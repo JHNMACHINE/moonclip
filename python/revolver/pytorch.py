@@ -53,6 +53,23 @@ def _detect_distributed_env() -> Tuple[int, int]:
     return 1, 0
 
 
+def _tensor_to_bytes(t: "torch.Tensor") -> bytes:
+    """
+    Convert a tensor to raw bytes efficiently.
+    Handles all dtypes including bfloat16 (which numpy doesn't support).
+    """
+    t = t.detach().cpu().contiguous()
+    if t.dtype == torch.bfloat16:
+        # numpy doesn't support bf16 — reinterpret as int16 (same size)
+        return t.view(torch.int16).numpy().tobytes()
+    else:
+        try:
+            return t.numpy().tobytes()
+        except TypeError:
+            # Fallback for any other unsupported dtype
+            return t.view(torch.uint8).numpy().tobytes()
+
+
 def _flatten_and_extract_tensors(val: Any, prefix: str, tensors_out: dict) -> Any:
     """
     Recursively walks val (which can be dict, list, tuple, tensor, etc.).
@@ -63,8 +80,7 @@ def _flatten_and_extract_tensors(val: Any, prefix: str, tensors_out: dict) -> An
         t = val.detach().cpu().contiguous()
         shape = list(t.shape)
         dtype = str(t.dtype).replace("torch.", "")
-        # numpy doesn't support bf16, so use raw byte access via untyped_storage
-        raw_bytes = bytes(t.untyped_storage())
+        raw_bytes = _tensor_to_bytes(t)
         tensors_out[prefix] = (shape, dtype, raw_bytes)
         return {
             "__tensor__": prefix,
@@ -138,6 +154,7 @@ class CheckpointManager:
         rank: Optional[int] = None,
         merge_stride: int = 0,
         merge_max_chain: int = 10,
+        save_dtype: str = "none",
         **kwargs,
     ):
         if torch is None:
@@ -146,7 +163,6 @@ class CheckpointManager:
         from revolver import RevolverManager
 
         # Auto-detect from torchrun / torch.distributed environment
-        # Priority: explicit arg > torch.distributed > env vars > defaults
         if world_size is None or rank is None:
             detected_world_size, detected_rank = _detect_distributed_env()
             if world_size is None:
@@ -156,6 +172,7 @@ class CheckpointManager:
 
         self.world_size = world_size
         self.rank = rank
+        self.save_dtype = save_dtype
 
         self._mgr = RevolverManager(
             storage_root=storage_root,
@@ -168,6 +185,7 @@ class CheckpointManager:
             rank=rank,
             merge_stride=merge_stride,
             merge_max_chain=merge_max_chain,
+            save_dtype=save_dtype,
             **kwargs,
         )
 

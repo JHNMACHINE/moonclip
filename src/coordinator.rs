@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use chrono::Utc;
 use uuid::Uuid;
 
+use crate::cast::DType;
 use crate::error::{Result, RevolverError};
 use crate::manifest::*;
 use crate::merger::{DeltaMerger, MergerConfig};
@@ -20,10 +21,10 @@ pub struct CoordinatorConfig {
     pub lineage: LineageConfig,
     pub delta_threshold: f64,
     pub merger: Option<MergerConfig>,
-    /// Remote storage for batched sync. If set, local is primary, remote is backup.
     pub remote_storage: Option<Arc<dyn StorageBackend>>,
-    /// Remote sync configuration.
     pub remote_sync: Option<RemoteSyncConfig>,
+    /// Target dtype for saving float tensors. DType::None = keep original.
+    pub save_dtype: DType,
 }
 
 impl Default for CoordinatorConfig {
@@ -38,6 +39,7 @@ impl Default for CoordinatorConfig {
             merger: None,
             remote_storage: None,
             remote_sync: None,
+            save_dtype: DType::None,
         }
     }
 }
@@ -421,6 +423,7 @@ impl Coordinator {
             self.config.delta_threshold,
             snap_dir,
             self.config.rank,
+            &self.config.save_dtype,
         )?;
 
         // Write data to storage

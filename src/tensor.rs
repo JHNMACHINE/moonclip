@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use crate::cast::{self, DType, is_castable_float};
 use crate::compression;
 use crate::delta;
 use crate::error::{Result, RevolverError};
@@ -24,13 +25,11 @@ pub struct ProcessedTensor {
     pub write_data: Option<Vec<u8>>,
 }
 
-/// Process a tensor for saving: compare with base, decide skip/delta/full,
-/// compress, and return the entry + data to write.
+/// Process a tensor for saving: optionally cast dtype, compare with base,
+/// decide skip/delta/full, compress, and return the entry + data to write.
 ///
-/// This is the core of DECK's "zero-cost delta tracking" adapted to dense models:
-/// - If sha256 matches base → skip (zero I/O)
-/// - If same size and delta density < threshold → XOR delta + compress
-/// - Otherwise → full save + compress
+/// `save_dtype`: if set, float tensors are cast to this dtype before saving.
+/// The original dtype is preserved in the entry for uncast on load.
 pub fn process_tensor(
     tensor: &TensorData,
     base_entry: Option<&TensorEntry>,
@@ -39,8 +38,25 @@ pub fn process_tensor(
     delta_threshold: f64,
     snap_dir: &str,
     rank: u32,
+    save_dtype: &DType,
 ) -> Result<ProcessedTensor> {
-    let raw_hash = sha256_hex(&tensor.data);
+    // Cast if requested and applicable
+    let (working_data, working_dtype) = if *save_dtype != DType::None
+        && is_castable_float(&tensor.dtype)
+    {
+        cast::cast_tensor(&tensor.data, &tensor.dtype, save_dtype)?
+    } else {
+        (tensor.data.clone(), tensor.dtype.clone())
+    };
+
+    let raw_hash = sha256_hex(&working_data);
+
+    // Determine original_dtype field (set only if we actually cast)
+    let orig_dtype = if working_dtype != tensor.dtype {
+        Some(tensor.dtype.clone())
+    } else {
+        None
+    };
 
     // Check if we can skip (identical to base)
     if let Some(base) = base_entry {
@@ -49,11 +65,12 @@ pub fn process_tensor(
                 entry: TensorEntry {
                     name: tensor.name.clone(),
                     shape: tensor.shape.clone(),
-                    dtype: tensor.dtype.clone(),
+                    dtype: working_dtype.clone(),
+                    original_dtype: orig_dtype.clone(),
                     storage: TensorStorage::Skipped,
                     filename: None,
                     compressed_size: 0,
-                    raw_size: tensor.data.len() as u64,
+                    raw_size: working_data.len() as u64,
                     sha256_raw: raw_hash,
                     sha256_compressed: None,
                 },
@@ -62,7 +79,7 @@ pub fn process_tensor(
         }
 
         // Try delta encoding
-        if base.raw_size == tensor.data.len() as u64 {
+        if base.raw_size == working_data.len() as u64 {
             if let Some(ref base_filename) = base.filename {
                 if base.storage != TensorStorage::Skipped {
                     // Load base tensor data
@@ -72,21 +89,16 @@ pub fn process_tensor(
                     if base_comp_size > 0 && base_compressed.len() > base_comp_size {
                         base_compressed.truncate(base_comp_size);
                     }
-                    let base_algo = compression; // assume same compression
+                    let base_algo = compression;
                     let base_raw = if base.storage == TensorStorage::DeltaXor {
-                        // Can't delta against a delta — need the full data.
-                        // This would require chain resolution. For simplicity,
-                        // fall through to full save.
-                        // In practice, merging should prevent deep chains.
-                        return make_full_entry(tensor, &raw_hash, compression, snap_dir, rank);
+                        return make_full_entry(tensor, &working_data, &working_dtype, &orig_dtype, &raw_hash, compression, snap_dir, rank);
                     } else {
                         compression::decompress(&base_compressed, base_algo)?
                     };
 
-                    if let Some(xor_delta) = delta::compute_delta(&base_raw, &tensor.data) {
+                    if let Some(xor_delta) = delta::compute_delta(&base_raw, &working_data) {
                         let density = delta::delta_density(&xor_delta);
                         if density < delta_threshold {
-                            // Delta is worth it
                             let compressed = compression::compress(&xor_delta, compression)?;
                             let filename = tensor_filename(snap_dir, rank, &tensor.name);
                             let compressed_hash = sha256_hex(&compressed);
@@ -95,11 +107,12 @@ pub fn process_tensor(
                                 entry: TensorEntry {
                                     name: tensor.name.clone(),
                                     shape: tensor.shape.clone(),
-                                    dtype: tensor.dtype.clone(),
+                                    dtype: working_dtype.clone(),
+                                    original_dtype: orig_dtype.clone(),
                                     storage: TensorStorage::DeltaXor,
                                     filename: Some(filename),
                                     compressed_size: compressed.len() as u64,
-                                    raw_size: tensor.data.len() as u64,
+                                    raw_size: working_data.len() as u64,
                                     sha256_raw: raw_hash,
                                     sha256_compressed: Some(compressed_hash),
                                 },
@@ -113,17 +126,20 @@ pub fn process_tensor(
     }
 
     // Full save
-    make_full_entry(tensor, &raw_hash, compression, snap_dir, rank)
+    make_full_entry(tensor, &working_data, &working_dtype, &orig_dtype, &raw_hash, compression, snap_dir, rank)
 }
 
 fn make_full_entry(
     tensor: &TensorData,
+    working_data: &[u8],
+    working_dtype: &str,
+    original_dtype: &Option<String>,
     raw_hash: &str,
     compression: &CompressionAlgo,
     snap_dir: &str,
     rank: u32,
 ) -> Result<ProcessedTensor> {
-    let compressed = compression::compress(&tensor.data, compression)?;
+    let compressed = compression::compress(working_data, compression)?;
     let filename = tensor_filename(snap_dir, rank, &tensor.name);
     let compressed_hash = sha256_hex(&compressed);
 
@@ -131,11 +147,12 @@ fn make_full_entry(
         entry: TensorEntry {
             name: tensor.name.clone(),
             shape: tensor.shape.clone(),
-            dtype: tensor.dtype.clone(),
+            dtype: working_dtype.to_string(),
+            original_dtype: original_dtype.clone(),
             storage: TensorStorage::Full,
             filename: Some(filename),
             compressed_size: compressed.len() as u64,
-            raw_size: tensor.data.len() as u64,
+            raw_size: working_data.len() as u64,
             sha256_raw: raw_hash.to_string(),
             sha256_compressed: Some(compressed_hash),
         },
@@ -144,12 +161,33 @@ fn make_full_entry(
 }
 
 /// Load a tensor's raw bytes, resolving delta chains if needed.
+/// If the tensor was saved with a cast (e.g. fp32→bf16), it is
+/// automatically uncast back to the original dtype.
 pub fn load_tensor(
     entry: &TensorEntry,
     snap_base_id: Option<uuid::Uuid>,
     storage: &dyn StorageBackend,
     compression: &CompressionAlgo,
-    // Function to look up a base tensor entry by name and snapshot ID
+    find_base_entry: &dyn Fn(uuid::Uuid, &str) -> Result<(TensorEntry, CompressionAlgo)>,
+) -> Result<Vec<u8>> {
+    let raw = load_tensor_raw(entry, snap_base_id, storage, compression, find_base_entry)?;
+
+    // Uncast if needed (e.g. bf16 on disk → fp32 for training)
+    if let Some(ref orig_dtype) = entry.original_dtype {
+        if orig_dtype != &entry.dtype {
+            return cast::uncast_tensor(&raw, &entry.dtype, orig_dtype);
+        }
+    }
+
+    Ok(raw)
+}
+
+/// Load raw bytes without uncasting.
+fn load_tensor_raw(
+    entry: &TensorEntry,
+    snap_base_id: Option<uuid::Uuid>,
+    storage: &dyn StorageBackend,
+    compression: &CompressionAlgo,
     find_base_entry: &dyn Fn(uuid::Uuid, &str) -> Result<(TensorEntry, CompressionAlgo)>,
 ) -> Result<Vec<u8>> {
     match entry.storage {
@@ -162,7 +200,7 @@ pub fn load_tensor(
                 ))
             })?;
             let (base_entry, base_compression) = find_base_entry(base_id, &entry.name)?;
-            load_tensor(&base_entry, None, storage, &base_compression, find_base_entry)
+            load_tensor_raw(&base_entry, None, storage, &base_compression, find_base_entry)
         }
         TensorStorage::Full => {
             let filename = entry.filename.as_ref().ok_or_else(|| {
@@ -223,7 +261,7 @@ pub fn load_tensor(
             })?;
             let (base_entry, base_compression) = find_base_entry(base_id, &entry.name)?;
             let base_raw =
-                load_tensor(&base_entry, None, storage, &base_compression, find_base_entry)?;
+                load_tensor_raw(&base_entry, None, storage, &base_compression, find_base_entry)?;
 
             // Apply XOR delta
             let raw = delta::apply_delta(&base_raw, &delta_data)?;
@@ -263,11 +301,10 @@ pub fn process_tensors_parallel(
     delta_threshold: f64,
     snap_dir: &str,
     rank: u32,
+    save_dtype: &DType,
 ) -> Result<Vec<ProcessedTensor>>
 where
 {
-    // We can't easily parallelize due to StorageBackend not being Sync in all cases.
-    // Process sequentially for now; rayon can be added per-tensor for compression.
     let mut results = Vec::with_capacity(tensors.len());
 
     for tensor in tensors {
@@ -280,6 +317,7 @@ where
             delta_threshold,
             snap_dir,
             rank,
+            save_dtype,
         )?;
         results.push(processed);
     }
@@ -291,6 +329,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cast::DType;
     use crate::storage::LocalStorage;
 
     #[test]
@@ -316,6 +355,7 @@ mod tests {
             raw_size: 8192,
             sha256_raw: raw_hash.clone(),
             sha256_compressed: Some(sha256_hex(&compressed)),
+                    original_dtype: None,
         };
 
         // Process same tensor again → should be Skipped
@@ -334,6 +374,7 @@ mod tests {
             0.5,
             "snapshots/new",
             0,
+            &DType::None,
         )
         .unwrap();
 
@@ -362,6 +403,7 @@ mod tests {
             raw_size: 50_000,
             sha256_raw: sha256_hex(&data_v1),
             sha256_compressed: Some(sha256_hex(&compressed_v1)),
+            original_dtype: None,
         };
 
         // Change 2 bytes
@@ -384,6 +426,7 @@ mod tests {
             0.5,
             "snapshots/new",
             0,
+            &DType::None,
         )
         .unwrap();
 
@@ -414,6 +457,7 @@ mod tests {
             0.5,
             "snapshots/first",
             0,
+            &DType::None,
         )
         .unwrap();
 

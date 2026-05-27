@@ -23,8 +23,12 @@ pub struct TensorEntry {
     pub name: String,
     /// Shape as a list of dims.
     pub shape: Vec<usize>,
-    /// Element dtype string, e.g. "bfloat16", "float32".
+    /// Element dtype string as stored on disk, e.g. "bfloat16", "float32".
     pub dtype: String,
+    /// Original dtype before casting (e.g. "float32" if saved as bf16).
+    /// If None, dtype == original dtype (no cast was applied).
+    #[serde(default)]
+    pub original_dtype: Option<String>,
     /// How this tensor is stored.
     pub storage: TensorStorage,
     /// Path to the compressed data file (None if Skipped).

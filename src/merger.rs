@@ -248,6 +248,7 @@ fn do_full_merge(
                 raw_size: current_data.len() as u64,
                 sha256_raw: raw_hash,
                 sha256_compressed: Some(compressed_hash),
+                original_dtype: None,
             });
         }
 

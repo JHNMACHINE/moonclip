@@ -3,6 +3,7 @@ use pyo3::types::{PyBytes, PyDict};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::cast::DType;
 use crate::coordinator::{Coordinator, CoordinatorConfig};
 use crate::manifest::{CompressionAlgo, LineageConfig, RetentionPolicy};
 use crate::merger::MergerConfig;
@@ -89,6 +90,7 @@ impl RevolverManager {
         s3_secret_key = None,
         s3_path_style = false,
         sync_every_n_saves = 100,
+        save_dtype = "none",
     ))]
     fn new(
         storage_root: &str,
@@ -111,6 +113,7 @@ impl RevolverManager {
         s3_secret_key: Option<&str>,
         s3_path_style: bool,
         sync_every_n_saves: u64,
+        save_dtype: &str,
     ) -> PyResult<Self> {
         let compression = if compression_level == 0 {
             CompressionAlgo::None
@@ -137,8 +140,9 @@ impl RevolverManager {
             } else {
                 None
             },
-            remote_storage: None, // Set below if S3 is configured
-            remote_sync: None,    // Set below if S3 is configured
+            remote_storage: None,
+            remote_sync: None,
+            save_dtype: DType::from_str(save_dtype),
         };
 
         // Storage setup:

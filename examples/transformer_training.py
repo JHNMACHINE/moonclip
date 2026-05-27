@@ -4,9 +4,13 @@ Real transformer training with Revolver checkpointing.
 Trains a small GPT-style causal language model on synthetic text data,
 demonstrating checkpoint save/resume with per-tensor delta tracking.
 
+Auto-resumes from existing checkpoints if the directory is populated.
+Also auto-detects save_dtype from checkpoint metadata on resume.
+
 Usage:
-    python transformer_training.py              # Train from scratch
-    python transformer_training.py --resume     # Resume from last checkpoint
+    python transformer_training.py                        # Train (auto-resumes if ckpts exist)
+    python transformer_training.py --save-dtype bf16      # Save checkpoints in bf16
+    python transformer_training.py --fresh-start          # Ignore existing ckpts, start over
 
 Requirements:
     pip install torch revolver
@@ -40,7 +44,6 @@ class CausalSelfAttention(nn.Module):
         self.attn_dropout = nn.Dropout(dropout)
         self.resid_dropout = nn.Dropout(dropout)
 
-        # Causal mask
         self.register_buffer(
             "mask",
             torch.tril(torch.ones(max_seq_len, max_seq_len)).view(1, 1, max_seq_len, max_seq_len),
@@ -49,15 +52,15 @@ class CausalSelfAttention(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, C = x.shape
         qkv = self.qkv(x).reshape(B, T, 3, self.n_heads, self.head_dim)
-        q, k, v = qkv.unbind(dim=2)  # (B, T, nh, hd)
-        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)  # (B, nh, T, hd)
+        q, k, v = qkv.unbind(dim=2)
+        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
 
         attn = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_dim))
         attn = attn.masked_fill(self.mask[:, :, :T, :T] == 0, float("-inf"))
         attn = F.softmax(attn, dim=-1)
         attn = self.attn_dropout(attn)
 
-        y = attn @ v  # (B, nh, T, hd)
+        y = attn @ v
         y = y.transpose(1, 2).contiguous().reshape(B, T, C)
         return self.resid_dropout(self.proj(y))
 
@@ -82,10 +85,7 @@ class TransformerBlock(nn.Module):
 
 
 class MiniGPT(nn.Module):
-    """
-    A small GPT-style causal LM.
-    ~2.5M parameters with default config.
-    """
+    """A small GPT-style causal LM. ~2.5M parameters with default config."""
 
     def __init__(
         self,
@@ -105,10 +105,7 @@ class MiniGPT(nn.Module):
         )
         self.ln_f = nn.LayerNorm(d_model)
         self.head = nn.Linear(d_model, vocab_size, bias=False)
-
-        # Weight tying
         self.head.weight = self.token_emb.weight
-
         self.max_seq_len = max_seq_len
         self._init_weights()
 
@@ -137,16 +134,11 @@ class MiniGPT(nn.Module):
 # ─── Dataset ─────────────────────────────────────────────────────────
 
 class SyntheticTextDataset(Dataset):
-    """
-    Generates synthetic byte-level "text" with learnable patterns.
-    Pattern: sequences of incrementing bytes with periodic resets,
-    so the model can learn to predict the next byte.
-    """
+    """Synthetic byte-level text with learnable incrementing patterns."""
 
     def __init__(self, n_samples: int = 10000, seq_len: int = 128):
         self.data = []
         for i in range(n_samples):
-            # Create a sequence with a learnable pattern
             start = i % 200
             seq = [(start + j) % 256 for j in range(seq_len + 1)]
             self.data.append(torch.tensor(seq, dtype=torch.long))
@@ -156,62 +148,62 @@ class SyntheticTextDataset(Dataset):
 
     def __getitem__(self, idx):
         seq = self.data[idx]
-        return seq[:-1], seq[1:]  # input, target
+        return seq[:-1], seq[1:]
 
 
 # ─── Training ────────────────────────────────────────────────────────
 
 def train(
     ckpt_dir: str = "./revolver_training_ckpts",
-    resume: bool = False,
+    fresh_start: bool = False,
     n_epochs: int = 5,
     batch_size: int = 32,
     lr: float = 3e-4,
     save_every_steps: int = 50,
+    save_dtype: str = "fp32",
     device: str = "cpu",
 ):
     os.makedirs(ckpt_dir, exist_ok=True)
 
-    # Model
+    # Model — always trains in fp32 for stability (especially on CPU)
     model = MiniGPT(vocab_size=256, d_model=256, n_heads=4, n_layers=4, max_seq_len=128)
     model = model.to(device)
 
-    # Optimizer and scheduler
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_epochs * 312)
 
-    # Dataset
     dataset = SyntheticTextDataset(n_samples=10000, seq_len=128)
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True)
 
-    # Revolver checkpoint manager
+    # The cast is handled entirely by Rust — just pass save_dtype
     ckpt = CheckpointManager(
         storage_root=ckpt_dir,
         compression_level=3,
         max_full_snapshots=3,
         full_every_steps=200,
         delta_threshold=0.5,
+        save_dtype=save_dtype,
     )
 
-    # Resume
-    start_step = 0
-    if resume:
-        snaps = ckpt.list_snapshots()
-        if snaps:
-            snap_id, _ = ckpt.load_latest(model=model, optimizer=optimizer, scheduler=scheduler)
-            start_step = snaps[-1]["step"] + 1
-            print(f"Resumed from step {start_step} (snap {snap_id[:8]}...)")
+    # Auto-resume
+    if fresh_start:
+        print("Fresh start requested, ignoring existing checkpoints")
+        start_step = 0
+    else:
+        start_step = ckpt.resume(model=model, optimizer=optimizer, scheduler=scheduler)
+        if start_step > 0:
+            print(f"Resumed from step {start_step}")
         else:
-            print("No checkpoints found, starting from scratch")
+            print("No existing checkpoints, starting from scratch")
 
     # Training loop
     global_step = start_step
     model.train()
 
-    print(f"\n{'='*60}")
-    print(f"Training MiniGPT | {n_epochs} epochs | device={device}")
+    print(f"\n{'='*70}")
+    print(f"Training MiniGPT | {n_epochs} epochs | device={device} | ckpt dtype={save_dtype}")
     print(f"Checkpoint: save every {save_every_steps} steps to {ckpt_dir}")
-    print(f"{'='*60}\n")
+    print(f"{'='*70}\n")
 
     t_start = time.perf_counter()
 
@@ -253,12 +245,15 @@ def train(
 
                 snaps = ckpt.list_snapshots()
                 info = snaps[-1]
+                raw_kb = info["total_raw"] / 1024
+                comp_kb = info["total_compressed"] / 1024
+                ratio_pct = (1.0 - comp_kb / raw_kb) * 100 if raw_kb > 0 else 0
                 print(
                     f"  [ckpt] step={global_step} | {t_ckpt:.3f}s | "
-                    f"full={info['full_tensors']} delta={info['delta_tensors']} "
+                    f"full={info['full_tensors']} Δ={info['delta_tensors']} "
                     f"skip={info['skipped_tensors']} | "
-                    f"{info['total_compressed']/1024:.1f}KB compressed "
-                    f"({info['total_raw']/1024:.1f}KB raw)"
+                    f"{comp_kb:.1f}KB / {raw_kb:.1f}KB raw "
+                    f"({ratio_pct:.1f}% saved)"
                 )
 
             # Log
@@ -287,55 +282,59 @@ def train(
     ckpt.merge_now()
 
     total_time = time.perf_counter() - t_start
-    snaps = ckpt.list_snapshots()
 
-    print(f"\n{'='*60}")
-    print(f"Training complete in {total_time:.1f}s")
+    print(f"\n{'='*70}")
+    print(f"Training complete in {total_time:.1f}s | dtype={save_dtype}")
     print(f"Final loss: {avg_loss:.4f}")
-    print(f"Total snapshots: {len(snaps)}")
     print(f"Final checkpoint: {snap_id[:8]}...")
 
-    # Print checkpoint storage summary
-    total_compressed = sum(s["total_compressed"] for s in snaps)
-    total_raw = sum(s["total_raw"] for s in snaps)
-    print(f"Total storage: {total_compressed/1024:.1f}KB compressed ({total_raw/1024:.1f}KB raw)")
+    # Print aggregate stats — shows how much delta/skip saved vs naive torch.save
+    ckpt.print_stats()
 
-    # Verify resume works
+    # Verify resume
     print(f"\n--- Verifying resume ---")
     model2 = MiniGPT(vocab_size=256, d_model=256, n_heads=4, n_layers=4, max_seq_len=128)
     model2 = model2.to(device)
 
-    ckpt2 = CheckpointManager(storage_root=ckpt_dir)
+    ckpt2 = CheckpointManager(storage_root=ckpt_dir, save_dtype=save_dtype)
     ckpt2.load_latest(model=model2)
 
-    # Compare weights
+    use_bf16 = save_dtype in ("bf16", "bfloat16")
+    max_diff = 0.0
     for (n1, p1), (n2, p2) in zip(model.named_parameters(), model2.named_parameters()):
-        if not torch.allclose(p1.data, p2.data, atol=1e-6):
-            print(f"  MISMATCH: {n1}")
+        diff = (p1.data - p2.data).abs().max().item()
+        max_diff = max(max_diff, diff)
+        atol = 0.01 if use_bf16 else 1e-6
+        if not torch.allclose(p1.data, p2.data, atol=atol, rtol=0.01):
+            print(f"  MISMATCH: {n1} (max diff: {diff:.6f})")
             break
     else:
-        print("  ✓ All weights match after resume")
+        print(f"  ✓ All weights match after resume (max diff: {max_diff:.6f})")
 
-    print(f"{'='*60}")
+    print(f"{'='*70}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train MiniGPT with Revolver checkpointing")
-    parser.add_argument("--resume", action="store_true", help="Resume from last checkpoint")
+    parser.add_argument("--fresh-start", action="store_true",
+                        help="Ignore existing checkpoints and start from scratch")
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--save-every", type=int, default=50)
+    parser.add_argument("--save-dtype", type=str, default="fp32", choices=["fp32", "bf16"],
+                        help="Dtype for checkpoint storage. Training is always fp32.")
     parser.add_argument("--ckpt-dir", type=str, default="./revolver_training_ckpts")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
 
     train(
         ckpt_dir=args.ckpt_dir,
-        resume=args.resume,
+        fresh_start=args.fresh_start,
         n_epochs=args.epochs,
         batch_size=args.batch_size,
         lr=args.lr,
         save_every_steps=args.save_every,
+        save_dtype=args.save_dtype,
         device=args.device,
     )
