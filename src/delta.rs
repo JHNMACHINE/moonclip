@@ -109,4 +109,60 @@ mod tests {
         b[0] = 1;
         assert!(compute_delta(&a, &b).is_none());
     }
+
+    #[test]
+    fn large_delta_high_density() {
+        let base = vec![0u8; 8192];
+        let target = vec![255u8; 8192]; // every byte different
+
+        let delta = compute_delta(&base, &target).unwrap();
+        let density = delta_density(&delta);
+        assert!(density > 0.99, "fully different should have density ~1.0, got {density}");
+    }
+
+    #[test]
+    fn apply_delta_wrong_length_errors() {
+        let base = vec![0u8; 100];
+        let delta = vec![0u8; 200];
+        assert!(apply_delta(&base, &delta).is_err());
+    }
+
+    #[test]
+    fn xor_is_self_inverse() {
+        // XOR(XOR(base, target), target) == base
+        let base = vec![42u8; 8192];
+        let mut target = base.clone();
+        target[0] = 1;
+        target[4000] = 2;
+
+        let delta = compute_delta(&base, &target).unwrap();
+        let recovered_target = apply_delta(&base, &delta).unwrap();
+        let re_delta = compute_delta(&recovered_target, &base).unwrap();
+        let recovered_base = apply_delta(&recovered_target, &re_delta).unwrap();
+        assert_eq!(recovered_base, base);
+    }
+
+    #[test]
+    fn delta_density_empty() {
+        assert_eq!(delta_density(&[]), 0.0);
+    }
+
+    #[test]
+    fn delta_density_all_zero() {
+        assert_eq!(delta_density(&vec![0u8; 1000]), 0.0);
+    }
+
+    #[test]
+    fn delta_multimegabyte() {
+        let size = 4 * 1024 * 1024; // 4MB
+        let base = vec![0u8; size];
+        let mut target = base.clone();
+        target[0] = 1;
+        target[size - 1] = 2;
+
+        let delta = compute_delta(&base, &target).unwrap();
+        assert_eq!(delta.len(), size);
+        let recovered = apply_delta(&base, &delta).unwrap();
+        assert_eq!(recovered, target);
+    }
 }

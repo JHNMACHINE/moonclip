@@ -46,4 +46,39 @@ mod tests {
         let decompressed = decompress(&compressed, &algo).unwrap();
         assert_eq!(data, decompressed);
     }
+
+    #[test]
+    fn empty_data() {
+        let algo = CompressionAlgo::Zstd { level: 3 };
+        let compressed = compress(&[], &algo).unwrap();
+        let decompressed = decompress(&compressed, &algo).unwrap();
+        assert_eq!(decompressed, Vec::<u8>::new());
+    }
+
+    #[test]
+    fn high_compression_level() {
+        let data = vec![0u8; 50_000];
+        let algo = CompressionAlgo::Zstd { level: 9 };
+        let compressed = compress(&data, &algo).unwrap();
+        let decompressed = decompress(&compressed, &algo).unwrap();
+        assert_eq!(data, decompressed);
+        assert!(compressed.len() < 100, "Repetitive data should compress to almost nothing");
+    }
+
+    #[test]
+    fn random_data_still_roundtrips() {
+        // Pseudo-random data doesn't compress well but should still roundtrip
+        let data: Vec<u8> = (0..10_000).map(|i| ((i * 7 + 13) % 256) as u8).collect();
+        let algo = CompressionAlgo::Zstd { level: 1 };
+        let compressed = compress(&data, &algo).unwrap();
+        let decompressed = decompress(&compressed, &algo).unwrap();
+        assert_eq!(data, decompressed);
+    }
+
+    #[test]
+    fn decompress_garbage_errors() {
+        let algo = CompressionAlgo::Zstd { level: 3 };
+        let result = decompress(b"not valid zstd data", &algo);
+        assert!(result.is_err());
+    }
 }

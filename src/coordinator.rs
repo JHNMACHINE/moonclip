@@ -776,4 +776,204 @@ mod tests {
         assert_eq!(loaded_r0["shard.weight"][0], 1);
         assert_eq!(loaded_r1["shard.weight"][0], 2);
     }
+
+    #[test]
+    fn retention_policy_removes_old_snapshots() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(dir.path()).unwrap());
+        let config = CoordinatorConfig {
+            world_size: 1,
+            rank: 0,
+            compression: CompressionAlgo::Zstd { level: 1 },
+            retention: RetentionPolicy {
+                max_full_snapshots: 2,
+                max_deltas_per_full: 5,
+                full_snapshot_every_steps: 1, // force full every step
+            },
+            delta_threshold: 0.5,
+            ..Default::default()
+        };
+        let coord = Coordinator::new(storage, config).unwrap();
+
+        for i in 0..6 {
+            coord
+                .save(i, vec![TensorData {
+                    name: "w".into(),
+                    shape: vec![100],
+                    dtype: "uint8".into(),
+                    data: vec![i as u8; 100],
+                }], HashMap::new())
+                .unwrap();
+        }
+
+        let snaps = coord.list_snapshots();
+        let full_count = snaps.iter().filter(|s| !s.is_delta).count();
+        assert!(full_count <= 2, "Expected <=2 full snapshots, got {full_count}");
+    }
+
+    #[test]
+    fn empty_tensor_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let coord = make_coordinator(dir.path());
+
+        let tensors = vec![TensorData {
+            name: "empty".into(),
+            shape: vec![0],
+            dtype: "float32".into(),
+            data: vec![],
+        }];
+        let snap_id = coord.save(1, tensors, HashMap::new()).unwrap();
+
+        let loaded = coord.load(snap_id).unwrap();
+        assert_eq!(loaded["empty"].len(), 0);
+    }
+
+    #[test]
+    fn many_tensors_save_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let coord = make_coordinator(dir.path());
+
+        let tensors: Vec<TensorData> = (0..50)
+            .map(|i| TensorData {
+                name: format!("layer.{}.weight", i),
+                shape: vec![64, 64],
+                dtype: "float32".into(),
+                data: vec![i as u8; 64 * 64 * 4],
+            })
+            .collect();
+
+        let snap_id = coord.save(100, tensors.clone(), HashMap::new()).unwrap();
+        let loaded = coord.load(snap_id).unwrap();
+
+        assert_eq!(loaded.len(), 50);
+        for t in &tensors {
+            assert_eq!(loaded[&t.name], t.data);
+        }
+    }
+
+    #[test]
+    fn delta_chain_multiple_steps() {
+        let dir = tempfile::tempdir().unwrap();
+        let coord = make_coordinator(dir.path());
+
+        // Step 100: full
+        let mut data = vec![0u8; 10_000];
+        coord.save(100, vec![TensorData {
+            name: "w".into(),
+            shape: vec![10_000],
+            dtype: "uint8".into(),
+            data: data.clone(),
+        }], HashMap::new()).unwrap();
+
+        // Steps 200-500: delta (change 1 byte each time)
+        for step in (200..=500).step_by(100) {
+            let idx = step as usize % data.len();
+            data[idx] = (step / 100) as u8;
+            coord.save(step, vec![TensorData {
+                name: "w".into(),
+                shape: vec![10_000],
+                dtype: "uint8".into(),
+                data: data.clone(),
+            }], HashMap::new()).unwrap();
+        }
+
+        // Load the latest — should reconstruct correctly through delta chain
+        let (_, loaded) = coord.load_latest().unwrap();
+        assert_eq!(loaded["w"], data);
+
+        let snaps = coord.list_snapshots();
+        assert_eq!(snaps.len(), 5);
+        assert!(!snaps[0].is_delta);
+        assert!(snaps[1].is_delta);
+    }
+
+    #[test]
+    fn special_characters_in_tensor_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let coord = make_coordinator(dir.path());
+
+        let tensors = vec![
+            TensorData {
+                name: "module.layers.0.self_attn.q_proj.weight".into(),
+                shape: vec![64],
+                dtype: "float32".into(),
+                data: vec![1u8; 256],
+            },
+            TensorData {
+                name: "model/encoder/block_0/layer_0".into(),
+                shape: vec![32],
+                dtype: "float32".into(),
+                data: vec![2u8; 128],
+            },
+        ];
+
+        let snap_id = coord.save(1, tensors.clone(), HashMap::new()).unwrap();
+        let loaded = coord.load(snap_id).unwrap();
+
+        assert_eq!(loaded["module.layers.0.self_attn.q_proj.weight"], tensors[0].data);
+        assert_eq!(loaded["model/encoder/block_0/layer_0"], tensors[1].data);
+    }
+
+    #[test]
+    fn force_full_after_n_steps() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(dir.path()).unwrap());
+        let config = CoordinatorConfig {
+            world_size: 1,
+            rank: 0,
+            compression: CompressionAlgo::Zstd { level: 1 },
+            retention: RetentionPolicy {
+                max_full_snapshots: 10,
+                max_deltas_per_full: 100,
+                full_snapshot_every_steps: 3, // force full every 3 steps
+            },
+            delta_threshold: 0.5,
+            ..Default::default()
+        };
+        let coord = Coordinator::new(storage, config).unwrap();
+
+        let base = vec![0u8; 8192];
+        for step in 0..9 {
+            let mut d = base.clone();
+            d[0] = step as u8;
+            coord.save(step, vec![TensorData {
+                name: "w".into(),
+                shape: vec![8192],
+                dtype: "uint8".into(),
+                data: d,
+            }], HashMap::new()).unwrap();
+        }
+
+        let snaps = coord.list_snapshots();
+        let full_count = snaps.iter().filter(|s| !s.is_delta).count();
+        assert!(full_count >= 3, "Expected >=3 full snapshots with full_every=3, got {full_count}");
+    }
+
+    #[test]
+    fn load_nonexistent_snapshot_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let coord = make_coordinator(dir.path());
+
+        let fake_id = uuid::Uuid::new_v4();
+        let result = coord.load(fake_id);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn metadata_preserved() {
+        let dir = tempfile::tempdir().unwrap();
+        let coord = make_coordinator(dir.path());
+
+        let mut meta = HashMap::new();
+        meta.insert("loss".into(), "0.123".into());
+        meta.insert("lr".into(), "3e-4".into());
+        meta.insert("epoch".into(), "5".into());
+
+        coord.save(100, sample_tensors(0), meta).unwrap();
+
+        let snaps = coord.list_snapshots();
+        assert_eq!(snaps[0].metadata["loss"], "0.123");
+        assert_eq!(snaps[0].metadata["lr"], "3e-4");
+        assert_eq!(snaps[0].metadata["epoch"], "5");
+    }
 }

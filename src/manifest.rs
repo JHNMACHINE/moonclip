@@ -218,3 +218,93 @@ impl Manifest {
             .collect()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_full_snapshot(step: u64) -> Snapshot {
+        Snapshot {
+            id: Uuid::new_v4(), step, created_at: Utc::now(),
+            ranks: HashMap::new(), base_snapshot_id: None,
+            metadata: HashMap::new(), compression: CompressionAlgo::default(),
+            finalized: true,
+        }
+    }
+
+    fn make_delta_snapshot(step: u64, base_id: Uuid) -> Snapshot {
+        Snapshot {
+            id: Uuid::new_v4(), step, created_at: Utc::now(),
+            ranks: HashMap::new(), base_snapshot_id: Some(base_id),
+            metadata: HashMap::new(), compression: CompressionAlgo::default(),
+            finalized: true,
+        }
+    }
+
+    #[test]
+    fn empty_manifest_forces_full() {
+        let m = Manifest::default();
+        assert!(m.should_force_full(0));
+    }
+
+    #[test]
+    fn force_full_after_steps() {
+        let mut m = Manifest { retention: RetentionPolicy { full_snapshot_every_steps: 10, ..Default::default() }, ..Default::default() };
+        m.snapshots.push(make_full_snapshot(0));
+        assert!(!m.should_force_full(5));
+        assert!(m.should_force_full(10));
+    }
+
+    #[test]
+    fn force_full_after_max_deltas() {
+        let mut m = Manifest { retention: RetentionPolicy { max_deltas_per_full: 3, full_snapshot_every_steps: 100000, ..Default::default() }, ..Default::default() };
+        let full = make_full_snapshot(0);
+        let base_id = full.id;
+        m.snapshots.push(full);
+        for i in 1..=3 { m.snapshots.push(make_delta_snapshot(i, base_id)); }
+        assert!(m.should_force_full(4));
+    }
+
+    #[test]
+    fn pending_delta_count() {
+        let mut m = Manifest::default();
+        assert_eq!(m.pending_delta_count(), 0);
+        let full = make_full_snapshot(0);
+        let base_id = full.id;
+        m.snapshots.push(full);
+        m.snapshots.push(make_delta_snapshot(1, base_id));
+        m.snapshots.push(make_delta_snapshot(2, base_id));
+        assert_eq!(m.pending_delta_count(), 2);
+        m.snapshots.push(make_full_snapshot(3));
+        assert_eq!(m.pending_delta_count(), 0);
+    }
+
+    #[test]
+    fn last_full_skips_unfinalized() {
+        let mut m = Manifest::default();
+        m.snapshots.push(make_full_snapshot(0));
+        let mut unf = make_full_snapshot(100);
+        unf.finalized = false;
+        m.snapshots.push(unf);
+        assert_eq!(m.last_full_snapshot().unwrap().step, 0);
+    }
+
+    #[test]
+    fn rollback_ids() {
+        let mut m = Manifest { lineage: LineageConfig { rollback_interval_steps: 100, max_rollback_snapshots: 5 }, ..Default::default() };
+        m.snapshots.push(make_full_snapshot(0));
+        m.snapshots.push(make_full_snapshot(50));
+        m.snapshots.push(make_full_snapshot(100));
+        assert_eq!(m.rollback_snapshot_ids().len(), 2); // 0 and 100
+    }
+
+    #[test]
+    fn serialization_roundtrip() {
+        let mut m = Manifest::default();
+        m.snapshots.push(make_full_snapshot(100));
+        let json = serde_json::to_vec(&m).unwrap();
+        let d: Manifest = serde_json::from_slice(&json).unwrap();
+        assert_eq!(d.snapshots.len(), 1);
+        assert_eq!(d.snapshots[0].step, 100);
+    }
+}

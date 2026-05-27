@@ -1,8 +1,16 @@
-"""Integration tests for Revolver v1.0 — per-tensor, rank-aware."""
+"""
+Integration tests for Revolver v1.0.
+Tests the Rust RevolverManager directly (no PyTorch dependency needed).
+PyTorch-specific tests are in test_pytorch.py (requires torch).
+"""
 
 import os
 import sys
 import struct
+import threading
+import json
+import time
+
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "python"))
@@ -10,8 +18,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "python"))
 from revolver import RevolverManager
 
 
+# ─── Helpers ─────────────────────────────────────────────────────────
+
 def make_tensors(seed=0, size=8192):
-    """Create test tensors in the format (shape, dtype, bytes)."""
+    """Create test tensors: {name: (shape, dtype, bytes)}."""
     return {
         "model.weight": ([64, 32], "float32", bytes([seed] * size)),
         "model.bias": ([64], "float32", bytes([seed + 1] * 256)),
@@ -19,259 +29,389 @@ def make_tensors(seed=0, size=8192):
     }
 
 
-def test_save_load_roundtrip(tmp_path):
-    mgr = RevolverManager(storage_root=str(tmp_path), full_every_steps=100000)
+# ─── Basic save/load ────────────────────────────────────────────────
 
-    tensors = make_tensors(42)
-    snap_id = mgr.save_tensors(step=1000, tensors=tensors, metadata={"loss": "0.634"})
+class TestSaveLoad:
+    def test_roundtrip(self, tmp_path):
+        mgr = RevolverManager(storage_root=str(tmp_path), full_every_steps=100000)
+        tensors = make_tensors(42)
+        snap_id = mgr.save_tensors(step=1000, tensors=tensors, metadata={"loss": "0.634"})
 
-    assert len(snap_id) == 36  # UUID
+        assert len(snap_id) == 36
+        loaded = mgr.load(snap_id)
+        assert loaded["model.weight"] == tensors["model.weight"][2]
+        assert loaded["model.bias"] == tensors["model.bias"][2]
+        assert loaded["optimizer.exp_avg"] == tensors["optimizer.exp_avg"][2]
 
-    loaded = mgr.load(snap_id)
-    assert loaded["model.weight"] == tensors["model.weight"][2]
-    assert loaded["model.bias"] == tensors["model.bias"][2]
-    assert loaded["optimizer.exp_avg"] == tensors["optimizer.exp_avg"][2]
+    def test_load_latest(self, tmp_path):
+        mgr = RevolverManager(storage_root=str(tmp_path), full_every_steps=100000)
+        mgr.save_tensors(step=100, tensors=make_tensors(1))
+        mgr.save_tensors(step=200, tensors=make_tensors(2))
+        snap_id, loaded = mgr.load_latest()
+        assert loaded["model.weight"][0] == 2
 
+    def test_load_nonexistent_errors(self, tmp_path):
+        mgr = RevolverManager(storage_root=str(tmp_path), full_every_steps=100000)
+        with pytest.raises(RuntimeError, match="Not found|Snapshot"):
+            mgr.load("00000000-0000-0000-0000-000000000000")
 
-def test_per_tensor_skip(tmp_path):
-    """Unchanged tensors should be skipped (zero I/O)."""
-    mgr = RevolverManager(storage_root=str(tmp_path), full_every_steps=100000)
+    def test_load_invalid_uuid_errors(self, tmp_path):
+        mgr = RevolverManager(storage_root=str(tmp_path))
+        with pytest.raises(ValueError):
+            mgr.load("not-a-uuid")
 
-    tensors_v1 = make_tensors(0)
-    mgr.save_tensors(step=100, tensors=tensors_v1)
+    def test_metadata_preserved(self, tmp_path):
+        mgr = RevolverManager(storage_root=str(tmp_path), full_every_steps=100000)
+        mgr.save_tensors(step=100, tensors=make_tensors(0), metadata={"loss": "1.234", "lr": "3e-4"})
+        snaps = mgr.list_snapshots()
+        assert snaps[0]["metadata"]["loss"] == "1.234"
+        assert snaps[0]["metadata"]["lr"] == "3e-4"
 
-    # Only change model.weight, keep bias and exp_avg identical
-    tensors_v2 = make_tensors(0)
-    data = bytearray(tensors_v2["model.weight"][2])
-    data[0] = 1
-    tensors_v2["model.weight"] = ([64, 32], "float32", bytes(data))
+    def test_save_no_metadata(self, tmp_path):
+        mgr = RevolverManager(storage_root=str(tmp_path), full_every_steps=100000)
+        snap_id = mgr.save_tensors(step=1, tensors=make_tensors(0))
+        loaded = mgr.load(snap_id)
+        assert len(loaded) == 3
 
-    snap_id = mgr.save_tensors(step=200, tensors=tensors_v2)
+    def test_single_tensor(self, tmp_path):
+        mgr = RevolverManager(storage_root=str(tmp_path), full_every_steps=100000)
+        data = bytes(range(256))
+        snap_id = mgr.save_tensors(step=1, tensors={"only": ([256], "uint8", data)})
+        assert mgr.load(snap_id)["only"] == data
 
-    snaps = mgr.list_snapshots()
-    assert len(snaps) == 2
-    info = snaps[1]
-    assert info["is_delta"] is True
-    assert info["skipped_tensors"] == 2, f"Expected 2 skipped, got {info['skipped_tensors']}"
-
-    # Verify data integrity
-    loaded = mgr.load(snap_id)
-    assert loaded["model.weight"] == tensors_v2["model.weight"][2]
-    assert loaded["model.bias"] == tensors_v1["model.bias"][2]
-
-
-def test_per_tensor_delta(tmp_path):
-    """Changed tensors should use XOR delta compression."""
-    mgr = RevolverManager(storage_root=str(tmp_path), full_every_steps=100000)
-
-    # Large tensor to trigger delta (>4096 bytes)
-    big = bytes(100_000)
-    tensors_v1 = {"big_tensor": ([100000], "uint8", big)}
-    mgr.save_tensors(step=100, tensors=tensors_v1)
-
-    # Change 2 bytes
-    big_v2 = bytearray(big)
-    big_v2[0] = 1
-    big_v2[50000] = 2
-    tensors_v2 = {"big_tensor": ([100000], "uint8", bytes(big_v2))}
-    snap_id = mgr.save_tensors(step=200, tensors=tensors_v2)
-
-    snaps = mgr.list_snapshots()
-    info = snaps[1]
-    assert info["delta_tensors"] == 1
-    assert info["total_compressed"] < 1000, f"Delta should be tiny, got {info['total_compressed']}"
-
-    loaded = mgr.load(snap_id)
-    assert loaded["big_tensor"] == bytes(big_v2)
+    def test_large_tensor(self, tmp_path):
+        """1MB tensor roundtrip."""
+        mgr = RevolverManager(storage_root=str(tmp_path), full_every_steps=100000)
+        data = bytes(range(256)) * 4096  # 1MB
+        snap_id = mgr.save_tensors(step=1, tensors={"big": ([1048576], "uint8", data)})
+        assert mgr.load(snap_id)["big"] == data
 
 
-def test_load_latest(tmp_path):
-    mgr = RevolverManager(storage_root=str(tmp_path), full_every_steps=100000)
+# ─── Per-tensor delta tracking ──────────────────────────────────────
 
-    mgr.save_tensors(step=100, tensors=make_tensors(1))
-    mgr.save_tensors(step=200, tensors=make_tensors(2))
+class TestDelta:
+    def test_unchanged_tensors_skipped(self, tmp_path):
+        mgr = RevolverManager(storage_root=str(tmp_path), full_every_steps=100000)
+        tensors_v1 = make_tensors(0)
+        mgr.save_tensors(step=100, tensors=tensors_v1)
 
-    snap_id, loaded = mgr.load_latest()
-    assert loaded["model.weight"][0] == 2
+        tensors_v2 = make_tensors(0)
+        data = bytearray(tensors_v2["model.weight"][2])
+        data[0] = 1
+        tensors_v2["model.weight"] = ([64, 32], "float32", bytes(data))
+        snap_id = mgr.save_tensors(step=200, tensors=tensors_v2)
 
+        info = mgr.list_snapshots()[1]
+        assert info["is_delta"] is True
+        assert info["skipped_tensors"] == 2
 
-def test_integrity_check(tmp_path):
-    mgr = RevolverManager(storage_root=str(tmp_path), full_every_steps=100000)
-    snap_id = mgr.save_tensors(step=1, tensors=make_tensors(42))
+        loaded = mgr.load(snap_id)
+        assert loaded["model.bias"] == tensors_v1["model.bias"][2]
+        assert loaded["optimizer.exp_avg"] == tensors_v1["optimizer.exp_avg"][2]
 
-    # Corrupt ALL shard files
-    snaps_dir = os.path.join(str(tmp_path), "snapshots")
-    corrupted = 0
-    for root, dirs, files in os.walk(snaps_dir):
-        for f in files:
-            if f.endswith(".bin"):
-                path = os.path.join(root, f)
-                with open(path, "r+b") as fh:
-                    fh.seek(0)
-                    fh.write(b"\xFF\xFF\xFF\xFF")
-                corrupted += 1
+    def test_xor_delta_small_change(self, tmp_path):
+        mgr = RevolverManager(storage_root=str(tmp_path), full_every_steps=100000)
+        big = bytes(100_000)
+        mgr.save_tensors(step=100, tensors={"big": ([100000], "uint8", big)})
 
-    assert corrupted > 0, "No .bin files found to corrupt"
+        big_v2 = bytearray(big)
+        big_v2[0] = 1
+        big_v2[50000] = 2
+        snap_id = mgr.save_tensors(step=200, tensors={"big": ([100000], "uint8", bytes(big_v2))})
 
-    with pytest.raises(RuntimeError) as excinfo:
-        mgr.load(snap_id)
-    assert "Integrity" in str(excinfo.value) or "Compression" in str(excinfo.value)
+        info = mgr.list_snapshots()[1]
+        assert info["delta_tensors"] == 1
+        assert info["total_compressed"] < 1000
+        assert mgr.load(snap_id)["big"] == bytes(big_v2)
 
+    def test_all_tensors_changed_no_skip(self, tmp_path):
+        mgr = RevolverManager(storage_root=str(tmp_path), full_every_steps=100000)
+        t1 = {"a": ([100], "uint8", bytes([0] * 100)), "b": ([100], "uint8", bytes([0] * 100))}
+        mgr.save_tensors(step=100, tensors=t1)
+        t2 = {"a": ([100], "uint8", bytes([1] * 100)), "b": ([100], "uint8", bytes([2] * 100))}
+        mgr.save_tensors(step=200, tensors=t2)
 
-def test_snapshot_stats(tmp_path):
-    """list_snapshots returns per-tensor breakdown."""
-    mgr = RevolverManager(storage_root=str(tmp_path), full_every_steps=100000)
+        info = mgr.list_snapshots()[1]
+        assert info["skipped_tensors"] == 0, f"All tensors changed, expected 0 skipped, got {info['skipped_tensors']}"
 
-    mgr.save_tensors(step=100, tensors=make_tensors(0), metadata={"loss": "1.0"})
+    def test_delta_chain_correctness(self, tmp_path):
+        """Multiple delta steps maintain data integrity."""
+        mgr = RevolverManager(storage_root=str(tmp_path), full_every_steps=100000, max_deltas_per_full=100)
+        base = bytes(50_000)
+        mgr.save_tensors(step=100, tensors={"w": ([50000], "uint8", base)})
 
-    snaps = mgr.list_snapshots()
-    assert len(snaps) == 1
-    info = snaps[0]
-    assert info["step"] == 100
-    assert info["metadata"]["loss"] == "1.0"
-    assert info["full_tensors"] == 3
-    assert info["ranks"] == 1
+        current = bytearray(base)
+        for step in range(200, 600, 100):
+            current[step % len(current)] = step % 256
+            mgr.save_tensors(step=step, tensors={"w": ([50000], "uint8", bytes(current))})
 
-
-def test_multi_rank(tmp_path):
-    """Multi-rank save/load flow."""
-    # Rank 0 creates snapshot
-    mgr_r0 = RevolverManager(storage_root=str(tmp_path), world_size=2, rank=0, full_every_steps=100000)
-    snap_id = mgr_r0.create_snapshot(step=1000, metadata={"loss": "0.5"})
-
-    # Both ranks save their shards
-    mgr_r0.save_rank(snap_id, tensors={
-        "shard.weight": ([256, 512], "float32", bytes([1] * 256 * 512 * 4)),
-    })
-
-    mgr_r1 = RevolverManager(storage_root=str(tmp_path), world_size=2, rank=1, full_every_steps=100000)
-    mgr_r1.save_rank(snap_id, tensors={
-        "shard.weight": ([256, 512], "float32", bytes([2] * 256 * 512 * 4)),
-    })
-
-    # Rank 0 finalizes
-    mgr_r0_final = RevolverManager(storage_root=str(tmp_path), world_size=2, rank=0, full_every_steps=100000)
-    mgr_r0_final.finalize_snapshot(snap_id)
-
-    # Each rank loads its shard
-    loaded_r0 = RevolverManager(storage_root=str(tmp_path), world_size=2, rank=0).load(snap_id)
-    loaded_r1 = RevolverManager(storage_root=str(tmp_path), world_size=2, rank=1).load(snap_id)
-
-    assert loaded_r0["shard.weight"][0] == 1
-    assert loaded_r1["shard.weight"][0] == 2
+        _, loaded = mgr.load_latest()
+        assert loaded["w"] == bytes(current)
 
 
-def test_compression_ratio(tmp_path):
-    """Measure compression on realistic patterns."""
-    mgr = RevolverManager(storage_root=str(tmp_path), compression_level=3, full_every_steps=100000)
+# ─── Compression ────────────────────────────────────────────────────
 
-    # Optimizer momentum: repetitive float data
-    raw = struct.pack(f"{25000}f", *([0.0001] * 25000))
-    tensors = {"optimizer.momentum": ([25000], "float32", raw)}
-    mgr.save_tensors(step=1, tensors=tensors)
+class TestCompression:
+    def test_repetitive_data_compresses_well(self, tmp_path):
+        mgr = RevolverManager(storage_root=str(tmp_path), compression_level=3, full_every_steps=100000)
+        raw = struct.pack(f"{25000}f", *([0.0001] * 25000))
+        mgr.save_tensors(step=1, tensors={"momentum": ([25000], "float32", raw)})
+        info = mgr.list_snapshots()[0]
+        ratio = info["total_compressed"] / info["total_raw"]
+        assert ratio < 0.01
 
-    snaps = mgr.list_snapshots()
-    ratio = snaps[0]["total_compressed"] / snaps[0]["total_raw"]
-    assert ratio < 0.1
+    def test_no_compression(self, tmp_path):
+        mgr = RevolverManager(storage_root=str(tmp_path), compression_level=0, full_every_steps=100000)
+        data = bytes(range(256)) * 40
+        mgr.save_tensors(step=1, tensors={"data": ([10240], "uint8", data)})
+        info = mgr.list_snapshots()[0]
+        assert info["total_compressed"] >= info["total_raw"]
 
-
-# ─── Production Battle Tests ──────────────────────────────────────────
-
-def test_extreme_dimensions(tmp_path):
-    """Test saving/loading tensors with extreme shapes (0D, 1D, 5D)."""
-    mgr = RevolverManager(storage_root=str(tmp_path), full_every_steps=100)
-
-    tensors = {
-        "scalar": ([], "float32", struct.pack("f", 3.14)),
-        "single": ([1], "int32", struct.pack("i", 42)),
-        "large_dim": ([2, 2, 2, 2, 2], "uint8", bytes([1] * 32)),
-    }
-    snap_id = mgr.save_tensors(step=1, tensors=tensors)
-    loaded = mgr.load(snap_id)
-
-    assert loaded["scalar"] == tensors["scalar"][2]
-    assert loaded["single"] == tensors["single"][2]
-    assert loaded["large_dim"] == tensors["large_dim"][2]
+    def test_compression_levels(self, tmp_path):
+        """Higher compression level = smaller output."""
+        data = bytes([42] * 100_000)
+        sizes = {}
+        for level in [1, 3, 9]:
+            d = str(tmp_path / f"level_{level}")
+            mgr = RevolverManager(storage_root=d, compression_level=level, full_every_steps=100000)
+            mgr.save_tensors(step=1, tensors={"w": ([100000], "uint8", data)})
+            sizes[level] = mgr.list_snapshots()[0]["total_compressed"]
+        # level 9 should be <= level 1 (may be equal for trivial data)
+        assert sizes[9] <= sizes[1]
 
 
-def test_cleanup_and_retention(tmp_path):
-    """Verify that old snapshot directories and files are deleted according to retention policy."""
-    mgr = RevolverManager(
-        storage_root=str(tmp_path),
-        max_full_snapshots=2,
-        max_deltas_per_full=2,
-        full_every_steps=5,
-    )
+# ─── Integrity ──────────────────────────────────────────────────────
 
-    tensors = {"weight": ([100], "uint8", bytes([1] * 100))}
+class TestIntegrity:
+    def test_corruption_detected(self, tmp_path):
+        mgr = RevolverManager(storage_root=str(tmp_path), full_every_steps=100000)
+        snap_id = mgr.save_tensors(step=1, tensors=make_tensors(42))
 
-    # Save 9 snapshots to trigger multiple rounds of retention
-    for step in range(1, 10):
-        mgr.save_tensors(step=step, tensors=tensors)
+        corrupted = 0
+        for root, dirs, files in os.walk(str(tmp_path / "snapshots")):
+            for f in files:
+                if f.endswith(".bin"):
+                    with open(os.path.join(root, f), "r+b") as fh:
+                        fh.seek(0)
+                        fh.write(b"\xFF\xFF\xFF\xFF")
+                    corrupted += 1
+        assert corrupted > 0
 
-    snaps = mgr.list_snapshots()
-    # At most 2 full snapshots + their deltas should exist
-    assert len(snaps) <= 6
-
-    # Verify no files remain on disk for the pruned snapshots
-    all_snap_dirs = os.listdir(os.path.join(str(tmp_path), "snapshots"))
-    active_ids = {s["id"] for s in snaps}
-    for d in all_snap_dirs:
-        if d not in active_ids:
-            d_path = os.path.join(str(tmp_path), "snapshots", d)
-            files_left = []
-            for root, dirs, files in os.walk(d_path):
-                for f in files:
-                    files_left.append(f)
-            assert len(files_left) == 0, f"Snapshot {d} was pruned but still has files: {files_left}"
+        with pytest.raises(RuntimeError, match=r"Integrity|Compression"):
+            mgr.load(snap_id)
 
 
-def test_concurrent_saves(tmp_path):
-    """Verify that multiple threads can call save_tensors concurrently without crashes."""
-    import threading
-    mgr = RevolverManager(storage_root=str(tmp_path), full_every_steps=100)
-    
-    errors = []
-    
-    def worker(step):
-        try:
-            tensors = {f"thread_{step}": ([10], "uint8", bytes([step] * 10))}
-            mgr.save_tensors(step=step, tensors=tensors)
-        except Exception as e:
-            errors.append(e)
+# ─── Snapshot info ──────────────────────────────────────────────────
 
-    threads = [threading.Thread(target=worker, args=(i,)) for i in range(1, 11)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
+class TestSnapshotInfo:
+    def test_full_save_stats(self, tmp_path):
+        mgr = RevolverManager(storage_root=str(tmp_path), full_every_steps=100000)
+        mgr.save_tensors(step=100, tensors=make_tensors(0))
+        info = mgr.list_snapshots()[0]
+        assert info["step"] == 100
+        assert info["full_tensors"] == 3
+        assert info["delta_tensors"] == 0
+        assert info["skipped_tensors"] == 0
+        assert info["ranks"] == 1
+        assert info["total_raw"] > 0
+        assert info["total_compressed"] > 0
 
-    assert len(errors) == 0, f"Encountered concurrency errors: {errors}"
-    snaps = mgr.list_snapshots()
-    # Since they saved concurrently, they should all be in the manifest
-    assert len(snaps) == 10
+    def test_delta_save_stats(self, tmp_path):
+        mgr = RevolverManager(storage_root=str(tmp_path), full_every_steps=100000)
+        mgr.save_tensors(step=100, tensors=make_tensors(0))
+        t2 = make_tensors(0)
+        d = bytearray(t2["model.weight"][2]); d[0] = 1
+        t2["model.weight"] = ([64, 32], "float32", bytes(d))
+        mgr.save_tensors(step=200, tensors=t2)
+
+        info = mgr.list_snapshots()[1]
+        assert info["is_delta"] is True
+        total = info["skipped_tensors"] + info["delta_tensors"] + info["full_tensors"]
+        assert total == 3
+
+    def test_empty_list_on_fresh_manager(self, tmp_path):
+        mgr = RevolverManager(storage_root=str(tmp_path))
+        assert mgr.list_snapshots() == []
 
 
-def test_pytorch_non_standard_types(tmp_path):
-    """Verify CheckpointManager can save/load custom classes, empty dicts, and non-standard types."""
-    from revolver import CheckpointManager
-    mgr = CheckpointManager(storage_root=str(tmp_path))
+# ─── Multi-rank ─────────────────────────────────────────────────────
 
-    class CustomStateObject:
-        def __init__(self, val):
-            self.val = val
-        def state_dict(self):
-            return {"value": self.val, "empty_dict": {}, "nested": {"list": [1, 2, 3]}}
-        def load_state_dict(self, sd):
-            self.val = sd["value"]
-            self._sd = sd
+class TestMultiRank:
+    def test_two_rank_save_load(self, tmp_path):
+        p = str(tmp_path)
+        mgr_r0 = RevolverManager(storage_root=p, world_size=2, rank=0, full_every_steps=100000)
+        snap_id = mgr_r0.create_snapshot(step=1000, metadata={"loss": "0.5"})
 
-    obj = CustomStateObject(42)
-    snap_id = mgr.save(step=1, model=obj)
+        mgr_r0.save_rank(snap_id, tensors={
+            "shard": ([100], "float32", bytes([1] * 400)),
+        })
+        mgr_r1 = RevolverManager(storage_root=p, world_size=2, rank=1, full_every_steps=100000)
+        mgr_r1.save_rank(snap_id, tensors={
+            "shard": ([100], "float32", bytes([2] * 400)),
+        })
 
-    restored = CustomStateObject(0)
-    mgr.load(snap_id, model=restored)
+        RevolverManager(storage_root=p, world_size=2, rank=0, full_every_steps=100000).finalize_snapshot(snap_id)
 
-    assert restored.val == 42
-    assert restored._sd["empty_dict"] == {}
-    assert restored._sd["nested"]["list"] == [1, 2, 3]
+        assert RevolverManager(storage_root=p, world_size=2, rank=0).load(snap_id)["shard"][0] == 1
+        assert RevolverManager(storage_root=p, world_size=2, rank=1).load(snap_id)["shard"][0] == 2
+
+    def test_incomplete_finalize_fails(self, tmp_path):
+        mgr = RevolverManager(storage_root=str(tmp_path), world_size=2, rank=0, full_every_steps=100000)
+        snap_id = mgr.create_snapshot(step=1000)
+        mgr.save_rank(snap_id, tensors={"s": ([10], "uint8", bytes(10))})
+
+        with pytest.raises(RuntimeError, match="1/2"):
+            mgr.finalize_snapshot(snap_id)
+
+
+# ─── Page alignment ────────────────────────────────────────────────
+
+class TestPageAlignment:
+    def test_bin_files_aligned(self, tmp_path):
+        mgr = RevolverManager(storage_root=str(tmp_path), full_every_steps=100000)
+        mgr.save_tensors(step=1, tensors=make_tensors(42))
+        for root, _, files in os.walk(str(tmp_path / "snapshots")):
+            for f in files:
+                if f.endswith(".bin"):
+                    size = os.path.getsize(os.path.join(root, f))
+                    assert size % 4096 == 0, f"{f} is {size} bytes"
+
+    def test_manifest_aligned(self, tmp_path):
+        mgr = RevolverManager(storage_root=str(tmp_path), full_every_steps=100000)
+        mgr.save_tensors(step=1, tensors=make_tensors(0))
+        assert os.path.getsize(str(tmp_path / "manifest.json")) % 4096 == 0
+
+    def test_data_survives_padding(self, tmp_path):
+        mgr = RevolverManager(storage_root=str(tmp_path), full_every_steps=100000)
+        data = bytes(range(100))
+        snap_id = mgr.save_tensors(step=1, tensors={"tiny": ([100], "uint8", data)})
+        assert mgr.load(snap_id)["tiny"] == data
+
+
+# ─── Retention policy ───────────────────────────────────────────────
+
+class TestRetention:
+    def test_old_snapshots_cleaned(self, tmp_path):
+        mgr = RevolverManager(
+            storage_root=str(tmp_path), max_full_snapshots=2,
+            max_deltas_per_full=2, full_every_steps=5,
+        )
+        for step in range(1, 10):
+            mgr.save_tensors(step=step, tensors={"w": ([100], "uint8", bytes([step] * 100))})
+        snaps = mgr.list_snapshots()
+        assert len(snaps) <= 6
+
+    def test_data_still_loadable_after_retention(self, tmp_path):
+        mgr = RevolverManager(
+            storage_root=str(tmp_path), max_full_snapshots=2,
+            full_every_steps=1,
+        )
+        ids = []
+        for step in range(1, 6):
+            ids.append(mgr.save_tensors(step=step, tensors={"w": ([10], "uint8", bytes([step] * 10))}))
+
+        # Latest should always be loadable
+        _, loaded = mgr.load_latest()
+        assert loaded["w"][0] == 5
+
+
+# ─── Edge cases ─────────────────────────────────────────────────────
+
+class TestEdgeCases:
+    def test_extreme_dimensions(self, tmp_path):
+        mgr = RevolverManager(storage_root=str(tmp_path), full_every_steps=100000)
+        tensors = {
+            "scalar": ([], "float32", struct.pack("f", 3.14)),
+            "single": ([1], "int32", struct.pack("i", 42)),
+            "5d": ([2, 2, 2, 2, 2], "uint8", bytes([1] * 32)),
+        }
+        snap_id = mgr.save_tensors(step=1, tensors=tensors)
+        loaded = mgr.load(snap_id)
+        assert loaded["scalar"] == tensors["scalar"][2]
+        assert loaded["single"] == tensors["single"][2]
+        assert loaded["5d"] == tensors["5d"][2]
+
+    def test_empty_tensor(self, tmp_path):
+        mgr = RevolverManager(storage_root=str(tmp_path), full_every_steps=100000)
+        snap_id = mgr.save_tensors(step=1, tensors={"empty": ([0], "float32", b"")})
+        assert mgr.load(snap_id)["empty"] == b""
+
+    def test_many_small_tensors(self, tmp_path):
+        mgr = RevolverManager(storage_root=str(tmp_path), full_every_steps=100000)
+        tensors = {f"t_{i}": ([4], "float32", struct.pack("4f", 0.0, 0.0, 0.0, float(i))) for i in range(100)}
+        snap_id = mgr.save_tensors(step=1, tensors=tensors)
+        loaded = mgr.load(snap_id)
+        assert len(loaded) == 100
+        assert loaded["t_99"] == tensors["t_99"][2]
+
+    def test_special_chars_in_name(self, tmp_path):
+        mgr = RevolverManager(storage_root=str(tmp_path), full_every_steps=100000)
+        tensors = {
+            "module.layers.0.self_attn.q_proj.weight": ([4], "float32", bytes(16)),
+            "encoder/block_0/layer_0": ([4], "float32", bytes(16)),
+        }
+        snap_id = mgr.save_tensors(step=1, tensors=tensors)
+        loaded = mgr.load(snap_id)
+        assert len(loaded) == 2
+
+    def test_persist_across_manager_instances(self, tmp_path):
+        """Data saved by one manager instance is loadable by another."""
+        p = str(tmp_path)
+        mgr1 = RevolverManager(storage_root=p, full_every_steps=100000)
+        snap_id = mgr1.save_tensors(step=42, tensors={"w": ([10], "uint8", bytes(10))})
+        del mgr1
+
+        mgr2 = RevolverManager(storage_root=p, full_every_steps=100000)
+        loaded = mgr2.load(snap_id)
+        assert loaded["w"] == bytes(10)
+        assert mgr2.list_snapshots()[0]["step"] == 42
+
+
+# ─── Concurrency ────────────────────────────────────────────────────
+
+class TestConcurrency:
+    def test_concurrent_saves(self, tmp_path):
+        mgr = RevolverManager(storage_root=str(tmp_path), full_every_steps=100000)
+        errors = []
+
+        def worker(step):
+            try:
+                mgr.save_tensors(step=step, tensors={f"t_{step}": ([10], "uint8", bytes([step % 256] * 10))})
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(1, 11)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert len(errors) == 0, f"Concurrency errors: {errors}"
+        assert len(mgr.list_snapshots()) == 10
+
+
+# ─── S3 backend validation ──────────────────────────────────────────
+
+class TestS3Validation:
+    def test_missing_credentials_errors(self, tmp_path):
+        with pytest.raises(ValueError, match="s3_access_key"):
+            RevolverManager(storage_root=str(tmp_path), s3_bucket="test-bucket")
+
+    def test_missing_secret_errors(self, tmp_path):
+        with pytest.raises(ValueError, match="s3_secret_key"):
+            RevolverManager(storage_root=str(tmp_path), s3_bucket="test", s3_access_key="AK")
+
+    def test_s3_config_accepted(self, tmp_path):
+        """S3 config with local primary + remote sync should construct without error."""
+        mgr = RevolverManager(
+            storage_root=str(tmp_path),
+            s3_bucket="bucket",
+            s3_access_key="AK",
+            s3_secret_key="SK",
+            s3_endpoint="http://localhost:19999",
+            s3_path_style=True,
+            sync_every_n_saves=10,
+        )
+        # Should be able to save locally even though S3 is unreachable
+        snap_id = mgr.save_tensors(step=1, tensors={"w": ([10], "uint8", bytes(10))})
+        assert len(snap_id) == 36

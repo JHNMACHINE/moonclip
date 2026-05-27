@@ -14,8 +14,10 @@ import os
 import pickle
 from typing import Any, Dict, List, Optional, Tuple
 
-
-import torch
+try:
+    import torch
+except ImportError:
+    torch = None  # type: ignore
 
 
 def _detect_distributed_env() -> Tuple[int, int]:
@@ -63,8 +65,7 @@ def _flatten_and_extract_tensors(val: Any, prefix: str, tensors_out: dict) -> An
         t = val.detach().cpu().contiguous()
         shape = list(t.shape)
         dtype = str(t.dtype).replace("torch.", "")
-        # numpy doesn't support bf16, so use raw byte access via untyped_storage
-        raw_bytes = bytes(t.untyped_storage())
+        raw_bytes = t.numpy().tobytes()
         tensors_out[prefix] = (shape, dtype, raw_bytes)
         return {
             "__tensor__": prefix,
@@ -353,84 +354,3 @@ class CheckpointManager:
 
     def merge_now(self):
         self._mgr.merge_now()
-
-    def stats(self) -> Dict[str, Any]:
-        """
-        Return aggregate checkpoint statistics.
-
-        Shows how much storage was saved by delta tracking, skipping,
-        and compression across all snapshots.
-
-        Returns dict with keys:
-            total_snapshots, full_snapshots, delta_snapshots,
-            total_tensors_saved, skipped_tensors, delta_tensors, full_tensors,
-            total_raw_bytes, total_compressed_bytes, compression_ratio,
-            estimated_naive_bytes, total_saved_bytes, savings_percent
-        """
-        snaps = self.list_snapshots()
-        if not snaps:
-            return {"total_snapshots": 0}
-
-        total_full_snaps = sum(1 for s in snaps if not s["is_delta"])
-        total_delta_snaps = sum(1 for s in snaps if s["is_delta"])
-
-        total_skipped = sum(s["skipped_tensors"] for s in snaps)
-        total_delta = sum(s["delta_tensors"] for s in snaps)
-        total_full = sum(s["full_tensors"] for s in snaps)
-        total_tensors = total_skipped + total_delta + total_full
-
-        total_raw = sum(s["total_raw"] for s in snaps)
-        total_compressed = sum(s["total_compressed"] for s in snaps)
-
-        # Estimate naive cost: if every snapshot were a full save with no compression
-        # Use the raw size of the first full snapshot as the baseline per-snapshot cost
-        first_full = next((s for s in snaps if not s["is_delta"]), snaps[0])
-        naive_per_snapshot = first_full["total_raw"]
-        estimated_naive = naive_per_snapshot * len(snaps)
-
-        saved = estimated_naive - total_compressed
-        savings_pct = (saved / estimated_naive * 100) if estimated_naive > 0 else 0.0
-        compression_ratio = (total_compressed / total_raw) if total_raw > 0 else 1.0
-
-        return {
-            "total_snapshots": len(snaps),
-            "full_snapshots": total_full_snaps,
-            "delta_snapshots": total_delta_snaps,
-            "total_tensors_saved": total_tensors,
-            "skipped_tensors": total_skipped,
-            "delta_tensors": total_delta,
-            "full_tensors": total_full,
-            "total_raw_bytes": total_raw,
-            "total_compressed_bytes": total_compressed,
-            "compression_ratio": compression_ratio,
-            "estimated_naive_bytes": estimated_naive,
-            "total_saved_bytes": saved,
-            "savings_percent": savings_pct,
-        }
-
-    def print_stats(self):
-        """Print a human-readable summary of checkpoint statistics."""
-        s = self.stats()
-        if s["total_snapshots"] == 0:
-            print("[Revolver] No checkpoints yet")
-            return
-
-        def _fmt(b):
-            if b >= 1 << 30:
-                return f"{b / (1 << 30):.2f} GB"
-            elif b >= 1 << 20:
-                return f"{b / (1 << 20):.1f} MB"
-            elif b >= 1 << 10:
-                return f"{b / (1 << 10):.1f} KB"
-            return f"{b} B"
-
-        print(f"\n{'─'*60}")
-        print(f"  Revolver Checkpoint Stats")
-        print(f"{'─'*60}")
-        print(f"  Snapshots:  {s['total_snapshots']}  ({s['full_snapshots']} full, {s['delta_snapshots']} delta)")
-        print(f"  Tensors:    {s['total_tensors_saved']}  ({s['full_tensors']} full, {s['delta_tensors']} delta, {s['skipped_tensors']} skipped)")
-        print(f"  Raw size:   {_fmt(s['total_raw_bytes'])}")
-        print(f"  On disk:    {_fmt(s['total_compressed_bytes'])}  (compression: {s['compression_ratio']:.1%})")
-        print(f"  Naive cost: {_fmt(s['estimated_naive_bytes'])}  (if every save were full, uncompressed)")
-        print(f"  Saved:      {_fmt(s['total_saved_bytes'])}  ({s['savings_percent']:.1f}% vs naive)")
-        print(f"{'─'*60}\n")
