@@ -12,23 +12,29 @@ jobs:
     container:
       image: rust:1.86-bookworm
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Python and deps
+      - name: Install deps
         run: |
           apt-get update -qq
-          apt-get install -y -qq python3 python3-pip python3-venv
+          apt-get install -y -qq git python3 python3-pip python3-venv
+
+      - name: Checkout
+        run: |
+          git clone --depth 1 ${{ gitea.server_url }}/${{ gitea.repository }}.git .
+          git checkout ${{ gitea.sha }} || true
+
+      - name: Setup Python venv
+        run: |
           python3 -m venv /opt/venv
           /opt/venv/bin/pip install -r requirements.txt
 
-      - name: Run Rust tests
+      - name: Rust tests
         run: cargo test --release
 
       - name: Build Python module
-        run: /opt/venv/bin/maturin develop --release
-        env:
-          VIRTUAL_ENV: /opt/venv
-          PATH: /opt/venv/bin:$PATH
+        run: |
+          export VIRTUAL_ENV=/opt/venv
+          export PATH="/opt/venv/bin:$PATH"
+          maturin develop --release
 
       - name: Run Python tests
         run: /opt/venv/bin/pytest tests/ -v
