@@ -4,30 +4,29 @@ version = "1.1.0"
 edition = "2021"
 description = "High-performance checkpoint management for ML training"
 license = "Apache-2.0"
+repository = "https://codeberg.org/JHNMACHINE/revolver"
 
 [lib]
 name = "revolver"
 crate-type = ["cdylib"]
 
 [dependencies]
-pyo3 = { version = "0.20.3", features = ["extension-module"] }
-serde = { version = "1.0.197", features = ["derive"] }
-serde_json = "1.0.114"
+pyo3 = { version = "0.24", features = ["extension-module"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 bincode = "1.3"
-zstd = "0.13.0"
-sha2 = "0.10.8"
-hmac = "0.12.1"
-thiserror = "1.0.57"
-chrono = { version = "0.4.34", default-features = false, features = ["clock", "serde"] }
-uuid = { version = "=1.6.1", features = ["v4", "serde"] }
-rayon = "=1.8.1"
-memmap2 = "0.9.4"
-walkdir = "2.4.0"
-tempfile = { version = "=3.10.0", default-features = false }
-ureq = "=2.7.1"
+zstd = "0.13"
+sha2 = "0.10"
+hmac = "0.12"
+thiserror = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+rayon = "1.8"
+memmap2 = "0.9"
+walkdir = "2"
+tempfile = "3"
+ureq = "2"
 hex = "0.4"
-url = "=2.4.1"
-idna = "=0.4.0"
 
 [profile.release]
 lto = true

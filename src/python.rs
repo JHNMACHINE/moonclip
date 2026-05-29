@@ -1,5 +1,5 @@
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict};
+use pyo3::types::{PyBytes, PyDict, PyString, PyTuple};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -12,7 +12,7 @@ use crate::s3::{S3Config, S3Storage};
 use crate::storage::LocalStorage;
 use crate::tensor::TensorData;
 
-fn extract_metadata(metadata: Option<&PyDict>) -> PyResult<HashMap<String, String>> {
+fn extract_metadata(metadata: Option<Bound<'_, PyDict>>) -> PyResult<HashMap<String, String>> {
     match metadata {
         Some(d) => {
             let mut m = HashMap::new();
@@ -25,42 +25,25 @@ fn extract_metadata(metadata: Option<&PyDict>) -> PyResult<HashMap<String, Strin
     }
 }
 
-/// Extract tensors from a Python dict: {"name": (shape_list, dtype_str, bytes)}
-fn extract_tensors(tensors: &PyDict) -> PyResult<Vec<TensorData>> {
+fn extract_tensors(tensors: &Bound<'_, PyDict>) -> PyResult<Vec<TensorData>> {
     let mut result = Vec::new();
     for (key, value) in tensors.iter() {
         let name: String = key.extract()?;
-        let tuple = value.downcast::<pyo3::types::PyTuple>()?;
+        let tuple = value.downcast::<PyTuple>()?;
         let shape: Vec<usize> = tuple.get_item(0)?.extract()?;
         let dtype: String = tuple.get_item(1)?.extract()?;
-        let data: &[u8] = tuple.get_item(2)?.extract()?;
+        let data: Vec<u8> = tuple.get_item(2)?.extract()?;
         result.push(TensorData {
             name,
             shape,
             dtype,
-            data: data.to_vec(),
+            data,
         });
     }
     Ok(result)
 }
 
 /// High-performance checkpoint manager for ML training.
-///
-/// DECK-inspired architecture with per-tensor delta tracking,
-/// rank-aware saves, hierarchical merging, and lineage graph.
-///
-/// Example (single rank):
-///     import revolver
-///     mgr = revolver.RevolverManager("./checkpoints")
-///     snap_id = mgr.save_tensors(step=1000, tensors={...})
-///     snap_id, tensors = mgr.load_latest()
-///
-/// Example (multi-rank FSDP):
-///     mgr = revolver.RevolverManager("./checkpoints", world_size=8, rank=dist.get_rank())
-///     snap_id = mgr.create_snapshot(step=1000)
-///     mgr.save_rank(snap_id, tensors={...})
-///     # barrier
-///     if rank == 0: mgr.finalize_snapshot(snap_id)
 #[pyclass]
 pub struct RevolverManager {
     inner: Coordinator,
@@ -121,7 +104,7 @@ impl RevolverManager {
             CompressionAlgo::Zstd { level: compression_level }
         };
 
-        let config = CoordinatorConfig {
+        let mut config = CoordinatorConfig {
             world_size,
             rank,
             compression,
@@ -145,15 +128,12 @@ impl RevolverManager {
             save_dtype: DType::from_str(save_dtype),
         };
 
-        // Storage setup:
-        // - If S3 is configured: local is primary (page-aligned), S3 is remote (batched sync)
-        // - If no S3: local only
-        let (storage, mut config) = if let Some(bucket) = s3_bucket {
+        let storage: Arc<dyn crate::storage::StorageBackend> = if let Some(bucket) = s3_bucket {
             let ak = s3_access_key.ok_or_else(|| {
-                pyo3::exceptions::PyValueError::new_err("s3_access_key required")
+                pyo3::exceptions::PyValueError::new_err("s3_access_key required when s3_bucket is set")
             })?;
             let sk = s3_secret_key.ok_or_else(|| {
-                pyo3::exceptions::PyValueError::new_err("s3_secret_key required")
+                pyo3::exceptions::PyValueError::new_err("s3_secret_key required when s3_bucket is set")
             })?;
 
             let remote: Arc<dyn crate::storage::StorageBackend> =
@@ -168,20 +148,16 @@ impl RevolverManager {
                     timeout_secs: 30,
                 })?);
 
-            // Local is primary, S3 is synced in batches
             let local: Arc<dyn crate::storage::StorageBackend> =
                 Arc::new(LocalStorage::new(storage_root)?);
 
-            let mut cfg = config;
-            cfg.remote_storage = Some(Arc::clone(&remote));
-            cfg.remote_sync = Some(RemoteSyncConfig {
+            config.remote_storage = Some(Arc::clone(&remote));
+            config.remote_sync = Some(RemoteSyncConfig {
                 sync_every_n_saves: sync_every_n_saves,
             });
-            (local, cfg)
+            local
         } else {
-            let local: Arc<dyn crate::storage::StorageBackend> =
-                Arc::new(LocalStorage::new(storage_root)?);
-            (local, config)
+            Arc::new(LocalStorage::new(storage_root)?)
         };
 
         let inner = Coordinator::new(storage, config)?;
@@ -189,22 +165,14 @@ impl RevolverManager {
     }
 
     /// Save a checkpoint (single-rank mode).
-    ///
-    /// Args:
-    ///     step: Training step.
-    ///     tensors: Dict mapping tensor_name → (shape, dtype, bytes).
-    ///     metadata: Optional dict of string metadata.
-    ///
-    /// Returns:
-    ///     Snapshot UUID string.
     #[pyo3(signature = (step, tensors, metadata = None))]
     fn save_tensors(
         &self,
         step: u64,
-        tensors: &PyDict,
-        metadata: Option<&PyDict>,
+        tensors: Bound<'_, PyDict>,
+        metadata: Option<Bound<'_, PyDict>>,
     ) -> PyResult<String> {
-        let tensor_data = extract_tensors(tensors)?;
+        let tensor_data = extract_tensors(&tensors)?;
         let meta = extract_metadata(metadata)?;
         let id = self.inner.save(step, tensor_data, meta)?;
         Ok(id.to_string())
@@ -215,7 +183,7 @@ impl RevolverManager {
     fn create_snapshot(
         &self,
         step: u64,
-        metadata: Option<&PyDict>,
+        metadata: Option<Bound<'_, PyDict>>,
     ) -> PyResult<String> {
         let meta = extract_metadata(metadata)?;
         let id = self.inner.create_snapshot(step, meta)?;
@@ -223,10 +191,10 @@ impl RevolverManager {
     }
 
     /// Save this rank's tensors into an existing snapshot (multi-rank).
-    fn save_rank(&self, snap_id: &str, tensors: &PyDict) -> PyResult<()> {
+    fn save_rank(&self, snap_id: &str, tensors: Bound<'_, PyDict>) -> PyResult<()> {
         let uuid = uuid::Uuid::parse_str(snap_id)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
-        let tensor_data = extract_tensors(tensors)?;
+        let tensor_data = extract_tensors(&tensors)?;
         self.inner.save_rank(uuid, tensor_data)?;
         Ok(())
     }
@@ -240,7 +208,7 @@ impl RevolverManager {
     }
 
     /// Load a snapshot. Returns dict of tensor_name → bytes.
-    fn load<'py>(&self, py: Python<'py>, snap_id: &str) -> PyResult<&'py PyDict> {
+    fn load<'py>(&self, py: Python<'py>, snap_id: &str) -> PyResult<Bound<'py, PyDict>> {
         let uuid = uuid::Uuid::parse_str(snap_id)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
         let tensors = self.inner.load(uuid)?;
@@ -252,17 +220,18 @@ impl RevolverManager {
     }
 
     /// Load the latest snapshot.
-    fn load_latest<'py>(&self, py: Python<'py>) -> PyResult<(&'py pyo3::types::PyString, &'py PyDict)> {
+    fn load_latest<'py>(&self, py: Python<'py>) -> PyResult<(Bound<'py, PyString>, Bound<'py, PyDict>)> {
         let (id, tensors) = self.inner.load_latest()?;
         let dict = PyDict::new(py);
         for (name, data) in tensors {
             dict.set_item(name, PyBytes::new(py, &data))?;
         }
-        Ok((pyo3::types::PyString::new(py, &id.to_string()), dict))
+        let id_str = PyString::new(py, &id.to_string());
+        Ok((id_str, dict))
     }
 
     /// List all finalized snapshots.
-    fn list_snapshots<'py>(&self, py: Python<'py>) -> PyResult<Vec<&'py PyDict>> {
+    fn list_snapshots<'py>(&self, py: Python<'py>) -> PyResult<Vec<Bound<'py, PyDict>>> {
         let snaps = self.inner.list_snapshots();
         let mut result = Vec::new();
         for s in snaps {
@@ -286,20 +255,20 @@ impl RevolverManager {
         Ok(result)
     }
 
-    /// Force merge all pending deltas into a full checkpoint.
+    /// Force merge all pending deltas.
     fn merge_now(&self) {
         self.inner.merge_now();
     }
 
-    /// Force sync all local data to remote storage immediately.
+    /// Force sync to remote storage.
     fn sync_now(&self) {
         self.inner.sync_now();
     }
 }
 
 #[pymodule]
-fn revolver(_py: Python, m: &PyModule) -> PyResult<()> {
+fn revolver(m: &Bound<'_, pyo3::types::PyModule>) -> PyResult<()> {
     m.add_class::<RevolverManager>()?;
-    m.add("__version__", "1.0.0")?;
+    m.add("__version__", "1.1.0")?;
     Ok(())
 }

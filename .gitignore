@@ -5,8 +5,10 @@ __pycache__/
 .pytest_cache/
 *.py[cod]
 
-# C extensions
+# Native extensions
 *.so
+*.pyd
+*.pdb
 
 # Distribution / packaging
 .Python
@@ -70,3 +72,6 @@ docs/_build/
 
 # Pyenv
 .python-version
+
+# Training artifacts
+revolver_*_ckpts/

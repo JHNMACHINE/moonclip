@@ -1,17 +1,29 @@
 from typing import Any, Dict, List, Optional, Tuple
 
+def flatten_state_dict(
+    state_dict: dict,
+    prefix: str = "",
+) -> Tuple[dict, Any]:
+    """
+    Flatten a PyTorch state_dict into individual tensor bytes.
+
+    Returns:
+        Tuple of (tensors_dict, metadata_structure) where:
+        - tensors_dict: {name: (shape, dtype, bytes)}
+        - metadata_structure: state_dict with tensors replaced by placeholders
+    """
+    ...
+
 class CheckpointManager:
     """
     PyTorch-aware checkpoint manager with auto-detection of torchrun environment.
-
-    If world_size/rank are not specified, auto-detects from:
-    1. torch.distributed (if initialized)
-    2. torchrun env vars (RANK, WORLD_SIZE)
-    3. Defaults to single-rank (world_size=1, rank=0)
     """
 
     world_size: int
     rank: int
+    save_dtype: str
+    last_resume_metadata: Dict[str, str]
+    _mgr: Any  # RevolverManager (Rust)
 
     def __init__(
         self,
@@ -25,6 +37,7 @@ class CheckpointManager:
         rank: Optional[int] = None,
         merge_stride: int = 0,
         merge_max_chain: int = 10,
+        save_dtype: str = "none",
         **kwargs: Any,
     ) -> None: ...
 
@@ -38,6 +51,15 @@ class CheckpointManager:
         extra: Optional[Dict[str, Any]] = None,
         metadata: Optional[Dict[str, str]] = None,
     ) -> str: ...
+
+    def save_raw(
+        self,
+        step: int,
+        tensors: dict,
+        metadata: Optional[Dict[str, str]] = None,
+    ) -> str:
+        """Save pre-flattened tensors directly (for background executor pattern)."""
+        ...
 
     def load(
         self,
@@ -56,11 +78,6 @@ class CheckpointManager:
         scaler: Optional[Any] = None,
     ) -> Tuple[str, Dict[str, Any]]: ...
 
-    def list_snapshots(self) -> List[Dict[str, Any]]: ...
-    def merge_now(self) -> None: ...
-
-    last_resume_metadata: Dict[str, str]
-
     def resume(
         self,
         model: Optional[Any] = None,
@@ -68,10 +85,17 @@ class CheckpointManager:
         scheduler: Optional[Any] = None,
         scaler: Optional[Any] = None,
     ) -> int:
-        """
-        Auto-resume from the latest checkpoint if one exists.
+        """Auto-resume from latest checkpoint. Returns next step (0 if none)."""
+        ...
 
-        Returns:
-            Next training step (0 if no checkpoints, last_step + 1 otherwise).
-        """
+    def list_snapshots(self) -> List[Dict[str, Any]]: ...
+    def merge_now(self) -> None: ...
+    def sync_now(self) -> None: ...
+
+    def stats(self) -> Dict[str, Any]:
+        """Return aggregate checkpoint statistics."""
+        ...
+
+    def print_stats(self) -> None:
+        """Print human-readable checkpoint statistics."""
         ...

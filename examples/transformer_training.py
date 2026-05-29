@@ -33,6 +33,7 @@ from revolver import CheckpointManager
 # ─── Model ───────────────────────────────────────────────────────────
 
 class CausalSelfAttention(nn.Module):
+    mask: torch.Tensor
     def __init__(self, d_model: int, n_heads: int, max_seq_len: int, dropout: float = 0.1):
         super().__init__()
         assert d_model % n_heads == 0

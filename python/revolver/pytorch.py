@@ -99,6 +99,39 @@ def _flatten_and_extract_tensors(val: Any, prefix: str, tensors_out: dict) -> An
         return val
 
 
+def flatten_state_dict(
+    state_dict: dict,
+    prefix: str = "",
+) -> Tuple[dict, Any]:
+    """
+    Flatten a PyTorch state_dict into individual tensor bytes.
+
+    Extracts all tensors and returns them in the format expected by
+    RevolverManager.save_tensors() and CheckpointManager.save_raw().
+
+    Useful for the background executor pattern: serialize tensors in the
+    main thread, then submit the dict to a background thread for saving.
+
+    Args:
+        state_dict: A PyTorch state_dict (from model or optimizer).
+        prefix: Key prefix for tensor names (e.g. "model", "optimizer").
+
+    Returns:
+        Tuple of (tensors_dict, metadata_structure) where:
+        - tensors_dict: {name: (shape, dtype, bytes)}
+        - metadata_structure: the state_dict with tensors replaced by placeholders
+
+    Example:
+        tensors, meta = flatten_state_dict(model.state_dict(), "model")
+        # tensors = {"model/weight": ([512, 512], "float32", b"..."), ...}
+        # Submit to background:
+        executor.submit(mgr.save_raw, step=1000, tensors=tensors)
+    """
+    tensors_out: dict = {}
+    metadata = _flatten_and_extract_tensors(state_dict, prefix, tensors_out)
+    return tensors_out, metadata
+
+
 def _reconstruct_from_tensors(meta: Any, tensors_in: dict) -> Any:
     """
     Recursively walks meta (the template structure).
@@ -373,6 +406,30 @@ class CheckpointManager:
 
     def merge_now(self):
         self._mgr.merge_now()
+
+    def sync_now(self):
+        """Force sync all local data to remote storage."""
+        self._mgr.sync_now()
+
+    def save_raw(
+        self,
+        step: int,
+        tensors: dict,
+        metadata: Optional[Dict[str, str]] = None,
+    ) -> str:
+        """
+        Save pre-flattened tensors directly (for background executor pattern).
+
+        Args:
+            step: Training step.
+            tensors: Dict mapping name → (shape, dtype, bytes), as returned
+                     by flatten_state_dict().
+            metadata: Optional string metadata.
+
+        Returns:
+            Snapshot UUID string.
+        """
+        return self._mgr.save_tensors(step=step, tensors=tensors, metadata=metadata or {})
 
     def stats(self) -> Dict[str, Any]:
         """

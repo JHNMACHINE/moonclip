@@ -65,6 +65,7 @@ from revolver import CheckpointManager
 # ─── Model (same MiniGPT from transformer_training.py) ──────────────
 
 class CausalSelfAttention(nn.Module):
+    mask: torch.Tensor
     def __init__(self, d_model, n_heads, max_seq_len, dropout=0.1):
         super().__init__()
         self.n_heads = n_heads
@@ -208,6 +209,9 @@ def train(args):
     print(f"{'='*70}\n")
 
     t_start = time.perf_counter()
+
+    epoch_loss = 0.0
+    epoch_steps = 0
 
     for epoch in range(args.epochs):
         epoch_loss = 0.0
