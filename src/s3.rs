@@ -69,7 +69,7 @@ impl S3Config {
     }
 
     /// Build the base URL for requests.
-    #[warn(dead_code)]
+    #[allow(dead_code)]
     fn base_url(&self) -> String {
         let default_endpoint = format!("https://s3.{}.amazonaws.com", self.region);
         let endpoint = self.endpoint.as_deref().unwrap_or(&default_endpoint);
