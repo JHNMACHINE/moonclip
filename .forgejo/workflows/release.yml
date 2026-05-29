@@ -1,0 +1,38 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-and-publish:
+    runs-on: codeberg-small
+    container:
+      image: rust:1.86-bookworm
+    steps:
+      - name: Install deps
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq git python3 python3-pip python3-venv
+
+      - name: Checkout
+        run: |
+          git clone --depth 1 --branch ${{ forgejo.ref_name }} ${{ forgejo.server_url }}/${{ forgejo.repository }}.git .
+
+      - name: Build wheels
+        run: |
+          python3 -m venv /opt/venv
+          /opt/venv/bin/pip install maturin twine
+          export VIRTUAL_ENV=/opt/venv
+          export PATH="/opt/venv/bin:$PATH"
+          export PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1
+          maturin build --release --interpreter python3
+
+      - name: Publish to Codeberg Packages
+        run: |
+          /opt/venv/bin/twine upload \
+            --repository-url ${{ forgejo.server_url }}/api/packages/${{ forgejo.repository_owner }}/pypi \
+            --username ${{ forgejo.repository_owner }} \
+            --password ${{ secrets.PUBLISH_TOKEN }} \
+            target/wheels/*.whl
