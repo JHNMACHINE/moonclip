@@ -31,4 +31,4 @@ jobs:
           PATH: /opt/venv/bin:$PATH
 
       - name: Run Python tests
-        run: /opt/venv/bin/pytest tests/test_integration.py tests/test_distributed.py -v
+        run: /opt/venv/bin/pytest tests/ -v
