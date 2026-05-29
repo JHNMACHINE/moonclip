@@ -8,7 +8,7 @@ on:
 
 jobs:
   test:
-    runs-on: codeberg-tiny
+    runs-on: codeberg-small
     container:
       image: rust:1.86-bookworm
     steps:
@@ -22,19 +22,14 @@ jobs:
           git clone --depth 1 ${{ forgejo.server_url }}/${{ forgejo.repository }}.git .
           git checkout ${{ forgejo.sha }} || true
 
-      - name: Setup Python
+      - name: Rust tests
+        run: cargo test
+
+      - name: Build and test Python
         run: |
           python3 -m venv /opt/venv
           /opt/venv/bin/pip install maturin pytest
-
-      - name: Rust tests
-        run: cargo test --release
-
-      - name: Build Python module
-        run: |
           export VIRTUAL_ENV=/opt/venv
           export PATH="/opt/venv/bin:$PATH"
-          maturin develop --release
-
-      - name: Python tests
-        run: /opt/venv/bin/pytest tests/ -v
+          maturin develop
+          pytest tests/ -v
