@@ -43,6 +43,7 @@ torch = ["torch>=2.0"]
 features = ["pyo3/extension-module"]
 python-source = "python"
 module-name = "revolver.revolver"
+environment = {PYO3_USE_ABI3_FORWARD_COMPATIBILITY = "1"}
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
