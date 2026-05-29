@@ -10,7 +10,7 @@ use crate::manifest::*;
 use crate::merger::{DeltaMerger, MergerConfig};
 use crate::remote_sync::{RemoteSyncConfig, RemoteSyncer};
 use crate::storage::StorageBackend;
-use crate::tensor::{self, ProcessedTensor, TensorData};
+use crate::tensor::{self, TensorData};
 
 /// Configuration for the coordinator.
 pub struct CoordinatorConfig {
