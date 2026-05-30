@@ -65,7 +65,13 @@ class TestCheckpointManager:
         optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
         scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1)
 
+       # Need a dummy forward/backward before scheduler.step()
+        x = torch.randn(1, 8)
+        loss = model(x).sum()
+        loss.backward()
+        optimizer.step()
         scheduler.step()
+        optimizer.step()
         scheduler.step()
         original_lr = optimizer.param_groups[0]["lr"]
 

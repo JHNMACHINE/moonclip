@@ -20,7 +20,7 @@ class TestDistributedEnvDetection:
         monkeypatch.delenv("WORLD_SIZE", raising=False)
         monkeypatch.delenv("LOCAL_RANK", raising=False)
 
-        from revolver.pytorch import _detect_distributed_env
+        from revolver._env import _detect_distributed_env
         ws, r = _detect_distributed_env()
         assert ws == 1
         assert r == 0
@@ -30,7 +30,7 @@ class TestDistributedEnvDetection:
         monkeypatch.setenv("RANK", "3")
         monkeypatch.setenv("WORLD_SIZE", "8")
 
-        from revolver.pytorch import _detect_distributed_env
+        from revolver._env import _detect_distributed_env
         ws, r = _detect_distributed_env()
         assert ws == 8
         assert r == 3
@@ -40,7 +40,7 @@ class TestDistributedEnvDetection:
         monkeypatch.setenv("RANK", "2")
         monkeypatch.delenv("WORLD_SIZE", raising=False)
 
-        from revolver.pytorch import _detect_distributed_env
+        from revolver._env import _detect_distributed_env
         ws, r = _detect_distributed_env()
         assert ws == 1
         assert r == 0
@@ -50,7 +50,7 @@ class TestDistributedEnvDetection:
         monkeypatch.setenv("RANK", "abc")
         monkeypatch.setenv("WORLD_SIZE", "xyz")
 
-        from revolver.pytorch import _detect_distributed_env
+        from revolver._env import _detect_distributed_env
         ws, r = _detect_distributed_env()
         assert ws == 1
         assert r == 0
@@ -60,7 +60,7 @@ class TestDistributedEnvDetection:
         monkeypatch.setenv("RANK", "0")
         monkeypatch.setenv("WORLD_SIZE", "4")
 
-        from revolver.pytorch import _detect_distributed_env
+        from revolver._env import _detect_distributed_env
         ws, r = _detect_distributed_env()
         assert ws == 4
         assert r == 0
@@ -70,7 +70,7 @@ class TestDistributedEnvDetection:
         monkeypatch.setenv("RANK", "0")
         monkeypatch.setenv("WORLD_SIZE", "1")
 
-        from revolver.pytorch import _detect_distributed_env
+        from revolver._env import _detect_distributed_env
         ws, r = _detect_distributed_env()
         assert ws == 1
         assert r == 0

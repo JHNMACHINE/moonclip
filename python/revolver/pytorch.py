@@ -16,40 +16,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
-
-def _detect_distributed_env() -> Tuple[int, int]:
-    """
-    Auto-detect world_size and rank from the distributed environment.
-
-    Detection priority:
-    1. torch.distributed (if already initialized)
-    2. torchrun env vars: RANK, WORLD_SIZE
-    3. DeepSpeed / other launchers: same env vars
-    4. Defaults: world_size=1, rank=0
-
-    torchrun sets: RANK, WORLD_SIZE, LOCAL_RANK, MASTER_ADDR, MASTER_PORT
-    """
-    # 1. torch.distributed already initialized
-    if torch is not None:
-        try:
-            import torch.distributed as dist
-            if dist.is_initialized():
-                return dist.get_world_size(), dist.get_rank()
-        except Exception:
-            pass
-
-    # 2. Environment variables (torchrun, deepspeed, etc.)
-    env_world_size = os.environ.get("WORLD_SIZE")
-    env_rank = os.environ.get("RANK")
-
-    if env_world_size is not None and env_rank is not None:
-        try:
-            return int(env_world_size), int(env_rank)
-        except ValueError:
-            pass
-
-    # 3. Defaults
-    return 1, 0
+from revolver._env import _detect_distributed_env
 
 
 def _tensor_to_bytes(t: "torch.Tensor") -> bytes:
@@ -189,9 +156,6 @@ class CheckpointManager:
         save_dtype: str = "none",
         **kwargs,
     ):
-        if torch is None:
-            raise ImportError("PyTorch is required for CheckpointManager")
-
         from revolver import RevolverManager
 
         # Auto-detect from torchrun / torch.distributed environment
@@ -628,9 +592,6 @@ class CheckpointManager:
         Usage:
             mgr.save_to_pt("harold_v0.9_final.pt", model=model, optimizer=optimizer)
         """
-        if torch is None:
-            raise ImportError("PyTorch is required for save_to_pt")
-
         state = {}
         if model is not None:
             state["model"] = model.state_dict()
@@ -668,9 +629,6 @@ class CheckpointManager:
         Usage:
             mgr.save_to_safetensors("harold_v0.9.safetensors", model=model)
         """
-        if torch is None:
-            raise ImportError("PyTorch is required for save_to_safetensors")
-
         try:
             from safetensors.torch import save_file
         except ImportError:
