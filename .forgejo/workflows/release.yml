@@ -32,13 +32,12 @@ jobs:
           ls -la target/wheels/
 
       - name: Publish to Codeberg Packages
+        env:
+          TWINE_REPOSITORY_URL: ${{ forgejo.server_url }}/api/packages/${{ forgejo.repository_owner }}/pypi
+          TWINE_USERNAME: ${{ forgejo.repository_owner }}
+          TWINE_PASSWORD: ${{ secrets.PUBLISH_TOKEN }}
         run: |
           export PATH="/opt/venv/bin:$PATH"
           WHEEL=$(find target/wheels -name '*.whl' -type f | head -1)
-          if [ -z "$WHEEL" ]; then echo "No wheel found!" && exit 1; fi
           echo "Uploading: $WHEEL"
-          twine upload \
-            --repository-url ${{ forgejo.server_url }}/api/packages/${{ forgejo.repository_owner }}/pypi \
-            --username ${{ forgejo.repository_owner }} \
-            --password ${{ secrets.PUBLISH_TOKEN }} \
-            "$WHEEL"
+          twine upload "$WHEEL"
