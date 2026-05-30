@@ -4,26 +4,18 @@ def flatten_state_dict(
     state_dict: dict,
     prefix: str = "",
 ) -> Tuple[dict, Any]:
-    """
-    Flatten a PyTorch state_dict into individual tensor bytes.
-
-    Returns:
-        Tuple of (tensors_dict, metadata_structure) where:
-        - tensors_dict: {name: (shape, dtype, bytes)}
-        - metadata_structure: state_dict with tensors replaced by placeholders
-    """
+    """Flatten a PyTorch state_dict into individual tensor bytes."""
     ...
 
 class CheckpointManager:
-    """
-    PyTorch-aware checkpoint manager with auto-detection of torchrun environment.
-    """
+    """PyTorch-aware checkpoint manager with auto-detection of torchrun environment."""
 
     world_size: int
     rank: int
     save_dtype: str
     last_resume_metadata: Dict[str, str]
-    _mgr: Any  # RevolverManager (Rust)
+    _mgr: Any
+    _best_metric: Optional[float]
 
     def __init__(
         self,
@@ -59,6 +51,53 @@ class CheckpointManager:
         metadata: Optional[Dict[str, str]] = None,
     ) -> str:
         """Save pre-flattened tensors directly (for background executor pattern)."""
+        ...
+
+    def save_best(
+        self,
+        step: int,
+        metric: float,
+        model: Optional[Any] = None,
+        optimizer: Optional[Any] = None,
+        scheduler: Optional[Any] = None,
+        scaler: Optional[Any] = None,
+        metric_name: str = "val_loss",
+        lower_is_better: bool = True,
+        metadata: Optional[Dict[str, str]] = None,
+    ) -> Optional[str]:
+        """Save checkpoint only if the metric improves. Returns snap_id or None."""
+        ...
+
+    def save_final(
+        self,
+        step: int,
+        model: Optional[Any] = None,
+        optimizer: Optional[Any] = None,
+        scheduler: Optional[Any] = None,
+        scaler: Optional[Any] = None,
+        metadata: Optional[Dict[str, str]] = None,
+    ) -> str:
+        """Save final checkpoint, merge deltas, sync remote."""
+        ...
+
+    def save_to_pt(
+        self,
+        path: str,
+        model: Optional[Any] = None,
+        optimizer: Optional[Any] = None,
+        scheduler: Optional[Any] = None,
+        scaler: Optional[Any] = None,
+    ) -> str:
+        """Export current state as a standard PyTorch .pt file."""
+        ...
+
+    def save_to_safetensors(
+        self,
+        path: str,
+        model: Optional[Any] = None,
+        metadata: Optional[Dict[str, str]] = None,
+    ) -> str:
+        """Export model weights as a safetensors file. Requires: pip install safetensors"""
         ...
 
     def load(

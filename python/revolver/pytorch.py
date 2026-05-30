@@ -14,10 +14,7 @@ import os
 import pickle
 from typing import Any, Dict, List, Optional, Tuple
 
-try:
-    import torch
-except ImportError:
-    torch = None  # type: ignore
+import torch
 
 
 def _detect_distributed_env() -> Tuple[int, int]:
@@ -208,6 +205,7 @@ class CheckpointManager:
         self.world_size = world_size
         self.rank = rank
         self.save_dtype = save_dtype
+        self._best_metric: Optional[float] = None
 
         self._mgr = RevolverManager(
             storage_root=storage_root,
@@ -511,3 +509,184 @@ class CheckpointManager:
         print(f"  Naive cost: {_fmt(s['estimated_naive_bytes'])}  (if every save were full, uncompressed)")
         print(f"  Saved:      {_fmt(s['total_saved_bytes'])}  ({s['savings_percent']:.1f}% vs naive)")
         print(f"{'─'*60}\n")
+
+    # ─── Convenience save methods ────────────────────────────────────
+
+    def save_best(
+        self,
+        step: int,
+        metric: float,
+        model: Optional[Any] = None,
+        optimizer: Optional[Any] = None,
+        scheduler: Optional[Any] = None,
+        scaler: Optional[Any] = None,
+        metric_name: str = "val_loss",
+        lower_is_better: bool = True,
+        metadata: Optional[Dict[str, str]] = None,
+    ) -> Optional[str]:
+        """
+        Save a checkpoint only if the metric improves.
+
+        Tracks the best metric value internally. Returns the snapshot ID
+        if saved, None if the metric did not improve.
+
+        Args:
+            step: Training step.
+            metric: Current metric value (e.g. validation loss).
+            model: Model to save.
+            optimizer: Optimizer to save.
+            metric_name: Name of the metric for metadata.
+            lower_is_better: If True, lower metric = better (loss).
+                             If False, higher = better (accuracy).
+
+        Usage:
+            val_loss = evaluate(model)
+            mgr.save_best(step, metric=val_loss, model=model, optimizer=optimizer)
+        """
+        is_better = False
+        if not hasattr(self, "_best_metric") or self._best_metric is None:
+            is_better = True
+        elif lower_is_better and metric < self._best_metric:
+            is_better = True
+        elif not lower_is_better and metric > self._best_metric:
+            is_better = True
+
+        if not is_better:
+            return None
+
+        self._best_metric = metric
+
+        meta = metadata.copy() if metadata else {}
+        meta["best"] = "true"
+        meta[metric_name] = f"{metric:.6f}"
+
+        snap_id = self.save(
+            step=step,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=scaler,
+            metadata=meta,
+        )
+        print(f"[Revolver] New best {metric_name}={metric:.6f} at step {step}")
+        return snap_id
+
+    def save_final(
+        self,
+        step: int,
+        model: Optional[Any] = None,
+        optimizer: Optional[Any] = None,
+        scheduler: Optional[Any] = None,
+        scaler: Optional[Any] = None,
+        metadata: Optional[Dict[str, str]] = None,
+    ) -> str:
+        """
+        Save a final checkpoint and merge all deltas.
+
+        Call at the end of training. Saves, merges pending deltas,
+        and optionally syncs to remote storage.
+
+        Usage:
+            mgr.save_final(step=100_000, model=model, optimizer=optimizer)
+        """
+        meta = metadata.copy() if metadata else {}
+        meta["final"] = "true"
+
+        snap_id = self.save(
+            step=step,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=scaler,
+            metadata=meta,
+        )
+        self.merge_now()
+        self.sync_now()
+        print(f"[Revolver] Final checkpoint saved at step {step}")
+        return snap_id
+
+    def save_to_pt(
+        self,
+        path: str,
+        model: Optional[Any] = None,
+        optimizer: Optional[Any] = None,
+        scheduler: Optional[Any] = None,
+        scaler: Optional[Any] = None,
+    ) -> str:
+        """
+        Export the current state as a standard PyTorch .pt file.
+
+        Creates a file compatible with torch.load(). Useful for
+        sharing models without requiring Revolver.
+
+        Args:
+            path: Output file path (e.g. "model.pt").
+            model: Model to export.
+            optimizer: Optimizer to export (optional).
+            scheduler: Scheduler to export (optional).
+
+        Usage:
+            mgr.save_to_pt("harold_v0.9_final.pt", model=model, optimizer=optimizer)
+        """
+        if torch is None:
+            raise ImportError("PyTorch is required for save_to_pt")
+
+        state = {}
+        if model is not None:
+            state["model"] = model.state_dict()
+        if optimizer is not None:
+            state["optimizer"] = optimizer.state_dict()
+        if scheduler is not None:
+            state["scheduler"] = scheduler.state_dict()
+        if scaler is not None:
+            state["scaler"] = scaler.state_dict()
+
+        torch.save(state, path)
+        size_mb = os.path.getsize(path) / (1024 * 1024)
+        print(f"[Revolver] Exported to {path} ({size_mb:.1f} MB)")
+        return path
+
+    def save_to_safetensors(
+        self,
+        path: str,
+        model: Optional[Any] = None,
+        metadata: Optional[Dict[str, str]] = None,
+    ) -> str:
+        """
+        Export model weights as a safetensors file.
+
+        Creates a file compatible with the safetensors format.
+        Only model weights are saved (no optimizer state).
+
+        Requires: pip install safetensors
+
+        Args:
+            path: Output file path (e.g. "model.safetensors").
+            model: Model to export.
+            metadata: Optional string metadata dict.
+
+        Usage:
+            mgr.save_to_safetensors("harold_v0.9.safetensors", model=model)
+        """
+        if torch is None:
+            raise ImportError("PyTorch is required for save_to_safetensors")
+
+        try:
+            from safetensors.torch import save_file
+        except ImportError:
+            raise ImportError(
+                "safetensors is required for save_to_safetensors. "
+                "Install with: pip install safetensors"
+            )
+
+        if model is None:
+            raise ValueError("model is required for save_to_safetensors")
+
+        state_dict = model.state_dict()
+        # safetensors only supports tensors, filter out non-tensors
+        tensors = {k: v for k, v in state_dict.items() if torch.is_tensor(v)}
+
+        save_file(tensors, path, metadata=metadata)
+        size_mb = os.path.getsize(path) / (1024 * 1024)
+        print(f"[Revolver] Exported to {path} ({size_mb:.1f} MB, {len(tensors)} tensors)")
+        return path
