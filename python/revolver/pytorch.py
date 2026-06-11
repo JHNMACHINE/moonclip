@@ -8,11 +8,12 @@ Usage:
     mgr.save(step=1000, model=model, optimizer=optimizer, metadata={"loss": "0.634"})
     mgr.load_latest(model=model, optimizer=optimizer)
 """
+
 from __future__ import annotations
 
 import os
 import pickle
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 
@@ -54,11 +55,20 @@ def _flatten_and_extract_tensors(val: Any, prefix: str, tensors_out: dict) -> An
             "dtype": dtype,
         }
     elif isinstance(val, dict):
-        return {k: _flatten_and_extract_tensors(v, f"{prefix}/{k}", tensors_out) for k, v in val.items()}
+        return {
+            k: _flatten_and_extract_tensors(v, f"{prefix}/{k}", tensors_out)
+            for k, v in val.items()
+        }
     elif isinstance(val, list):
-        return [_flatten_and_extract_tensors(v, f"{prefix}/{idx}", tensors_out) for idx, v in enumerate(val)]
+        return [
+            _flatten_and_extract_tensors(v, f"{prefix}/{idx}", tensors_out)
+            for idx, v in enumerate(val)
+        ]
     elif isinstance(val, tuple):
-        return tuple(_flatten_and_extract_tensors(v, f"{prefix}/{idx}", tensors_out) for idx, v in enumerate(val))
+        return tuple(
+            _flatten_and_extract_tensors(v, f"{prefix}/{idx}", tensors_out)
+            for idx, v in enumerate(val)
+        )
     else:
         return val
 
@@ -224,13 +234,16 @@ class CheckpointManager:
 
         if self.world_size > 1:
             import torch.distributed as dist
+
             if not dist.is_initialized():
-                raise RuntimeError("torch.distributed must be initialized for multi-rank save")
+                raise RuntimeError(
+                    "torch.distributed must be initialized for multi-rank save"
+                )
 
             snap_id = ""
             if self.rank == 0:
                 snap_id = self._mgr.create_snapshot(step=step, metadata=metadata or {})
-            
+
             # Broadcast snapshot ID from rank 0 to all other ranks
             objects = [snap_id]
             dist.broadcast_object_list(objects, src=0)
@@ -276,8 +289,11 @@ class CheckpointManager:
         """Load the most recent checkpoint."""
         if self.world_size > 1:
             import torch.distributed as dist
+
             if not dist.is_initialized():
-                raise RuntimeError("torch.distributed must be initialized for multi-rank load")
+                raise RuntimeError(
+                    "torch.distributed must be initialized for multi-rank load"
+                )
 
             snap_id = ""
             if self.rank == 0:
@@ -297,7 +313,7 @@ class CheckpointManager:
     def _apply_loaded(self, raw, model, optimizer, scheduler, scaler):
         """Group loaded tensors by prefix and apply to objects."""
         result = {}
-        
+
         prefix_to_obj = {}
         if model is not None:
             prefix_to_obj["model"] = model
@@ -313,14 +329,14 @@ class CheckpointManager:
                 prefix = key[:-10]  # strip "._metadata"
                 meta = pickle.loads(value)
                 sd = _reconstruct_from_tensors(meta, raw)
-                
+
                 obj = prefix_to_obj.get(prefix)
                 if obj is not None:
                     if hasattr(obj, "load_state_dict"):
                         obj.load_state_dict(sd)
-                
+
                 result[prefix] = sd
-                
+
         return result
 
     def list_snapshots(self):
@@ -391,7 +407,9 @@ class CheckpointManager:
         Returns:
             Snapshot UUID string.
         """
-        return self._mgr.save_tensors(step=step, tensors=tensors, metadata=metadata or {})
+        return self._mgr.save_tensors(
+            step=step, tensors=tensors, metadata=metadata or {}
+        )
 
     def stats(self) -> Dict[str, Any]:
         """
@@ -463,16 +481,26 @@ class CheckpointManager:
                 return f"{b / (1 << 10):.1f} KB"
             return f"{b} B"
 
-        print(f"\n{'─'*60}")
-        print(f"  Revolver Checkpoint Stats")
-        print(f"{'─'*60}")
-        print(f"  Snapshots:  {s['total_snapshots']}  ({s['full_snapshots']} full, {s['delta_snapshots']} delta)")
-        print(f"  Tensors:    {s['total_tensors_saved']}  ({s['full_tensors']} full, {s['delta_tensors']} delta, {s['skipped_tensors']} skipped)")
+        print(f"\n{'─' * 60}")
+        print("  Revolver Checkpoint Stats")
+        print(f"{'─' * 60}")
+        print(
+            f"  Snapshots:  {s['total_snapshots']}  ({s['full_snapshots']} full, {s['delta_snapshots']} delta)"
+        )
+        print(
+            f"  Tensors:    {s['total_tensors_saved']}  ({s['full_tensors']} full, {s['delta_tensors']} delta, {s['skipped_tensors']} skipped)"
+        )
         print(f"  Raw size:   {_fmt(s['total_raw_bytes'])}")
-        print(f"  On disk:    {_fmt(s['total_compressed_bytes'])}  (compression: {s['compression_ratio']:.1%})")
-        print(f"  Naive cost: {_fmt(s['estimated_naive_bytes'])}  (if every save were full, uncompressed)")
-        print(f"  Saved:      {_fmt(s['total_saved_bytes'])}  ({s['savings_percent']:.1f}% vs naive)")
-        print(f"{'─'*60}\n")
+        print(
+            f"  On disk:    {_fmt(s['total_compressed_bytes'])}  (compression: {s['compression_ratio']:.1%})"
+        )
+        print(
+            f"  Naive cost: {_fmt(s['estimated_naive_bytes'])}  (if every save were full, uncompressed)"
+        )
+        print(
+            f"  Saved:      {_fmt(s['total_saved_bytes'])}  ({s['savings_percent']:.1f}% vs naive)"
+        )
+        print(f"{'─' * 60}\n")
 
     # ─── Convenience save methods ────────────────────────────────────
 
@@ -646,5 +674,7 @@ class CheckpointManager:
 
         save_file(tensors, path, metadata=metadata)
         size_mb = os.path.getsize(path) / (1024 * 1024)
-        print(f"[Revolver] Exported to {path} ({size_mb:.1f} MB, {len(tensors)} tensors)")
+        print(
+            f"[Revolver] Exported to {path} ({size_mb:.1f} MB, {len(tensors)} tensors)"
+        )
         return path

@@ -37,6 +37,15 @@ pub struct S3Config {
 }
 
 impl S3Config {
+    /// Auto-enable path_style when a custom endpoint is provided.
+    /// Virtual-hosted style requires DNS resolution (only works with AWS/R2/B2 domains).
+    pub fn with_auto_path_style(mut self) -> Self {
+        if self.endpoint.is_some() {
+            self.path_style = true;
+        }
+        self
+    }
+
     /// Normalize the prefix: ensure trailing slash, strip leading slash.
     fn normalized_prefix(&self) -> String {
         let mut p = self.prefix.trim_matches('/').to_string();
@@ -52,6 +61,7 @@ impl S3Config {
     }
 
     /// Build the host for requests.
+    #[allow(dead_code)]
     fn host(&self) -> String {
         let default_endpoint = format!("https://s3.{}.amazonaws.com", self.region);
         let base = self.endpoint.as_deref().unwrap_or(&default_endpoint);
@@ -144,17 +154,18 @@ fn sign_request(
     key: &str,
     payload_hash: &str,
     query_params: &[(&str, &str)],
+    content_length: Option<usize>,
 ) -> SignedRequest {
     let now = chrono::Utc::now();
     let date_stamp = now.format("%Y%m%d").to_string();
     let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
-    let host = config.host();
 
-    // Canonical URI
+    // Canonical URI – key encoded, slashes kept
+    let encoded_key = uri_encode(key, false);
     let canonical_uri = if config.path_style {
-        format!("/{}/{}", config.bucket, uri_encode(key, false))
+        format!("/{}/{}", config.bucket, encoded_key)
     } else {
-        format!("/{}", uri_encode(key, false))
+        format!("/{}", encoded_key)
     };
 
     // Canonical query string
@@ -166,19 +177,80 @@ fn sign_request(
         .collect::<Vec<_>>()
         .join("&");
 
-    // Canonical headers (must include host, x-amz-content-sha256, x-amz-date)
-    let canonical_headers = format!(
-        "host:{}\nx-amz-content-sha256:{}\nx-amz-date:{}\n",
-        host, payload_hash, amz_date
-    );
-    let signed_headers = "host;x-amz-content-sha256;x-amz-date";
+    // Build URL (using encoded key)
+    let default_endpoint = format!("https://s3.{}.amazonaws.com", config.region);
+    let endpoint = config.endpoint.as_deref().unwrap_or(&default_endpoint);
+    let endpoint = endpoint.trim_end_matches('/');
 
-    // Canonical request
+    let url = if config.path_style {
+        if canonical_qs.is_empty() {
+            format!("{}/{}/{}", endpoint, config.bucket, encoded_key)
+        } else {
+            format!(
+                "{}/{}/{}?{}",
+                endpoint, config.bucket, encoded_key, canonical_qs
+            )
+        }
+    } else {
+        let scheme_end = endpoint.find("://").map(|i| i + 3).unwrap_or(0);
+        let (scheme, rest) = endpoint.split_at(scheme_end);
+        if canonical_qs.is_empty() {
+            format!("{}{}.{}/{}", scheme, config.bucket, rest, encoded_key)
+        } else {
+            format!(
+                "{}{}.{}/{}?{}",
+                scheme, config.bucket, rest, encoded_key, canonical_qs
+            )
+        }
+    };
+
+    // Extract the host from the URL (lowercase, exactly what ureq will send)
+    let host = url
+        .split("://")
+        .nth(1)
+        .unwrap_or("")
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .to_lowercase();
+
+    // ─── Build canonical headers in **alphabetical order** ──────────
+    // Store (lowercase_name, original_value) pairs.
+    let mut headers_to_sign: Vec<(String, String)> = Vec::new();
+
+    // Always include these three
+    headers_to_sign.push(("host".into(), host.clone()));
+    headers_to_sign.push(("x-amz-content-sha256".into(), payload_hash.to_string()));
+    headers_to_sign.push(("x-amz-date".into(), amz_date.clone()));
+
+    // Add content-length only if a body is present
+    if let Some(len) = content_length {
+        headers_to_sign.push(("content-length".into(), len.to_string()));
+    }
+
+    // Sort by the lowercased header name (required by SigV4)
+    headers_to_sign.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+
+    // Build canonical_headers string
+    let canonical_headers: String = headers_to_sign
+        .iter()
+        .map(|(name, value)| format!("{}:{}\n", name.to_lowercase(), value))
+        .collect();
+
+    // Build signed_headers list (alphabetically)
+    let signed_headers: String = headers_to_sign
+        .iter()
+        .map(|(name, _)| name.to_lowercase())
+        .collect::<Vec<_>>()
+        .join(";");
+
+    // ─── Canonical request ──────────────────────────────────────────
     let canonical_request = format!(
         "{}\n{}\n{}\n{}\n{}\n{}",
         method, canonical_uri, canonical_qs, canonical_headers, signed_headers, payload_hash
     );
 
+    // ─── String to sign ─────────────────────────────────────────────
     let credential_scope = format!("{}/{}/s3/aws4_request", date_stamp, config.region);
     let string_to_sign = format!(
         "AWS4-HMAC-SHA256\n{}\n{}\n{}",
@@ -187,6 +259,7 @@ fn sign_request(
         sha256_hex(canonical_request.as_bytes())
     );
 
+    // ─── Signature ──────────────────────────────────────────────────
     let sig_key = signing_key(&config.secret_key, &date_stamp, &config.region, "s3");
     let signature_bytes = hmac_sha256(&sig_key, string_to_sign.as_bytes());
     let signature = hex::encode(signature_bytes);
@@ -196,26 +269,9 @@ fn sign_request(
         config.access_key, credential_scope, signed_headers, signature
     );
 
-    // Build URL
-    let default_endpoint = format!("https://s3.{}.amazonaws.com", config.region);
-    let endpoint = config.endpoint.as_deref().unwrap_or(&default_endpoint);
-    let endpoint = endpoint.trim_end_matches('/');
-
-    let url = if config.path_style {
-        if canonical_qs.is_empty() {
-            format!("{}/{}/{}", endpoint, config.bucket, key)
-        } else {
-            format!("{}/{}/{}?{}", endpoint, config.bucket, key, canonical_qs)
-        }
-    } else {
-        let scheme_end = endpoint.find("://").map(|i| i + 3).unwrap_or(0);
-        let (scheme, rest) = endpoint.split_at(scheme_end);
-        if canonical_qs.is_empty() {
-            format!("{}{}.{}/{}", scheme, config.bucket, rest, key)
-        } else {
-            format!("{}{}.{}/{}?{}", scheme, config.bucket, rest, key, canonical_qs)
-        }
-    };
+    // ─── Headers to send ────────────────────────────────────────────
+    // Note: we do NOT set "Host" or "Content-Length" manually;
+    // ureq will set them automatically based on the URL and body.
 
     SignedRequest {
         url,
@@ -223,7 +279,6 @@ fn sign_request(
             ("Authorization".into(), authorization),
             ("x-amz-content-sha256".into(), payload_hash.into()),
             ("x-amz-date".into(), amz_date),
-            ("Host".into(), host),
         ],
     }
 }
@@ -258,7 +313,16 @@ impl S3Storage {
             None => sha256_hex(b""),
         };
 
-        let signed = sign_request(&self.config, method, key, &payload_hash, query_params);
+        let content_length = body.map(|d| d.len());
+
+        let signed = sign_request(
+            &self.config,
+            method,
+            key,
+            &payload_hash,
+            query_params,
+            content_length,
+        );
 
         let mut req = match method {
             "GET" => self.agent.get(&signed.url),
@@ -283,9 +347,7 @@ impl S3Storage {
                 let body = resp.into_string().unwrap_or_default();
                 RevolverError::Storage(format!("S3 HTTP {code}: {body}"))
             }
-            ureq::Error::Transport(t) => {
-                RevolverError::Storage(format!("S3 transport error: {t}"))
-            }
+            ureq::Error::Transport(t) => RevolverError::Storage(format!("S3 transport error: {t}")),
         })
     }
 }
@@ -340,8 +402,7 @@ impl StorageBackend for S3Storage {
         let mut continuation_token: Option<String> = None;
 
         loop {
-            let mut params: Vec<(&str, &str)> =
-                vec![("list-type", "2"), ("prefix", &full_prefix)];
+            let mut params: Vec<(&str, &str)> = vec![("list-type", "2"), ("prefix", &full_prefix)];
 
             let ct_owned;
             if let Some(ref token) = continuation_token {
@@ -515,5 +576,50 @@ mod tests {
         // Custom endpoint with virtual-hosted
         config.path_style = false;
         assert_eq!(config.host(), "my-bucket.localhost:9000");
+    }
+
+    #[test]
+    fn test_auto_path_style() {
+        // No endpoint → path_style stays false
+        let config = S3Config {
+            bucket: "b".into(),
+            prefix: "".into(),
+            region: "us-east-1".into(),
+            endpoint: None,
+            access_key: "AK".into(),
+            secret_key: "SK".into(),
+            path_style: false,
+            timeout_secs: 30,
+        }
+        .with_auto_path_style();
+        assert!(!config.path_style);
+
+        // Custom endpoint → path_style forced to true
+        let config = S3Config {
+            bucket: "b".into(),
+            prefix: "".into(),
+            region: "us-east-1".into(),
+            endpoint: Some("http://172.17.0.2:9000".into()),
+            access_key: "AK".into(),
+            secret_key: "SK".into(),
+            path_style: false,
+            timeout_secs: 30,
+        }
+        .with_auto_path_style();
+        assert!(config.path_style);
+
+        // Already true + endpoint → stays true
+        let config = S3Config {
+            bucket: "b".into(),
+            prefix: "".into(),
+            region: "us-east-1".into(),
+            endpoint: Some("http://localhost:9000".into()),
+            access_key: "AK".into(),
+            secret_key: "SK".into(),
+            path_style: true,
+            timeout_secs: 30,
+        }
+        .with_auto_path_style();
+        assert!(config.path_style);
     }
 }

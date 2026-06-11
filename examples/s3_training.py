@@ -57,15 +57,15 @@ import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
-
 from revolver import CheckpointManager
-
+from torch.utils.data import DataLoader, Dataset
 
 # ─── Model (same MiniGPT from transformer_training.py) ──────────────
 
+
 class CausalSelfAttention(nn.Module):
     mask: torch.Tensor
+
     def __init__(self, d_model, n_heads, max_seq_len, dropout=0.1):
         super().__init__()
         self.n_heads = n_heads
@@ -74,7 +74,12 @@ class CausalSelfAttention(nn.Module):
         self.proj = nn.Linear(d_model, d_model, bias=False)
         self.attn_dropout = nn.Dropout(dropout)
         self.resid_dropout = nn.Dropout(dropout)
-        self.register_buffer("mask", torch.tril(torch.ones(max_seq_len, max_seq_len)).view(1, 1, max_seq_len, max_seq_len))
+        self.register_buffer(
+            "mask",
+            torch.tril(torch.ones(max_seq_len, max_seq_len)).view(
+                1, 1, max_seq_len, max_seq_len
+            ),
+        )
 
     def forward(self, x):
         B, T, C = x.shape
@@ -94,7 +99,12 @@ class TransformerBlock(nn.Module):
         self.ln1 = nn.LayerNorm(d_model)
         self.attn = CausalSelfAttention(d_model, n_heads, max_seq_len, dropout)
         self.ln2 = nn.LayerNorm(d_model)
-        self.mlp = nn.Sequential(nn.Linear(d_model, 4 * d_model), nn.GELU(), nn.Linear(4 * d_model, d_model), nn.Dropout(dropout))
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, 4 * d_model),
+            nn.GELU(),
+            nn.Linear(4 * d_model, d_model),
+            nn.Dropout(dropout),
+        )
 
     def forward(self, x):
         x = x + self.attn(self.ln1(x))
@@ -102,12 +112,25 @@ class TransformerBlock(nn.Module):
 
 
 class MiniGPT(nn.Module):
-    def __init__(self, vocab_size=256, d_model=256, n_heads=4, n_layers=4, max_seq_len=128, dropout=0.1):
+    def __init__(
+        self,
+        vocab_size=256,
+        d_model=256,
+        n_heads=4,
+        n_layers=4,
+        max_seq_len=128,
+        dropout=0.1,
+    ):
         super().__init__()
         self.token_emb = nn.Embedding(vocab_size, d_model)
         self.pos_emb = nn.Embedding(max_seq_len, d_model)
         self.drop = nn.Dropout(dropout)
-        self.blocks = nn.ModuleList([TransformerBlock(d_model, n_heads, max_seq_len, dropout) for _ in range(n_layers)])
+        self.blocks = nn.ModuleList(
+            [
+                TransformerBlock(d_model, n_heads, max_seq_len, dropout)
+                for _ in range(n_layers)
+            ]
+        )
         self.ln_f = nn.LayerNorm(d_model)
         self.head = nn.Linear(d_model, vocab_size, bias=False)
         self.head.weight = self.token_emb.weight
@@ -132,7 +155,12 @@ class MiniGPT(nn.Module):
 
 class SyntheticTextDataset(Dataset):
     def __init__(self, n_samples=10000, seq_len=128):
-        self.data = [torch.tensor([(i % 200 + j) % 256 for j in range(seq_len + 1)], dtype=torch.long) for i in range(n_samples)]
+        self.data = [
+            torch.tensor(
+                [(i % 200 + j) % 256 for j in range(seq_len + 1)], dtype=torch.long
+            )
+            for i in range(n_samples)
+        ]
 
     def __len__(self):
         return len(self.data)
@@ -143,14 +171,19 @@ class SyntheticTextDataset(Dataset):
 
 # ─── Training ────────────────────────────────────────────────────────
 
+
 def train(args):
     device = args.device
     os.makedirs(args.ckpt_dir, exist_ok=True)
 
     model = MiniGPT().to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs * 312)
-    loader = DataLoader(SyntheticTextDataset(), batch_size=args.batch_size, shuffle=True, drop_last=True)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=args.epochs * 312
+    )
+    loader = DataLoader(
+        SyntheticTextDataset(), batch_size=args.batch_size, shuffle=True, drop_last=True
+    )
 
     # ─── S3-backed CheckpointManager ─────────────────────────────────
     #
@@ -201,12 +234,16 @@ def train(args):
     global_step = start_step
     model.train()
 
-    print(f"\n{'='*70}")
-    print(f"Training MiniGPT | {args.epochs} epochs | device={device} | dtype={args.save_dtype}")
+    print(f"\n{'=' * 70}")
+    print(
+        f"Training MiniGPT | {args.epochs} epochs | device={device} | dtype={args.save_dtype}"
+    )
     print(f"Checkpoint: save every {args.save_every} steps")
     if args.s3_bucket:
-        print(f"S3 sync: every {args.sync_every} saves to s3://{args.s3_bucket}/{args.s3_prefix}")
-    print(f"{'='*70}\n")
+        print(
+            f"S3 sync: every {args.sync_every} saves to s3://{args.s3_bucket}/{args.s3_prefix}"
+        )
+    print(f"{'=' * 70}\n")
 
     t_start = time.perf_counter()
 
@@ -233,39 +270,51 @@ def train(args):
 
             if global_step % args.save_every == 0:
                 t0 = time.perf_counter()
-                snap_id = ckpt.save(
+                _ = ckpt.save(
                     step=global_step,
                     model=model,
                     optimizer=optimizer,
                     scheduler=scheduler,
-                    metadata={"loss": f"{loss.item():.4f}", "lr": f"{scheduler.get_last_lr()[0]:.2e}"},
+                    metadata={
+                        "loss": f"{loss.item():.4f}",
+                        "lr": f"{scheduler.get_last_lr()[0]:.2e}",
+                    },
                 )
                 t_ckpt = time.perf_counter() - t0
                 info = ckpt.list_snapshots()[-1]
                 comp_kb = info["total_compressed"] / 1024
                 raw_kb = info["total_raw"] / 1024
                 pct = (1.0 - comp_kb / raw_kb) * 100 if raw_kb > 0 else 0
-                print(f"  [ckpt] step={global_step} | {t_ckpt:.3f}s | "
-                      f"full={info['full_tensors']} Δ={info['delta_tensors']} skip={info['skipped_tensors']} | "
-                      f"{comp_kb:.1f}KB / {raw_kb:.1f}KB ({pct:.1f}% saved)")
+                print(
+                    f"  [ckpt] step={global_step} | {t_ckpt:.3f}s | "
+                    f"full={info['full_tensors']} Δ={info['delta_tensors']} skip={info['skipped_tensors']} | "
+                    f"{comp_kb:.1f}KB / {raw_kb:.1f}KB ({pct:.1f}% saved)"
+                )
 
             if batch_idx % 50 == 0:
-                print(f"  epoch {epoch+1}/{args.epochs} | step {global_step} | "
-                      f"loss {loss.item():.4f} (avg {epoch_loss/max(epoch_steps,1):.4f}) | "
-                      f"{time.perf_counter()-t_start:.1f}s")
+                print(
+                    f"  epoch {epoch + 1}/{args.epochs} | step {global_step} | "
+                    f"loss {loss.item():.4f} (avg {epoch_loss / max(epoch_steps, 1):.4f}) | "
+                    f"{time.perf_counter() - t_start:.1f}s"
+                )
 
-        print(f"  → Epoch {epoch+1} done | avg loss: {epoch_loss/epoch_steps:.4f}")
+        print(f"  → Epoch {epoch + 1} done | avg loss: {epoch_loss / epoch_steps:.4f}")
 
     # Final save and sync
-    ckpt.save(step=global_step, model=model, optimizer=optimizer, scheduler=scheduler,
-              metadata={"loss": f"{epoch_loss/epoch_steps:.4f}", "final": "true"})
+    ckpt.save(
+        step=global_step,
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        metadata={"loss": f"{epoch_loss / epoch_steps:.4f}", "final": "true"},
+    )
 
     # Force sync to S3 before exit
     if args.s3_bucket:
         print("\n[S3] Final sync...")
         t0 = time.perf_counter()
         ckpt.sync_now()
-        print(f"[S3] Sync complete in {time.perf_counter()-t0:.1f}s")
+        print(f"[S3] Sync complete in {time.perf_counter() - t0:.1f}s")
 
     ckpt.merge_now()
     ckpt.print_stats()
@@ -273,36 +322,65 @@ def train(args):
     # Verify resume
     print("--- Verifying resume ---")
     model2 = MiniGPT().to(device)
-    ckpt2 = CheckpointManager(storage_root=args.ckpt_dir, save_dtype=args.save_dtype, **s3_kwargs)
+    ckpt2 = CheckpointManager(
+        storage_root=args.ckpt_dir, save_dtype=args.save_dtype, **s3_kwargs
+    )
     ckpt2.load_latest(model=model2)
 
-    max_diff = max((p1.data - p2.data).abs().max().item()
-                   for (_, p1), (_, p2) in zip(model.named_parameters(), model2.named_parameters()))
+    max_diff = max(
+        (p1.data - p2.data).abs().max().item()
+        for (_, p1), (_, p2) in zip(model.named_parameters(), model2.named_parameters())
+    )
     atol = 0.01 if args.save_dtype in ("bf16", "bfloat16") else 1e-6
     status = "✓" if max_diff < atol * 10 else "✗"
     print(f"  {status} All weights match (max diff: {max_diff:.6f})")
-    print(f"{'='*70}")
+    print(f"{'=' * 70}")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train MiniGPT with S3-backed Revolver checkpoints")
+    parser = argparse.ArgumentParser(
+        description="Train MiniGPT with S3-backed Revolver checkpoints"
+    )
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--save-every", type=int, default=50)
-    parser.add_argument("--save-dtype", type=str, default="bf16", choices=["fp32", "bf16"])
+    parser.add_argument(
+        "--save-dtype", type=str, default="bf16", choices=["fp32", "bf16"]
+    )
     parser.add_argument("--ckpt-dir", type=str, default="./revolver_s3_ckpts")
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument(
+        "--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu"
+    )
 
     # S3 config (also reads from env vars)
     parser.add_argument("--s3-bucket", type=str, default=os.environ.get("S3_BUCKET"))
-    parser.add_argument("--s3-region", type=str, default=os.environ.get("S3_REGION", "us-east-1"))
-    parser.add_argument("--s3-prefix", type=str, default=os.environ.get("S3_PREFIX", "revolver-training/"))
-    parser.add_argument("--s3-endpoint", type=str, default=os.environ.get("S3_ENDPOINT"))
-    parser.add_argument("--s3-access-key", type=str, default=os.environ.get("S3_ACCESS_KEY"))
-    parser.add_argument("--s3-secret-key", type=str, default=os.environ.get("S3_SECRET_KEY"))
-    parser.add_argument("--s3-path-style", action="store_true", default=os.environ.get("S3_PATH_STYLE", "").lower() in ("1", "true"))
-    parser.add_argument("--sync-every", type=int, default=3, help="Sync to S3 every N checkpoint saves")
+    parser.add_argument(
+        "--s3-region", type=str, default=os.environ.get("S3_REGION", "us-east-1")
+    )
+    parser.add_argument(
+        "--s3-prefix",
+        type=str,
+        default=os.environ.get("S3_PREFIX", "revolver-training/"),
+    )
+    parser.add_argument(
+        "--s3-endpoint", type=str, default=os.environ.get("S3_ENDPOINT")
+    )
+    parser.add_argument(
+        "--s3-access-key", type=str, default=os.environ.get("S3_ACCESS_KEY")
+    )
+    parser.add_argument(
+        "--s3-secret-key", type=str, default=os.environ.get("S3_SECRET_KEY")
+    )
+    parser.add_argument(
+        "--s3-path-style",
+        action="store_true",
+        default=os.environ.get("S3_PATH_STYLE", "").lower() in ("1", "true"),
+        help="Force path-style URLs (auto-enabled when --s3-endpoint is set)",
+    )
+    parser.add_argument(
+        "--sync-every", type=int, default=3, help="Sync to S3 every N checkpoint saves"
+    )
 
     args = parser.parse_args()
 

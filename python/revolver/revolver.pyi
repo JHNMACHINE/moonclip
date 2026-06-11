@@ -57,6 +57,7 @@ class RevolverManager:
             s3_access_key: S3 access key.
             s3_secret_key: S3 secret key.
             s3_path_style: Use path-style S3 URLs instead of virtual hosting.
+                Automatically forced to True when s3_endpoint is set.
             sync_every_n_saves: Sync local data to remote S3 every N saves.
             save_dtype: Target dtype for saving float tensors ("none", "bf16", "fp16").
                 If set, float tensors are cast in Rust before compression, and

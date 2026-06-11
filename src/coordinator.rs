@@ -63,7 +63,11 @@ impl Coordinator {
         // Load or create manifest
         let manifest = match storage.get("manifest.json") {
             Ok(data) => {
-                let end = data.iter().rposition(|&b| b != 0).map(|i| i + 1).unwrap_or(0);
+                let end = data
+                    .iter()
+                    .rposition(|&b| b != 0)
+                    .map(|i| i + 1)
+                    .unwrap_or(0);
                 serde_json::from_slice(&data[..end])
                     .map_err(|e| RevolverError::Serialization(e.to_string()))?
             }
@@ -134,8 +138,7 @@ impl Coordinator {
             };
             drop(manifest);
 
-            let rank_entry =
-                self.save_rank_tensors(snap_id, &snap_dir, &base_snap, tensors)?;
+            let rank_entry = self.save_rank_tensors(snap_id, &snap_dir, &base_snap, tensors)?;
 
             let snapshot = Snapshot {
                 id: snap_id,
@@ -182,11 +185,7 @@ impl Coordinator {
 
     /// Create a new snapshot entry (rank 0 only in multi-rank).
     /// Returns the snapshot ID that all ranks should use.
-    pub fn create_snapshot(
-        &self,
-        step: u64,
-        metadata: HashMap<String, String>,
-    ) -> Result<Uuid> {
+    pub fn create_snapshot(&self, step: u64, metadata: HashMap<String, String>) -> Result<Uuid> {
         let snap_id = Uuid::new_v4();
 
         let manifest = self.manifest.lock().unwrap();
@@ -219,11 +218,7 @@ impl Coordinator {
 
     /// Save this rank's tensors into an existing snapshot.
     /// Called by each rank independently.
-    pub fn save_rank(
-        &self,
-        snap_id: Uuid,
-        tensors: Vec<TensorData>,
-    ) -> Result<()> {
+    pub fn save_rank(&self, snap_id: Uuid, tensors: Vec<TensorData>) -> Result<()> {
         // Re-read manifest from storage for multi-rank correctness
         // (another rank may have created the snapshot)
         self.reload_manifest()?;
@@ -240,8 +235,7 @@ impl Coordinator {
         drop(manifest);
 
         let snap_dir = format!("snapshots/{}", snap_id);
-        let rank_entry =
-            self.save_rank_tensors(snap_id, &snap_dir, &base_snap, tensors)?;
+        let rank_entry = self.save_rank_tensors(snap_id, &snap_dir, &base_snap, tensors)?;
 
         // Re-read manifest again (another rank may have saved concurrently)
         self.reload_manifest()?;
@@ -301,15 +295,12 @@ impl Coordinator {
             .clone();
         drop(manifest);
 
-        let rank_entry = snap
-            .ranks
-            .get(&self.config.rank)
-            .ok_or_else(|| {
-                RevolverError::NotFound(format!(
-                    "Rank {} not found in snapshot {snap_id}",
-                    self.config.rank
-                ))
-            })?;
+        let rank_entry = snap.ranks.get(&self.config.rank).ok_or_else(|| {
+            RevolverError::NotFound(format!(
+                "Rank {} not found in snapshot {snap_id}",
+                self.config.rank
+            ))
+        })?;
 
         let mut result = HashMap::new();
 
@@ -472,15 +463,12 @@ impl Coordinator {
             .find_snapshot(base_id)
             .ok_or_else(|| RevolverError::NotFound(format!("Base snapshot {base_id}")))?;
 
-        let rank_entry = base_snap
-            .ranks
-            .get(&self.config.rank)
-            .ok_or_else(|| {
-                RevolverError::NotFound(format!(
-                    "Rank {} not in base snapshot {base_id}",
-                    self.config.rank
-                ))
-            })?;
+        let rank_entry = base_snap.ranks.get(&self.config.rank).ok_or_else(|| {
+            RevolverError::NotFound(format!(
+                "Rank {} not in base snapshot {base_id}",
+                self.config.rank
+            ))
+        })?;
 
         let entry = rank_entry
             .tensors
@@ -502,7 +490,11 @@ impl Coordinator {
         match self.storage.get("manifest.json") {
             Ok(data) => {
                 // Strip trailing null bytes from page-aligned storage
-                let end = data.iter().rposition(|&b| b != 0).map(|i| i + 1).unwrap_or(0);
+                let end = data
+                    .iter()
+                    .rposition(|&b| b != 0)
+                    .map(|i| i + 1)
+                    .unwrap_or(0);
                 let trimmed = &data[..end];
                 let new_manifest: Manifest = serde_json::from_slice(trimmed)
                     .map_err(|e| RevolverError::Serialization(e.to_string()))?;
@@ -539,11 +531,7 @@ impl Coordinator {
         let oldest_removable = manifest
             .snapshots
             .iter()
-            .find(|s| {
-                s.base_snapshot_id.is_none()
-                    && s.finalized
-                    && !rollback_ids.contains(&s.id)
-            })
+            .find(|s| s.base_snapshot_id.is_none() && s.finalized && !rollback_ids.contains(&s.id))
             .map(|s| s.id);
 
         if let Some(oldest_id) = oldest_removable {
@@ -555,7 +543,11 @@ impl Coordinator {
                 .collect();
 
             // Delete files
-            for snap in manifest.snapshots.iter().filter(|s| to_remove.contains(&s.id)) {
+            for snap in manifest
+                .snapshots
+                .iter()
+                .filter(|s| to_remove.contains(&s.id))
+            {
                 for rank_entry in snap.ranks.values() {
                     for tensor in &rank_entry.tensors {
                         if let Some(ref filename) = tensor.filename {
@@ -663,7 +655,7 @@ mod tests {
         // Second save: change only model.weight, rest identical
         let mut tensors_v2 = sample_tensors(0);
         tensors_v2[0].data[0] = 1; // Change one byte in model.weight
-        // model.bias and optimizer.exp_avg are unchanged
+                                   // model.bias and optimizer.exp_avg are unchanged
 
         let id2 = coord.save(200, tensors_v2.clone(), HashMap::new()).unwrap();
 
@@ -672,7 +664,10 @@ mod tests {
         assert_eq!(snaps.len(), 2);
         let info = &snaps[1];
         assert!(info.is_delta);
-        assert_eq!(info.skipped_tensors, 2, "bias and exp_avg should be skipped");
+        assert_eq!(
+            info.skipped_tensors, 2,
+            "bias and exp_avg should be skipped"
+        );
         assert!(
             info.delta_tensors == 1 || info.full_tensors == 1,
             "model.weight should be delta or full"
@@ -699,7 +694,7 @@ mod tests {
         coord.save(100, sample_tensors(1), HashMap::new()).unwrap();
         coord.save(200, sample_tensors(2), HashMap::new()).unwrap();
 
-        let (id, loaded) = coord.load_latest().unwrap();
+        let (_, loaded) = coord.load_latest().unwrap();
         assert_eq!(loaded["model.weight"][0], 2);
     }
 
@@ -725,27 +720,31 @@ mod tests {
         let coord_r1 = Coordinator::new(Arc::clone(&storage), config_r1).unwrap();
 
         // Rank 0 creates snapshot
-        let snap_id = coord_r0
-            .create_snapshot(1000, HashMap::new())
-            .unwrap();
+        let snap_id = coord_r0.create_snapshot(1000, HashMap::new()).unwrap();
 
         // Both ranks save their tensors
         coord_r0
-            .save_rank(snap_id, vec![TensorData {
-                name: "shard.weight".into(),
-                shape: vec![256, 512],
-                dtype: "float32".into(),
-                data: vec![1u8; 256 * 512 * 4],
-            }])
+            .save_rank(
+                snap_id,
+                vec![TensorData {
+                    name: "shard.weight".into(),
+                    shape: vec![256, 512],
+                    dtype: "float32".into(),
+                    data: vec![1u8; 256 * 512 * 4],
+                }],
+            )
             .unwrap();
 
         coord_r1
-            .save_rank(snap_id, vec![TensorData {
-                name: "shard.weight".into(),
-                shape: vec![256, 512],
-                dtype: "float32".into(),
-                data: vec![2u8; 256 * 512 * 4],
-            }])
+            .save_rank(
+                snap_id,
+                vec![TensorData {
+                    name: "shard.weight".into(),
+                    shape: vec![256, 512],
+                    dtype: "float32".into(),
+                    data: vec![2u8; 256 * 512 * 4],
+                }],
+            )
             .unwrap();
 
         // Reload and finalize
@@ -764,12 +763,20 @@ mod tests {
         // Each rank loads its own shard
         let coord_r0_final = Coordinator::new(
             Arc::clone(&storage),
-            CoordinatorConfig { world_size: 2, rank: 0, ..Default::default() },
+            CoordinatorConfig {
+                world_size: 2,
+                rank: 0,
+                ..Default::default()
+            },
         )
         .unwrap();
         let coord_r1_final = Coordinator::new(
             Arc::clone(&storage),
-            CoordinatorConfig { world_size: 2, rank: 1, ..Default::default() },
+            CoordinatorConfig {
+                world_size: 2,
+                rank: 1,
+                ..Default::default()
+            },
         )
         .unwrap();
 
@@ -800,18 +807,25 @@ mod tests {
 
         for i in 0..6 {
             coord
-                .save(i, vec![TensorData {
-                    name: "w".into(),
-                    shape: vec![100],
-                    dtype: "uint8".into(),
-                    data: vec![i as u8; 100],
-                }], HashMap::new())
+                .save(
+                    i,
+                    vec![TensorData {
+                        name: "w".into(),
+                        shape: vec![100],
+                        dtype: "uint8".into(),
+                        data: vec![i as u8; 100],
+                    }],
+                    HashMap::new(),
+                )
                 .unwrap();
         }
 
         let snaps = coord.list_snapshots();
         let full_count = snaps.iter().filter(|s| !s.is_delta).count();
-        assert!(full_count <= 2, "Expected <=2 full snapshots, got {full_count}");
+        assert!(
+            full_count <= 2,
+            "Expected <=2 full snapshots, got {full_count}"
+        );
     }
 
     #[test]
@@ -861,23 +875,35 @@ mod tests {
 
         // Step 100: full
         let mut data = vec![0u8; 10_000];
-        coord.save(100, vec![TensorData {
-            name: "w".into(),
-            shape: vec![10_000],
-            dtype: "uint8".into(),
-            data: data.clone(),
-        }], HashMap::new()).unwrap();
+        coord
+            .save(
+                100,
+                vec![TensorData {
+                    name: "w".into(),
+                    shape: vec![10_000],
+                    dtype: "uint8".into(),
+                    data: data.clone(),
+                }],
+                HashMap::new(),
+            )
+            .unwrap();
 
         // Steps 200-500: delta (change 1 byte each time)
         for step in (200..=500).step_by(100) {
             let idx = step as usize % data.len();
             data[idx] = (step / 100) as u8;
-            coord.save(step, vec![TensorData {
-                name: "w".into(),
-                shape: vec![10_000],
-                dtype: "uint8".into(),
-                data: data.clone(),
-            }], HashMap::new()).unwrap();
+            coord
+                .save(
+                    step,
+                    vec![TensorData {
+                        name: "w".into(),
+                        shape: vec![10_000],
+                        dtype: "uint8".into(),
+                        data: data.clone(),
+                    }],
+                    HashMap::new(),
+                )
+                .unwrap();
         }
 
         // Load the latest — should reconstruct correctly through delta chain
@@ -913,7 +939,10 @@ mod tests {
         let snap_id = coord.save(1, tensors.clone(), HashMap::new()).unwrap();
         let loaded = coord.load(snap_id).unwrap();
 
-        assert_eq!(loaded["module.layers.0.self_attn.q_proj.weight"], tensors[0].data);
+        assert_eq!(
+            loaded["module.layers.0.self_attn.q_proj.weight"],
+            tensors[0].data
+        );
         assert_eq!(loaded["model/encoder/block_0/layer_0"], tensors[1].data);
     }
 
@@ -939,17 +968,26 @@ mod tests {
         for step in 0..9 {
             let mut d = base.clone();
             d[0] = step as u8;
-            coord.save(step, vec![TensorData {
-                name: "w".into(),
-                shape: vec![8192],
-                dtype: "uint8".into(),
-                data: d,
-            }], HashMap::new()).unwrap();
+            coord
+                .save(
+                    step,
+                    vec![TensorData {
+                        name: "w".into(),
+                        shape: vec![8192],
+                        dtype: "uint8".into(),
+                        data: d,
+                    }],
+                    HashMap::new(),
+                )
+                .unwrap();
         }
 
         let snaps = coord.list_snapshots();
         let full_count = snaps.iter().filter(|s| !s.is_delta).count();
-        assert!(full_count >= 3, "Expected >=3 full snapshots with full_every=3, got {full_count}");
+        assert!(
+            full_count >= 3,
+            "Expected >=3 full snapshots with full_every=3, got {full_count}"
+        );
     }
 
     #[test]

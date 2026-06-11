@@ -146,7 +146,7 @@ impl RevolverManager {
                     secret_key: sk.into(),
                     path_style: s3_path_style,
                     timeout_secs: 30,
-                })?);
+                }.with_auto_path_style())?);
 
             let local: Arc<dyn crate::storage::StorageBackend> =
                 Arc::new(LocalStorage::new(storage_root)?);
