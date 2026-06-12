@@ -60,18 +60,16 @@ fn extract_tensors(tensors: &Bound<'_, PyDict>) -> PyResult<Vec<TensorData>> {
             if tensor.hasattr("data_ptr")? {
                 let shape: Vec<usize> = tensor.getattr("shape")?.extract()?;
                 let dtype_full = tensor.getattr("dtype")?.str()?.to_string();
-                // Togliamo il prefisso "torch." per uniformità
                 let dtype = dtype_full
                     .strip_prefix("torch.")
                     .unwrap_or(&dtype_full)
                     .to_string();
                 let numel: usize = tensor.call_method0("numel")?.extract()?;
                 let data_ptr: usize = tensor.call_method0("data_ptr")?.extract()?;
-                let element_size = get_element_size(&format!("torch.{}", dtype))?; // ri-aggiungiamo per la funzione
+                let element_size = get_element_size(&format!("torch.{}", dtype))?;
                 let nbytes = numel * element_size;
                 let data_slice: &[u8] =
                     unsafe { std::slice::from_raw_parts(data_ptr as *const u8, nbytes) };
-                // Copia efficiente in Vec<u8>
                 let data = data_slice.to_vec();
                 result.push(TensorData {
                     name,
@@ -117,6 +115,7 @@ impl RevolverManager {
         merge_max_chain = 10,
         rollback_interval_steps = 10000,
         max_rollback_snapshots = 3,
+        max_total_snapshots = None,
         s3_bucket = None,
         s3_region = "us-east-1",
         s3_prefix = "",
@@ -140,6 +139,7 @@ impl RevolverManager {
         merge_max_chain: usize,
         rollback_interval_steps: u64,
         max_rollback_snapshots: usize,
+        max_total_snapshots: Option<usize>,
         s3_bucket: Option<&str>,
         s3_region: &str,
         s3_prefix: &str,
@@ -166,6 +166,7 @@ impl RevolverManager {
                 max_full_snapshots,
                 max_deltas_per_full,
                 full_snapshot_every_steps: full_every_steps,
+                max_total_snapshots,
             },
             lineage: LineageConfig {
                 rollback_interval_steps,
@@ -236,10 +237,8 @@ impl RevolverManager {
         tensors: Bound<'_, PyDict>,
         metadata: Option<Bound<'_, PyDict>>,
     ) -> PyResult<String> {
-        // Extract Python data while holding GIL
         let tensor_data = extract_tensors(&tensors)?;
         let meta = extract_metadata(metadata)?;
-        // Release GIL — Rust does SHA256 + zstd + delta + I/O in parallel
         let id = py.allow_threads(|| self.inner.save(step, tensor_data, meta))?;
         Ok(id.to_string())
     }
@@ -273,7 +272,6 @@ impl RevolverManager {
     fn load<'py>(&self, py: Python<'py>, snap_id: &str) -> PyResult<Bound<'py, PyDict>> {
         let uuid = uuid::Uuid::parse_str(snap_id)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
-        // Release GIL for Rust decompression + delta reconstruction
         let tensors = py.allow_threads(|| self.inner.load(uuid))?;
         let dict = PyDict::new(py);
         for (name, data) in tensors {
@@ -287,7 +285,6 @@ impl RevolverManager {
         &self,
         py: Python<'py>,
     ) -> PyResult<(Bound<'py, PyString>, Bound<'py, PyDict>)> {
-        // Release GIL for Rust decompression + delta reconstruction
         let (id, tensors) = py.allow_threads(|| self.inner.load_latest())?;
         let dict = PyDict::new(py);
         for (name, data) in tensors {
@@ -336,6 +333,6 @@ impl RevolverManager {
 #[pymodule]
 fn revolver(m: &Bound<'_, pyo3::types::PyModule>) -> PyResult<()> {
     m.add_class::<RevolverManager>()?;
-    m.add("__version__", "1.1.3")?;
+    m.add("__version__", "1.2.0")?;
     Ok(())
 }

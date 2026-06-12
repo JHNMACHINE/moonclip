@@ -95,6 +95,7 @@ class CheckpointManager:
         merge_stride: int = 0,
         merge_max_chain: int = 10,
         save_dtype: str = "none",
+        max_total_snapshots: Optional[int] = None,
         **kwargs,
     ):
         from revolver import RevolverManager
@@ -124,6 +125,7 @@ class CheckpointManager:
             merge_stride=merge_stride,
             merge_max_chain=merge_max_chain,
             save_dtype=save_dtype,
+            max_total_snapshots=max_total_snapshots,
             **kwargs,
         )
 

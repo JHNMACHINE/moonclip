@@ -32,14 +32,19 @@ pub struct TensorEntry {
     /// How this tensor is stored.
     pub storage: TensorStorage,
     /// Path to the compressed data file (None if Skipped).
+    /// With packed files, this is None — use RankEntry.pack_file instead.
     pub filename: Option<String>,
+    /// Byte offset within the pack file (0 for legacy per-file storage).
+    #[serde(default)]
+    pub offset: u64,
     /// Byte size of compressed data on disk.
     pub compressed_size: u64,
     /// Byte size of raw (uncompressed) tensor data.
     pub raw_size: u64,
-    /// SHA-256 of the raw tensor bytes (always present, used for skip detection).
+    /// Hash of the raw tensor bytes (used for skip detection).
+    /// xxHash3-128 in v2+ format, SHA-256 in legacy.
     pub sha256_raw: String,
-    /// SHA-256 of the compressed data on disk (None if Skipped).
+    /// Hash of the compressed data on disk (None if Skipped).
     pub sha256_compressed: Option<String>,
 }
 
@@ -50,6 +55,11 @@ pub struct TensorEntry {
 pub struct RankEntry {
     pub rank: u32,
     pub tensors: Vec<TensorEntry>,
+    /// Single pack file containing all tensor data for this rank.
+    /// If Some, tensor offsets are relative to this file.
+    /// If None, each tensor uses its own `filename` (legacy mode).
+    #[serde(default)]
+    pub pack_file: Option<String>,
     /// Total compressed bytes on disk for this rank.
     pub total_compressed: u64,
     /// Total raw bytes for this rank.
@@ -126,6 +136,10 @@ pub struct RetentionPolicy {
     pub max_deltas_per_full: usize,
     /// Force a full snapshot every N steps.
     pub full_snapshot_every_steps: u64,
+    /// Hard cap on total accessible snapshots (full + delta).
+    /// If None, defaults to max_full_snapshots * (1 + max_deltas_per_full).
+    #[serde(default)]
+    pub max_total_snapshots: Option<usize>,
 }
 
 impl Default for RetentionPolicy {
@@ -134,7 +148,16 @@ impl Default for RetentionPolicy {
             max_full_snapshots: 5,
             max_deltas_per_full: 10,
             full_snapshot_every_steps: 5000,
+            max_total_snapshots: None,
         }
+    }
+}
+
+impl RetentionPolicy {
+    /// Effective total snapshot cap.
+    pub fn effective_total_cap(&self) -> usize {
+        self.max_total_snapshots
+            .unwrap_or(self.max_full_snapshots * (1 + self.max_deltas_per_full))
     }
 }
 
@@ -300,6 +323,27 @@ mod tests {
         m.snapshots.push(make_full_snapshot(50));
         m.snapshots.push(make_full_snapshot(100));
         assert_eq!(m.rollback_snapshot_ids().len(), 2); // 0 and 100
+    }
+
+    #[test]
+    fn effective_total_cap_default() {
+        let p = RetentionPolicy {
+            max_full_snapshots: 3,
+            max_deltas_per_full: 10,
+            ..Default::default()
+        };
+        assert_eq!(p.effective_total_cap(), 33);
+    }
+
+    #[test]
+    fn effective_total_cap_explicit() {
+        let p = RetentionPolicy {
+            max_full_snapshots: 3,
+            max_deltas_per_full: 10,
+            max_total_snapshots: Some(5),
+            ..Default::default()
+        };
+        assert_eq!(p.effective_total_cap(), 5);
     }
 
     #[test]

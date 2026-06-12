@@ -1,6 +1,6 @@
 [package]
 name = "revolver"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2021"
 description = "High-performance checkpoint management for ML training"
 license = "Apache-2.0"
@@ -16,8 +16,9 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 bincode = "1.3"
 zstd = "0.13"
-sha2 = "0.10"
-hmac = "0.12"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+sha2 = "0.10"      # Required for S3 AWS SigV4 signing only
+hmac = "0.12"       # Required for S3 AWS SigV4 signing only
 thiserror = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }

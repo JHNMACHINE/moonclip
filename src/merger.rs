@@ -8,7 +8,7 @@ use uuid::Uuid;
 use crate::compression;
 use crate::delta;
 use crate::error::{Result, RevolverError};
-use crate::hash::sha256_hex;
+use crate::hash::hash_hex;
 use crate::manifest::*;
 use crate::storage::StorageBackend;
 
@@ -124,9 +124,6 @@ fn do_stride_merge(
         return Ok(());
     }
 
-    // For now, just trigger a full merge if chain is too deep.
-    // Proper hierarchical merging (DECK stride-based) can be added later
-    // with the same manifest structures.
     if delta_count >= config.max_chain_depth {
         drop(manifest);
         return do_full_merge(storage, manifest_lock, compression);
@@ -163,12 +160,10 @@ fn do_full_merge(
 
     drop(manifest);
 
-    // For each rank, resolve the full state by applying all deltas sequentially
     let merged_id = Uuid::new_v4();
     let merged_dir = format!("snapshots/{}", merged_id);
     let mut merged_ranks: HashMap<u32, RankEntry> = HashMap::new();
 
-    // Collect all ranks
     let mut all_ranks: Vec<u32> = base_snap.ranks.keys().cloned().collect();
     all_ranks.sort();
 
@@ -183,15 +178,13 @@ fn do_full_merge(
         let mut total_raw = 0u64;
 
         for base_tensor in &base_rank.tensors {
-            // Start with base data
             let mut current_data = load_tensor_data(
                 base_tensor,
-                None,
+                &base_snap,
                 storage,
                 compression,
             )?;
 
-            // Apply each delta's version of this tensor
             for delta_snap in &deltas {
                 if let Some(delta_rank) = delta_snap.ranks.get(&rank) {
                     if let Some(delta_tensor) = delta_rank
@@ -200,23 +193,19 @@ fn do_full_merge(
                         .find(|t| t.name == base_tensor.name)
                     {
                         match delta_tensor.storage {
-                            TensorStorage::Skipped => {} // No change
+                            TensorStorage::Skipped => {}
                             TensorStorage::Full => {
                                 current_data = load_tensor_data(
                                     delta_tensor,
-                                    None,
+                                    delta_snap,
                                     storage,
                                     compression,
                                 )?;
                             }
                             TensorStorage::DeltaXor => {
-                                if let Some(ref filename) = delta_tensor.filename {
-                                    let compressed = storage.get(filename)?;
-                                    let delta_bytes =
-                                        compression::decompress(&compressed, compression)?;
-                                    current_data =
-                                        delta::apply_delta(&current_data, &delta_bytes)?;
-                                }
+                                let compressed = load_compressed_data(delta_tensor, delta_snap, storage)?;
+                                let delta_bytes = compression::decompress(&compressed, compression)?;
+                                current_data = delta::apply_delta(&current_data, &delta_bytes)?;
                             }
                         }
                     }
@@ -224,7 +213,7 @@ fn do_full_merge(
             }
 
             // Store as full
-            let raw_hash = sha256_hex(&current_data);
+            let raw_hash = hash_hex(&current_data);
             let compressed = compression::compress(&current_data, compression)?;
             let filename = format!(
                 "{}/rank_{}/{}.bin",
@@ -234,7 +223,7 @@ fn do_full_merge(
             );
             storage.put(&filename, &compressed)?;
 
-            let compressed_hash = sha256_hex(&compressed);
+            let compressed_hash = hash_hex(&compressed);
             total_compressed += compressed.len() as u64;
             total_raw += current_data.len() as u64;
 
@@ -244,6 +233,7 @@ fn do_full_merge(
                 dtype: base_tensor.dtype.clone(),
                 storage: TensorStorage::Full,
                 filename: Some(filename),
+                offset: 0,
                 compressed_size: compressed.len() as u64,
                 raw_size: current_data.len() as u64,
                 sha256_raw: raw_hash,
@@ -258,6 +248,7 @@ fn do_full_merge(
             RankEntry {
                 rank,
                 tensors: merged_tensors,
+                pack_file: None, // Merger still uses individual files
                 total_compressed,
                 total_raw,
                 skipped_count: 0,
@@ -272,7 +263,7 @@ fn do_full_merge(
         step: deltas.last().unwrap().step,
         created_at: chrono::Utc::now(),
         ranks: merged_ranks,
-        base_snapshot_id: None, // Full snapshot
+        base_snapshot_id: None,
         metadata: {
             let mut m = deltas.last().unwrap().metadata.clone();
             m.insert("full_merge".into(), "true".into());
@@ -283,13 +274,15 @@ fn do_full_merge(
         finalized: true,
     };
 
-    // Update manifest
     let mut manifest = manifest_lock.lock().unwrap();
     let delta_ids: Vec<Uuid> = deltas.iter().map(|s| s.id).collect();
 
     // Delete old files
     for snap in deltas.iter().chain(std::iter::once(&base_snap)) {
         for rank_entry in snap.ranks.values() {
+            if let Some(ref pack_file) = rank_entry.pack_file {
+                let _ = storage.delete(pack_file);
+            }
             for tensor in &rank_entry.tensors {
                 if let Some(ref filename) = tensor.filename {
                     let _ = storage.delete(filename);
@@ -311,23 +304,52 @@ fn do_full_merge(
     Ok(())
 }
 
+/// Load tensor compressed data, supporting both pack files and legacy individual files.
+fn load_compressed_data(
+    entry: &TensorEntry,
+    snap: &Snapshot,
+    storage: &Arc<dyn StorageBackend>,
+) -> Result<Vec<u8>> {
+    // Try individual file first (merger legacy + old snapshots)
+    if let Some(ref filename) = entry.filename {
+        let mut data = storage.get(filename)?;
+        let expected = entry.compressed_size as usize;
+        if expected > 0 && data.len() > expected {
+            data.truncate(expected);
+        }
+        return Ok(data);
+    }
+
+    // Try pack file
+    let rank_entry = snap.ranks.values().find(|re| {
+        re.tensors.iter().any(|t| t.name == entry.name)
+    });
+
+    if let Some(re) = rank_entry {
+        if let Some(ref pack_file) = re.pack_file {
+            let pack_data = storage.get(pack_file)?;
+            let start = entry.offset as usize;
+            let end = start + entry.compressed_size as usize;
+            if end <= pack_data.len() {
+                return Ok(pack_data[start..end].to_vec());
+            }
+        }
+    }
+
+    Err(RevolverError::NotFound(format!(
+        "No data found for tensor '{}'", entry.name
+    )))
+}
+
 fn load_tensor_data(
     entry: &TensorEntry,
-    _base_id: Option<Uuid>,
+    snap: &Snapshot,
     storage: &Arc<dyn StorageBackend>,
     compression: &CompressionAlgo,
 ) -> Result<Vec<u8>> {
     match entry.storage {
         TensorStorage::Full => {
-            let filename = entry.filename.as_ref().ok_or_else(|| {
-                RevolverError::NotFound(format!("No filename for '{}'", entry.name))
-            })?;
-            let mut compressed = storage.get(filename)?;
-            // Truncate padding from page-aligned writes
-            let expected_len = entry.compressed_size as usize;
-            if expected_len > 0 && compressed.len() > expected_len {
-                compressed.truncate(expected_len);
-            }
+            let compressed = load_compressed_data(entry, snap, storage)?;
             compression::decompress(&compressed, compression)
         }
         _ => Err(RevolverError::Delta(format!(

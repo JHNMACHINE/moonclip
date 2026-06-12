@@ -33,6 +33,7 @@ class RevolverManager:
         s3_path_style: bool = False,
         sync_every_n_saves: int = 100,
         save_dtype: str = "none",
+        max_total_snapshots: Optional[int] = None,
     ) -> None:
         """
         Initialize the RevolverManager.
