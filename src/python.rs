@@ -168,13 +168,16 @@ impl RevolverManager {
     #[pyo3(signature = (step, tensors, metadata = None))]
     fn save_tensors(
         &self,
+        py: Python<'_>,
         step: u64,
         tensors: Bound<'_, PyDict>,
         metadata: Option<Bound<'_, PyDict>>,
     ) -> PyResult<String> {
+        // Extract Python data while holding GIL
         let tensor_data = extract_tensors(&tensors)?;
         let meta = extract_metadata(metadata)?;
-        let id = self.inner.save(step, tensor_data, meta)?;
+        // Release GIL — Rust does SHA256 + zstd + delta + I/O in parallel
+        let id = py.allow_threads(|| self.inner.save(step, tensor_data, meta))?;
         Ok(id.to_string())
     }
 
@@ -191,11 +194,11 @@ impl RevolverManager {
     }
 
     /// Save this rank's tensors into an existing snapshot (multi-rank).
-    fn save_rank(&self, snap_id: &str, tensors: Bound<'_, PyDict>) -> PyResult<()> {
+    fn save_rank(&self, py: Python<'_>, snap_id: &str, tensors: Bound<'_, PyDict>) -> PyResult<()> {
         let uuid = uuid::Uuid::parse_str(snap_id)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
         let tensor_data = extract_tensors(&tensors)?;
-        self.inner.save_rank(uuid, tensor_data)?;
+        py.allow_threads(|| self.inner.save_rank(uuid, tensor_data))?;
         Ok(())
     }
 
@@ -211,7 +214,8 @@ impl RevolverManager {
     fn load<'py>(&self, py: Python<'py>, snap_id: &str) -> PyResult<Bound<'py, PyDict>> {
         let uuid = uuid::Uuid::parse_str(snap_id)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
-        let tensors = self.inner.load(uuid)?;
+        // Release GIL for Rust decompression + delta reconstruction
+        let tensors = py.allow_threads(|| self.inner.load(uuid))?;
         let dict = PyDict::new(py);
         for (name, data) in tensors {
             dict.set_item(name, PyBytes::new(py, &data))?;
@@ -221,7 +225,8 @@ impl RevolverManager {
 
     /// Load the latest snapshot.
     fn load_latest<'py>(&self, py: Python<'py>) -> PyResult<(Bound<'py, PyString>, Bound<'py, PyDict>)> {
-        let (id, tensors) = self.inner.load_latest()?;
+        // Release GIL for Rust decompression + delta reconstruction
+        let (id, tensors) = py.allow_threads(|| self.inner.load_latest())?;
         let dict = PyDict::new(py);
         for (name, data) in tensors {
             dict.set_item(name, PyBytes::new(py, &data))?;

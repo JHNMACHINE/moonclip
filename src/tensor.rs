@@ -40,19 +40,21 @@ pub fn process_tensor(
     rank: u32,
     save_dtype: &DType,
 ) -> Result<ProcessedTensor> {
-    // Cast if requested and applicable
-    let (working_data, working_dtype) = if *save_dtype != DType::None
-        && is_castable_float(&tensor.dtype)
-    {
-        cast::cast_tensor(&tensor.data, &tensor.dtype, save_dtype)?
-    } else {
-        (tensor.data.clone(), tensor.dtype.clone())
-    };
+    use std::borrow::Cow;
+
+    // Cast if requested and applicable — otherwise borrow without cloning
+    let (working_data, working_dtype): (Cow<[u8]>, Cow<str>) =
+        if *save_dtype != DType::None && is_castable_float(&tensor.dtype) {
+            let (d, t) = cast::cast_tensor(&tensor.data, &tensor.dtype, save_dtype)?;
+            (Cow::Owned(d), Cow::Owned(t))
+        } else {
+            (Cow::Borrowed(&tensor.data), Cow::Borrowed(&tensor.dtype))
+        };
 
     let raw_hash = sha256_hex(&working_data);
 
     // Determine original_dtype field (set only if we actually cast)
-    let orig_dtype = if working_dtype != tensor.dtype {
+    let orig_dtype = if *working_dtype != tensor.dtype {
         Some(tensor.dtype.clone())
     } else {
         None
@@ -65,7 +67,7 @@ pub fn process_tensor(
                 entry: TensorEntry {
                     name: tensor.name.clone(),
                     shape: tensor.shape.clone(),
-                    dtype: working_dtype.clone(),
+                    dtype: working_dtype.to_string(),
                     original_dtype: orig_dtype.clone(),
                     storage: TensorStorage::Skipped,
                     filename: None,
@@ -107,7 +109,7 @@ pub fn process_tensor(
                                 entry: TensorEntry {
                                     name: tensor.name.clone(),
                                     shape: tensor.shape.clone(),
-                                    dtype: working_dtype.clone(),
+                                    dtype: working_dtype.to_string(),
                                     original_dtype: orig_dtype.clone(),
                                     storage: TensorStorage::DeltaXor,
                                     filename: Some(filename),
@@ -305,24 +307,24 @@ pub fn process_tensors_parallel(
 ) -> Result<Vec<ProcessedTensor>>
 where
 {
-    let mut results = Vec::with_capacity(tensors.len());
+    use rayon::prelude::*;
 
-    for tensor in tensors {
-        let base_entry = base_entries.get(&tensor.name);
-        let processed = process_tensor(
-            tensor,
-            base_entry,
-            base_storage,
-            compression,
-            delta_threshold,
-            snap_dir,
-            rank,
-            save_dtype,
-        )?;
-        results.push(processed);
-    }
-
-    Ok(results)
+    tensors
+        .par_iter()
+        .map(|tensor| {
+            let base_entry = base_entries.get(&tensor.name);
+            process_tensor(
+                tensor,
+                base_entry,
+                base_storage,
+                compression,
+                delta_threshold,
+                snap_dir,
+                rank,
+                save_dtype,
+            )
+        })
+        .collect()
 }
 
 

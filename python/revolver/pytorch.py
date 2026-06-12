@@ -207,30 +207,46 @@ class CheckpointManager:
         metadata: Optional[Dict[str, str]] = None,
     ) -> str:
         """
-        Save a training checkpoint with per-tensor delta tracking.
+        Save a training checkpoint.
 
-        Each tensor is stored individually, so unchanged tensors are
-        skipped entirely (zero I/O) and changed tensors use XOR delta.
+        Model weights use per-tensor delta tracking: unchanged tensors are
+        skipped entirely (zero I/O) and changed tensors use XOR delta + zstd.
+
+        Optimizer, scheduler, and scaler state are saved as single compressed
+        blobs (their internal buffers change entirely every step, making
+        per-tensor delta tracking counterproductive).
         """
         all_tensors = {}
 
-        def _add(prefix: str, obj: Any):
+        def _add_tracked(prefix: str, obj: Any):
+            """Per-tensor delta tracking — for model weights."""
             sd = obj.state_dict() if hasattr(obj, "state_dict") else obj
             meta = _flatten_and_extract_tensors(sd, prefix, all_tensors)
             meta_bytes = pickle.dumps(meta)
             all_tensors[f"{prefix}._metadata"] = ([], "uint8", meta_bytes)
 
+        def _add_blob(prefix: str, obj: Any):
+            """Single compressed blob — for optimizer/scheduler/aux state.
+
+            Optimizer buffers (exp_avg, exp_avg_sq) change completely every
+            step, so per-tensor XOR deltas are useless. A single blob avoids
+            hundreds of Python→Rust round-trips and metadata overhead.
+            """
+            sd = obj.state_dict() if hasattr(obj, "state_dict") else obj
+            blob = pickle.dumps(sd)
+            all_tensors[f"{prefix}._blob"] = ([], "uint8", blob)
+
         if model is not None:
-            _add("model", model)
+            _add_tracked("model", model)
         if optimizer is not None:
-            _add("optimizer", optimizer)
+            _add_blob("optimizer", optimizer)
         if scheduler is not None:
-            _add("scheduler", scheduler)
+            _add_blob("scheduler", scheduler)
         if scaler is not None:
-            _add("scaler", scaler)
+            _add_blob("scaler", scaler)
         if extra:
             for name, obj in extra.items():
-                _add(name, obj)
+                _add_tracked(name, obj)
 
         if self.world_size > 1:
             import torch.distributed as dist
@@ -311,7 +327,12 @@ class CheckpointManager:
             return snap_id, state_dicts
 
     def _apply_loaded(self, raw, model, optimizer, scheduler, scaler):
-        """Group loaded tensors by prefix and apply to objects."""
+        """Group loaded tensors by prefix and apply to objects.
+
+        Supports two formats:
+        - Blob: prefix._blob → single pickled state_dict (new, for optimizer/scheduler)
+        - Per-tensor: prefix._metadata + individual tensors (original, for model weights)
+        """
         result = {}
 
         prefix_to_obj = {}
@@ -324,17 +345,27 @@ class CheckpointManager:
         if scaler is not None:
             prefix_to_obj["scaler"] = scaler
 
+        # First pass: load blobs (optimizer/scheduler/scaler)
+        for key, value in raw.items():
+            if key.endswith("._blob"):
+                prefix = key[:-6]  # strip "._blob"
+                sd = pickle.loads(value)
+                obj = prefix_to_obj.get(prefix)
+                if obj is not None and hasattr(obj, "load_state_dict"):
+                    obj.load_state_dict(sd)
+                result[prefix] = sd
+
+        # Second pass: load per-tensor (model weights, or old-format optimizer)
         for key, value in raw.items():
             if key.endswith("._metadata"):
                 prefix = key[:-10]  # strip "._metadata"
+                if prefix in result:
+                    continue  # already loaded via blob
                 meta = pickle.loads(value)
                 sd = _reconstruct_from_tensors(meta, raw)
-
                 obj = prefix_to_obj.get(prefix)
-                if obj is not None:
-                    if hasattr(obj, "load_state_dict"):
-                        obj.load_state_dict(sd)
-
+                if obj is not None and hasattr(obj, "load_state_dict"):
+                    obj.load_state_dict(sd)
                 result[prefix] = sd
 
         return result
