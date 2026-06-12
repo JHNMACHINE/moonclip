@@ -1,5 +1,5 @@
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict, PyString, PyTuple};
+use pyo3::types::{PyByteArray, PyDict, PyString, PyTuple};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -30,6 +30,7 @@ fn get_element_size(dtype: &str) -> PyResult<usize> {
         "torch.float32" | "torch.int32" => Ok(4),
         "torch.float64" | "torch.int64" => Ok(8),
         "torch.float16" | "torch.bfloat16" => Ok(2),
+        "torch.int16" | "torch.uint16" => Ok(2),
         "torch.int8" | "torch.uint8" => Ok(1),
         "torch.bool" => Ok(1),
         _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
@@ -39,7 +40,22 @@ fn get_element_size(dtype: &str) -> PyResult<usize> {
     }
 }
 
-fn extract_tensors(tensors: &Bound<'_, PyDict>) -> PyResult<Vec<TensorData>> {
+/// Tensor data captured under the GIL. Large torch tensors are kept as a
+/// raw pointer + length so the actual byte copy happens in parallel with
+/// the GIL released.
+enum PendingBytes {
+    Owned(Vec<u8>),
+    Borrowed { ptr: usize, len: usize },
+}
+
+struct PendingTensor {
+    name: String,
+    shape: Vec<usize>,
+    dtype: String,
+    bytes: PendingBytes,
+}
+
+fn collect_tensors(tensors: &Bound<'_, PyDict>) -> PyResult<Vec<PendingTensor>> {
     let mut result = Vec::new();
     for (key, value) in tensors.iter() {
         let name: String = key.extract()?;
@@ -48,11 +64,11 @@ fn extract_tensors(tensors: &Bound<'_, PyDict>) -> PyResult<Vec<TensorData>> {
             let shape: Vec<usize> = tuple.get_item(0)?.extract()?;
             let dtype: String = tuple.get_item(1)?.extract()?;
             let data: Vec<u8> = tuple.get_item(2)?.extract()?;
-            result.push(TensorData {
+            result.push(PendingTensor {
                 name,
                 shape,
                 dtype,
-                data,
+                bytes: PendingBytes::Owned(data),
             });
         }
         // Nuovo formato: tensore PyTorch direttamente
@@ -68,14 +84,14 @@ fn extract_tensors(tensors: &Bound<'_, PyDict>) -> PyResult<Vec<TensorData>> {
                 let data_ptr: usize = tensor.call_method0("data_ptr")?.extract()?;
                 let element_size = get_element_size(&format!("torch.{}", dtype))?;
                 let nbytes = numel * element_size;
-                let data_slice: &[u8] =
-                    unsafe { std::slice::from_raw_parts(data_ptr as *const u8, nbytes) };
-                let data = data_slice.to_vec();
-                result.push(TensorData {
+                result.push(PendingTensor {
                     name,
                     shape,
                     dtype,
-                    data,
+                    bytes: PendingBytes::Borrowed {
+                        ptr: data_ptr,
+                        len: nbytes,
+                    },
                 });
             } else {
                 return Err(pyo3::exceptions::PyTypeError::new_err(format!(
@@ -91,6 +107,34 @@ fn extract_tensors(tensors: &Bound<'_, PyDict>) -> PyResult<Vec<TensorData>> {
         }
     }
     Ok(result)
+}
+
+/// Copy pending tensor bytes into owned buffers, in parallel.
+///
+/// SAFETY: borrowed pointers come from CPU-contiguous torch tensors held
+/// alive by the caller's Python dict for the whole duration of the call;
+/// this runs (with the GIL released) strictly within that window and only
+/// reads the raw bytes.
+fn materialize_tensors(pending: Vec<PendingTensor>) -> Vec<TensorData> {
+    use rayon::prelude::*;
+
+    pending
+        .into_par_iter()
+        .map(|p| {
+            let data = match p.bytes {
+                PendingBytes::Owned(v) => v,
+                PendingBytes::Borrowed { ptr, len } => {
+                    unsafe { std::slice::from_raw_parts(ptr as *const u8, len) }.to_vec()
+                }
+            };
+            TensorData {
+                name: p.name,
+                shape: p.shape,
+                dtype: p.dtype,
+                data,
+            }
+        })
+        .collect()
 }
 
 /// High-performance checkpoint manager for ML training.
@@ -125,6 +169,7 @@ impl RevolverManager {
         s3_path_style = false,
         sync_every_n_saves = 100,
         save_dtype = "none",
+        async_save = true,
     ))]
     fn new(
         storage_root: &str,
@@ -149,6 +194,7 @@ impl RevolverManager {
         s3_path_style: bool,
         sync_every_n_saves: u64,
         save_dtype: &str,
+        async_save: bool,
     ) -> PyResult<Self> {
         let compression = if compression_level == 0 {
             CompressionAlgo::None
@@ -184,6 +230,7 @@ impl RevolverManager {
             remote_storage: None,
             remote_sync: None,
             save_dtype: DType::from_str(save_dtype),
+            async_save,
         };
 
         let storage: Arc<dyn crate::storage::StorageBackend> = if let Some(bucket) = s3_bucket {
@@ -237,9 +284,12 @@ impl RevolverManager {
         tensors: Bound<'_, PyDict>,
         metadata: Option<Bound<'_, PyDict>>,
     ) -> PyResult<String> {
-        let tensor_data = extract_tensors(&tensors)?;
+        let pending = collect_tensors(&tensors)?;
         let meta = extract_metadata(metadata)?;
-        let id = py.allow_threads(|| self.inner.save(step, tensor_data, meta))?;
+        let id = py.allow_threads(|| {
+            let tensor_data = materialize_tensors(pending);
+            self.inner.save(step, tensor_data, meta)
+        })?;
         Ok(id.to_string())
     }
 
@@ -255,8 +305,11 @@ impl RevolverManager {
     fn save_rank(&self, py: Python<'_>, snap_id: &str, tensors: Bound<'_, PyDict>) -> PyResult<()> {
         let uuid = uuid::Uuid::parse_str(snap_id)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
-        let tensor_data = extract_tensors(&tensors)?;
-        py.allow_threads(|| self.inner.save_rank(uuid, tensor_data))?;
+        let pending = collect_tensors(&tensors)?;
+        py.allow_threads(|| {
+            let tensor_data = materialize_tensors(pending);
+            self.inner.save_rank(uuid, tensor_data)
+        })?;
         Ok(())
     }
 
@@ -268,14 +321,21 @@ impl RevolverManager {
         Ok(())
     }
 
-    /// Load a snapshot. Returns dict of tensor_name → bytes.
+    /// Block until any in-flight background save completes.
+    /// Raises if the background save failed.
+    fn flush(&self, py: Python<'_>) -> PyResult<()> {
+        py.allow_threads(|| self.inner.flush())?;
+        Ok(())
+    }
+
+    /// Load a snapshot. Returns dict of tensor_name → bytearray.
     fn load<'py>(&self, py: Python<'py>, snap_id: &str) -> PyResult<Bound<'py, PyDict>> {
         let uuid = uuid::Uuid::parse_str(snap_id)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
         let tensors = py.allow_threads(|| self.inner.load(uuid))?;
         let dict = PyDict::new(py);
         for (name, data) in tensors {
-            dict.set_item(name, PyBytes::new(py, &data))?;
+            dict.set_item(name, PyByteArray::new(py, &data))?;
         }
         Ok(dict)
     }
@@ -288,7 +348,7 @@ impl RevolverManager {
         let (id, tensors) = py.allow_threads(|| self.inner.load_latest())?;
         let dict = PyDict::new(py);
         for (name, data) in tensors {
-            dict.set_item(name, PyBytes::new(py, &data))?;
+            dict.set_item(name, PyByteArray::new(py, &data))?;
         }
         let id_str = PyString::new(py, &id.to_string());
         Ok((id_str, dict))
@@ -296,7 +356,7 @@ impl RevolverManager {
 
     /// List all finalized snapshots.
     fn list_snapshots<'py>(&self, py: Python<'py>) -> PyResult<Vec<Bound<'py, PyDict>>> {
-        let snaps = self.inner.list_snapshots();
+        let snaps = py.allow_threads(|| self.inner.list_snapshots());
         let mut result = Vec::new();
         for s in snaps {
             let d = PyDict::new(py);
@@ -320,13 +380,13 @@ impl RevolverManager {
     }
 
     /// Force merge all pending deltas.
-    fn merge_now(&self) {
-        self.inner.merge_now();
+    fn merge_now(&self, py: Python<'_>) {
+        py.allow_threads(|| self.inner.merge_now());
     }
 
     /// Force sync to remote storage.
-    fn sync_now(&self) {
-        self.inner.sync_now();
+    fn sync_now(&self, py: Python<'_>) {
+        py.allow_threads(|| self.inner.sync_now());
     }
 }
 

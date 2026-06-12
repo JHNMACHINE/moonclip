@@ -35,7 +35,9 @@ enum SyncCommand {
 /// Remote (S3/GCS) is the durable backup. The syncer copies new files
 /// to remote in batches, reducing API calls and bandwidth spikes.
 pub struct RemoteSyncer {
-    sender: Option<mpsc::Sender<SyncCommand>>,
+    // Mutex-wrapped so RemoteSyncer is Sync (mpsc::Sender is Send but not
+    // Sync); the coordinator shares it with the background save thread.
+    sender: Option<std::sync::Mutex<mpsc::Sender<SyncCommand>>>,
     handle: Option<thread::JoinHandle<()>>,
     save_counter: std::sync::atomic::AtomicU64,
     sync_every: u64,
@@ -77,7 +79,7 @@ impl RemoteSyncer {
             .expect("Failed to spawn remote sync thread");
 
         RemoteSyncer {
-            sender: Some(tx),
+            sender: Some(std::sync::Mutex::new(tx)),
             handle: Some(handle),
             save_counter: std::sync::atomic::AtomicU64::new(0),
             sync_every,
@@ -94,6 +96,7 @@ impl RemoteSyncer {
 
         if count % self.sync_every == 0 {
             if let Some(ref tx) = self.sender {
+                let tx = tx.lock().unwrap();
                 // Sync snapshots and manifest
                 let _ = tx.send(SyncCommand::SyncPrefix("snapshots".into()));
                 let _ = tx.send(SyncCommand::SyncPrefix("manifest.json".into()));
@@ -104,14 +107,14 @@ impl RemoteSyncer {
     /// Force an immediate sync of everything.
     pub fn sync_now(&self) {
         if let Some(ref tx) = self.sender {
-            let _ = tx.send(SyncCommand::SyncAll);
+            let _ = tx.lock().unwrap().send(SyncCommand::SyncAll);
         }
     }
 
     /// Shutdown the syncer thread.
     pub fn shutdown(&mut self) {
         if let Some(ref tx) = self.sender {
-            let _ = tx.send(SyncCommand::Shutdown);
+            let _ = tx.lock().unwrap().send(SyncCommand::Shutdown);
         }
         self.sender.take();
         if let Some(handle) = self.handle.take() {

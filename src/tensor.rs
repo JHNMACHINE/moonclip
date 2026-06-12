@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::cast::{self, DType, is_castable_float};
 use crate::compression;
@@ -25,49 +26,86 @@ pub struct ProcessedTensor {
     pub write_data: Option<Vec<u8>>,
 }
 
-/// Pre-loaded base snapshot data for delta comparison.
+/// Tensors smaller than this skip the delta machinery entirely.
+/// Must match delta::DELTA_MIN_SIZE semantics.
+const DELTA_MIN_SIZE: usize = 4096;
+
+/// Raw bytes sampled from the start of a base tensor for density estimation.
+const SAMPLE_RAW: usize = 64 * 1024;
+/// Compressed window read from storage to produce the sample.
+const SAMPLE_WINDOW: usize = 256 * 1024;
+/// Minimum sample size to trust the estimate.
+const SAMPLE_MIN: usize = 8 * 1024;
+
+/// Density above which the delta attempt is abandoned based on the sample
+/// alone (small margin over the exact threshold to absorb sampling error;
+/// borderline cases still go through the exact full-buffer check).
+fn bail_threshold(delta_threshold: f64) -> f64 {
+    (delta_threshold + 0.05).min(0.98)
+}
+
+/// Lazy handle to the base snapshot's data for delta comparison.
 ///
-/// Instead of each parallel worker hitting disk independently,
-/// the coordinator reads the base pack file once and shares it
-/// immutably across rayon threads.
+/// Tensor bytes are read from storage on demand (range reads from the
+/// pack file), so unchanged tensors (hash match) and tensors that bail
+/// out via density sampling cost little or no base I/O.
 pub struct BaseCache {
-    /// Raw bytes of the base snapshot's pack file.
-    /// Empty if no pack file (legacy per-file storage).
-    pub pack_data: Vec<u8>,
+    /// Storage to read base data from.
+    pub storage: Arc<dyn StorageBackend>,
+    /// Pack file of the base snapshot (None for legacy per-file storage).
+    pub pack_file: Option<String>,
     /// Tensor entries from the base snapshot, keyed by name.
     pub entries: HashMap<String, TensorEntry>,
     /// Compression algo of the base snapshot.
     pub compression: CompressionAlgo,
-    /// For legacy mode: individual file data loaded ahead of time.
-    /// Keyed by filename.
-    pub legacy_files: HashMap<String, Vec<u8>>,
 }
 
 impl BaseCache {
-    /// Extract compressed bytes for a tensor from the pack file or legacy files.
-    fn get_compressed(&self, entry: &TensorEntry) -> Option<Vec<u8>> {
-        if !self.pack_data.is_empty() {
-            // Pack mode: slice from pack buffer
-            let start = entry.offset as usize;
-            let end = start + entry.compressed_size as usize;
-            if end <= self.pack_data.len() {
-                Some(self.pack_data[start..end].to_vec())
-            } else {
-                None
+    /// Read the compressed bytes for a tensor (full entry).
+    fn read_compressed(&self, entry: &TensorEntry) -> Result<Option<Vec<u8>>> {
+        if let Some(ref pack) = self.pack_file {
+            let data =
+                self.storage
+                    .get_range(pack, entry.offset, entry.compressed_size as usize)?;
+            if data.len() == entry.compressed_size as usize {
+                return Ok(Some(data));
             }
-        } else if let Some(ref filename) = entry.filename {
-            // Legacy mode: from pre-loaded files
-            self.legacy_files.get(filename).map(|data| {
-                let expected = entry.compressed_size as usize;
-                if expected > 0 && data.len() > expected {
-                    data[..expected].to_vec()
-                } else {
-                    data.clone()
-                }
-            })
-        } else {
-            None
+            return Ok(None);
         }
+        if let Some(ref filename) = entry.filename {
+            match self.storage.get(filename) {
+                Ok(mut data) => {
+                    let expected = entry.compressed_size as usize;
+                    if expected > 0 && data.len() > expected {
+                        data.truncate(expected);
+                    }
+                    Ok(Some(data))
+                }
+                Err(_) => Ok(None), // missing base file → full save
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Best-effort decompression of the first ~`max_raw` bytes of a base
+    /// tensor, reading only a small window of compressed data.
+    /// Returns None when no usable sample could be produced.
+    fn sample_prefix(&self, entry: &TensorEntry, max_raw: usize) -> Option<Vec<u8>> {
+        if entry.storage != TensorStorage::Full {
+            return None;
+        }
+        let window = (entry.compressed_size as usize).min(SAMPLE_WINDOW);
+        let compressed = if let Some(ref pack) = self.pack_file {
+            self.storage.get_range(pack, entry.offset, window).ok()?
+        } else {
+            // Legacy per-file storage: read the file (cheap, page-cached).
+            let filename = entry.filename.as_ref()?;
+            let mut data = self.storage.get(filename).ok()?;
+            data.truncate(window);
+            data
+        };
+        compression::decompress_prefix(&compressed, &self.compression, max_raw).ok()
     }
 
     /// Decompress a base tensor to raw bytes. Returns None for delta/skipped bases.
@@ -75,7 +113,7 @@ impl BaseCache {
         if entry.storage != TensorStorage::Full {
             return Ok(None); // Can't delta-chain against non-full bases
         }
-        match self.get_compressed(entry) {
+        match self.read_compressed(entry)? {
             Some(compressed) => {
                 let raw = compression::decompress(&compressed, &self.compression)?;
                 Ok(Some(raw))
@@ -88,7 +126,7 @@ impl BaseCache {
 /// Process a tensor for saving: optionally cast dtype, compare with base,
 /// decide skip/delta/full, compress, and return the entry + data to write.
 ///
-/// `base_cache`: pre-loaded base snapshot data (None for first save).
+/// `base_cache`: lazy handle to the base snapshot (None for first save).
 pub fn process_tensor(
     tensor: &TensorData,
     base_cache: Option<&BaseCache>,
@@ -141,13 +179,30 @@ pub fn process_tensor(
             // Try delta encoding (only against full bases with matching size)
             if base_entry.raw_size == working_data.len() as u64
                 && base_entry.storage == TensorStorage::Full
+                && working_data.len() >= DELTA_MIN_SIZE
             {
-                // Decompress base from cache — no disk I/O here
-                if let Some(base_raw) = cache.decompress_tensor(base_entry)? {
-                    if let Some(xor_delta) = delta::compute_delta(&base_raw, &working_data) {
-                        let density = delta::delta_density(&xor_delta);
-                        if density < delta_threshold {
+                // Cheap density estimate from a decompressed prefix of the
+                // base. After typical optimizer steps nearly every byte
+                // changes; sampling avoids decompressing the whole base
+                // tensor just to throw the delta away. The sample only
+                // decides whether to *attempt* the delta — the final
+                // decision always uses the exact full-buffer density.
+                let attempt = match cache.sample_prefix(base_entry, SAMPLE_RAW) {
+                    Some(prefix) if prefix.len() >= SAMPLE_MIN => {
+                        let n = prefix.len().min(working_data.len());
+                        let est = delta::sample_density(&prefix[..n], &working_data[..n]);
+                        est < bail_threshold(delta_threshold)
+                    }
+                    _ => true, // no usable sample → let the exact path decide
+                };
+
+                if attempt {
+                    if let Some(base_raw) = cache.decompress_tensor(base_entry)? {
+                        if let Some(xor_delta) =
+                            delta::delta_if_sparse(&base_raw, &working_data, delta_threshold)
+                        {
                             let compressed = compression::compress(&xor_delta, compression)?;
+                            let compressed_hash = hash_hex(&compressed);
 
                             return Ok(ProcessedTensor {
                                 entry: TensorEntry {
@@ -161,7 +216,7 @@ pub fn process_tensor(
                                     compressed_size: compressed.len() as u64,
                                     raw_size: working_data.len() as u64,
                                     sha256_raw: raw_hash,
-                                    sha256_compressed: None, // Set after packing
+                                    sha256_compressed: Some(compressed_hash),
                                 },
                                 write_data: Some(compressed),
                             });
@@ -185,6 +240,7 @@ fn make_full_entry(
     compression: &CompressionAlgo,
 ) -> Result<ProcessedTensor> {
     let compressed = compression::compress(working_data, compression)?;
+    let compressed_hash = hash_hex(&compressed);
 
     Ok(ProcessedTensor {
         entry: TensorEntry {
@@ -198,11 +254,17 @@ fn make_full_entry(
             compressed_size: compressed.len() as u64,
             raw_size: working_data.len() as u64,
             sha256_raw: raw_hash.to_string(),
-            sha256_compressed: None, // Set after packing
+            sha256_compressed: Some(compressed_hash),
         },
         write_data: Some(compressed),
     })
 }
+
+/// Resolver for base-snapshot tensor entries during load.
+/// Returns (entry, compression of the base snapshot, optional shared pack bytes).
+pub type BaseEntryResolver<'a> = dyn Fn(uuid::Uuid, &str) -> Result<(TensorEntry, CompressionAlgo, Option<Arc<Vec<u8>>>)>
+    + Sync
+    + 'a;
 
 /// Load a tensor's raw bytes, resolving delta chains if needed.
 /// If the tensor was saved with a cast (e.g. fp32→bf16), it is
@@ -216,7 +278,7 @@ pub fn load_tensor(
     storage: &dyn StorageBackend,
     compression: &CompressionAlgo,
     pack_data: Option<&[u8]>,
-    find_base_entry: &dyn Fn(uuid::Uuid, &str) -> Result<(TensorEntry, CompressionAlgo, Option<Vec<u8>>)>,
+    find_base_entry: &BaseEntryResolver<'_>,
 ) -> Result<Vec<u8>> {
     let raw = load_tensor_raw(entry, snap_base_id, storage, compression, pack_data, find_base_entry)?;
 
@@ -265,7 +327,7 @@ fn load_tensor_raw(
     storage: &dyn StorageBackend,
     compression: &CompressionAlgo,
     pack_data: Option<&[u8]>,
-    find_base_entry: &dyn Fn(uuid::Uuid, &str) -> Result<(TensorEntry, CompressionAlgo, Option<Vec<u8>>)>,
+    find_base_entry: &BaseEntryResolver<'_>,
 ) -> Result<Vec<u8>> {
     match entry.storage {
         TensorStorage::Skipped => {
@@ -277,7 +339,14 @@ fn load_tensor_raw(
                 ))
             })?;
             let (base_entry, base_compression, base_pack) = find_base_entry(base_id, &entry.name)?;
-            load_tensor_raw(&base_entry, None, storage, &base_compression, base_pack.as_deref(), find_base_entry)
+            load_tensor_raw(
+                &base_entry,
+                None,
+                storage,
+                &base_compression,
+                base_pack.as_ref().map(|p| p.as_slice()),
+                find_base_entry,
+            )
         }
         TensorStorage::Full => {
             let compressed = extract_compressed(entry, storage, pack_data)?;
@@ -307,8 +376,14 @@ fn load_tensor_raw(
                 ))
             })?;
             let (base_entry, base_compression, base_pack) = find_base_entry(base_id, &entry.name)?;
-            let base_raw =
-                load_tensor_raw(&base_entry, None, storage, &base_compression, base_pack.as_deref(), find_base_entry)?;
+            let base_raw = load_tensor_raw(
+                &base_entry,
+                None,
+                storage,
+                &base_compression,
+                base_pack.as_ref().map(|p| p.as_slice()),
+                find_base_entry,
+            )?;
 
             // Apply XOR delta
             let raw = delta::apply_delta(&base_raw, &delta_data)?;
@@ -360,31 +435,23 @@ mod tests {
     use crate::storage::LocalStorage;
 
     fn make_base_cache(
-        storage: &LocalStorage,
+        storage: Arc<dyn StorageBackend>,
         entries: Vec<TensorEntry>,
         compression: &CompressionAlgo,
     ) -> BaseCache {
-        let mut legacy_files = HashMap::new();
-        for e in &entries {
-            if let Some(ref filename) = e.filename {
-                if let Ok(data) = storage.get(filename) {
-                    legacy_files.insert(filename.clone(), data);
-                }
-            }
-        }
         let entry_map = entries.into_iter().map(|e| (e.name.clone(), e)).collect();
         BaseCache {
-            pack_data: Vec::new(),
+            storage,
+            pack_file: None,
             entries: entry_map,
             compression: compression.clone(),
-            legacy_files,
         }
     }
 
     #[test]
     fn skip_identical_tensor() {
         let dir = tempfile::tempdir().unwrap();
-        let storage = LocalStorage::new(dir.path()).unwrap();
+        let storage: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(dir.path()).unwrap());
         let compression = CompressionAlgo::Zstd { level: 1 };
 
         // Save a "base" tensor
@@ -408,7 +475,7 @@ mod tests {
             original_dtype: None,
         };
 
-        let cache = make_base_cache(&storage, vec![base_entry], &compression);
+        let cache = make_base_cache(Arc::clone(&storage), vec![base_entry], &compression);
 
         // Process same tensor again → should be Skipped
         let tensor = TensorData {
@@ -434,7 +501,7 @@ mod tests {
     #[test]
     fn delta_on_small_change() {
         let dir = tempfile::tempdir().unwrap();
-        let storage = LocalStorage::new(dir.path()).unwrap();
+        let storage: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(dir.path()).unwrap());
         let compression = CompressionAlgo::Zstd { level: 1 };
 
         let data_v1 = vec![0u8; 50_000];
@@ -456,7 +523,7 @@ mod tests {
             original_dtype: None,
         };
 
-        let cache = make_base_cache(&storage, vec![base_entry], &compression);
+        let cache = make_base_cache(Arc::clone(&storage), vec![base_entry], &compression);
 
         // Change 2 bytes
         let mut data_v2 = data_v1.clone();
@@ -485,6 +552,47 @@ mod tests {
     }
 
     #[test]
+    fn dense_change_falls_back_to_full() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(dir.path()).unwrap());
+        let compression = CompressionAlgo::Zstd { level: 1 };
+
+        let data_v1: Vec<u8> = (0..200_000).map(|i| (i % 256) as u8).collect();
+        let compressed_v1 = compression::compress(&data_v1, &compression).unwrap();
+        let base_filename = "snapshots/base/rank_0/dense.bin".to_string();
+        storage.put(&base_filename, &compressed_v1).unwrap();
+
+        let base_entry = TensorEntry {
+            name: "dense".into(),
+            shape: vec![200_000],
+            dtype: "uint8".into(),
+            storage: TensorStorage::Full,
+            filename: Some(base_filename),
+            offset: 0,
+            compressed_size: compressed_v1.len() as u64,
+            raw_size: 200_000,
+            sha256_raw: hash_hex(&data_v1),
+            sha256_compressed: None,
+            original_dtype: None,
+        };
+
+        let cache = make_base_cache(Arc::clone(&storage), vec![base_entry], &compression);
+
+        // Change every byte → density ~1.0 → must be stored Full
+        let data_v2: Vec<u8> = data_v1.iter().map(|b| b.wrapping_add(1)).collect();
+        let tensor = TensorData {
+            name: "dense".into(),
+            shape: vec![200_000],
+            dtype: "uint8".into(),
+            data: data_v2,
+        };
+
+        let result = process_tensor(&tensor, Some(&cache), &compression, 0.5, &DType::None).unwrap();
+        assert_eq!(result.entry.storage, TensorStorage::Full);
+        assert!(result.write_data.is_some());
+    }
+
+    #[test]
     fn full_save_no_base() {
         let compression = CompressionAlgo::Zstd { level: 1 };
 
@@ -506,5 +614,6 @@ mod tests {
 
         assert_eq!(result.entry.storage, TensorStorage::Full);
         assert!(result.write_data.is_some());
+        assert!(result.entry.sha256_compressed.is_some());
     }
 }

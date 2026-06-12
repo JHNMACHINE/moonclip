@@ -5,9 +5,11 @@ Measures save time, load time, and disk usage across multiple checkpoint saves
 during a real training run. Each method uses its natural retention policy to
 show real-world disk footprint.
 
-Key insight: Revolver's advantage is NOT per-save speed (it's slower due to
-per-tensor processing). Its advantage is cumulative disk savings over many
-saves via delta tracking, zstd compression, and built-in retention.
+Revolver saves run asynchronously by default: save() returns as soon as the
+tensor data has been copied, while hashing, delta detection, compression and
+the disk write overlap with the next training steps. On top of that it keeps
+cumulative disk savings over many saves via per-tensor delta tracking, zstd
+compression, and built-in retention.
 
 Usage:
     pip install revolver torch safetensors accelerate pytorch-lightning
@@ -24,6 +26,7 @@ import glob
 import math
 import os
 import shutil
+import sys
 import time
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
@@ -691,6 +694,11 @@ ALL_METHODS = {
 
 
 def main():
+    # The report uses box-drawing characters; Windows consoles may default
+    # to a legacy codepage (cp1252) that can't encode them.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
     parser = argparse.ArgumentParser(
         description="Benchmark checkpoint methods",
         formatter_class=argparse.RawDescriptionHelpFormatter,

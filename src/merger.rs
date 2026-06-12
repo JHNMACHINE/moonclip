@@ -37,7 +37,9 @@ pub(crate) enum MergeCommand {
 }
 
 pub struct DeltaMerger {
-    sender: Option<mpsc::Sender<MergeCommand>>,
+    // Mutex-wrapped so DeltaMerger is Sync (mpsc::Sender is Send but not Sync);
+    // the coordinator shares it with the background save thread.
+    sender: Option<Mutex<mpsc::Sender<MergeCommand>>>,
     handle: Option<thread::JoinHandle<()>>,
 }
 
@@ -76,26 +78,26 @@ impl DeltaMerger {
             .expect("Failed to spawn merger thread");
 
         DeltaMerger {
-            sender: Some(tx),
+            sender: Some(Mutex::new(tx)),
             handle: Some(handle),
         }
     }
 
     pub fn notify(&self) {
         if let Some(ref tx) = self.sender {
-            let _ = tx.send(MergeCommand::CheckAndMerge);
+            let _ = tx.lock().unwrap().send(MergeCommand::CheckAndMerge);
         }
     }
 
     pub fn force_full_merge(&self) {
         if let Some(ref tx) = self.sender {
-            let _ = tx.send(MergeCommand::ForceFullMerge);
+            let _ = tx.lock().unwrap().send(MergeCommand::ForceFullMerge);
         }
     }
 
     pub fn shutdown(&mut self) {
         if let Some(ref tx) = self.sender {
-            let _ = tx.send(MergeCommand::Shutdown);
+            let _ = tx.lock().unwrap().send(MergeCommand::Shutdown);
         }
         self.sender.take();
         if let Some(handle) = self.handle.take() {

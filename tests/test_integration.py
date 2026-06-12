@@ -186,11 +186,12 @@ class TestIntegrity:
     def test_corruption_detected(self, tmp_path):
         mgr = RevolverManager(storage_root=str(tmp_path), full_every_steps=100000)
         snap_id = mgr.save_tensors(step=1, tensors=make_tensors(42))
+        mgr.flush()  # wait for the background save before touching files
 
         corrupted = 0
         for root, dirs, files in os.walk(str(tmp_path / "snapshots")):
             for f in files:
-                if f.endswith(".bin"):
+                if f.endswith(".pack"):
                     with open(os.path.join(root, f), "r+b") as fh:
                         fh.seek(0)
                         fh.write(b"\xFF\xFF\xFF\xFF")
@@ -267,18 +268,23 @@ class TestMultiRank:
 # ─── Page alignment ────────────────────────────────────────────────
 
 class TestPageAlignment:
-    def test_bin_files_aligned(self, tmp_path):
+    def test_pack_files_aligned(self, tmp_path):
         mgr = RevolverManager(storage_root=str(tmp_path), full_every_steps=100000)
         mgr.save_tensors(step=1, tensors=make_tensors(42))
+        mgr.flush()
+        checked = 0
         for root, _, files in os.walk(str(tmp_path / "snapshots")):
             for f in files:
-                if f.endswith(".bin"):
+                if f.endswith(".pack"):
                     size = os.path.getsize(os.path.join(root, f))
                     assert size % 4096 == 0, f"{f} is {size} bytes"
+                    checked += 1
+        assert checked > 0
 
     def test_manifest_aligned(self, tmp_path):
         mgr = RevolverManager(storage_root=str(tmp_path), full_every_steps=100000)
         mgr.save_tensors(step=1, tensors=make_tensors(0))
+        mgr.flush()
         assert os.path.getsize(str(tmp_path / "manifest.json")) % 4096 == 0
 
     def test_data_survives_padding(self, tmp_path):

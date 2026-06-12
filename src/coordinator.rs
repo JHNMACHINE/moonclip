@@ -1,12 +1,12 @@
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
+use std::thread;
 
 use chrono::Utc;
 use uuid::Uuid;
 
 use crate::cast::DType;
 use crate::error::{Result, RevolverError};
-use crate::hash::hash_hex;
 use crate::manifest::*;
 use crate::merger::{DeltaMerger, MergerConfig};
 use crate::remote_sync::{RemoteSyncConfig, RemoteSyncer};
@@ -26,6 +26,11 @@ pub struct CoordinatorConfig {
     pub remote_sync: Option<RemoteSyncConfig>,
     /// Target dtype for saving float tensors. DType::None = keep original.
     pub save_dtype: DType,
+    /// Run single-rank saves on a background thread (bound-1 queue).
+    /// `save()` returns as soon as the tensor data is handed off; any
+    /// error surfaces on the next save/load/flush call. Loads, listing
+    /// and multi-rank operations always wait for pending saves first.
+    pub async_save: bool,
 }
 
 impl Default for CoordinatorConfig {
@@ -41,8 +46,19 @@ impl Default for CoordinatorConfig {
             remote_storage: None,
             remote_sync: None,
             save_dtype: DType::None,
+            async_save: true,
         }
     }
+}
+
+/// Shared state + save/load logic. Owned via Arc by the Coordinator and
+/// (when async saving is enabled) by the background save thread.
+pub(crate) struct Core {
+    pub(crate) storage: Arc<dyn StorageBackend>,
+    pub(crate) manifest: Arc<Mutex<Manifest>>,
+    config: CoordinatorConfig,
+    merger: Option<DeltaMerger>,
+    syncer: Option<RemoteSyncer>,
 }
 
 /// The main checkpoint coordinator.
@@ -52,11 +68,9 @@ impl Default for CoordinatorConfig {
 /// with the same storage backend and manifest. Rank 0 is responsible
 /// for creating/finalizing snapshots.
 pub struct Coordinator {
-    pub(crate) storage: Arc<dyn StorageBackend>,
-    pub(crate) manifest: Arc<Mutex<Manifest>>,
-    config: CoordinatorConfig,
-    merger: Option<DeltaMerger>,
-    syncer: Option<RemoteSyncer>,
+    // Declared before `core` so pending saves drain before teardown.
+    saver: Option<AsyncSaver>,
+    pub(crate) core: Arc<Core>,
 }
 
 impl Coordinator {
@@ -103,18 +117,32 @@ impl Coordinator {
             _ => None,
         };
 
-        Ok(Coordinator {
+        let use_async = config.async_save && config.world_size == 1;
+
+        let core = Arc::new(Core {
             storage,
             manifest,
             config,
             merger,
             syncer,
-        })
+        });
+
+        let saver = if use_async {
+            Some(AsyncSaver::new(Arc::clone(&core)))
+        } else {
+            None
+        };
+
+        Ok(Coordinator { saver, core })
     }
 
     /// Save a checkpoint for this rank.
     ///
     /// For single-rank (world_size=1): creates snapshot, saves tensors, finalizes.
+    /// With async_save (default), the heavy work (hashing, delta detection,
+    /// compression, disk write) runs on a background thread and this call
+    /// returns as soon as the previous save has drained.
+    ///
     /// For multi-rank: rank 0 must call create_snapshot first, then all ranks
     /// call save_rank, then rank 0 calls finalize.
     ///
@@ -125,68 +153,153 @@ impl Coordinator {
         tensors: Vec<TensorData>,
         metadata: HashMap<String, String>,
     ) -> Result<Uuid> {
-        if self.config.world_size == 1 {
-            // Single-rank fast path
-            let snap_id = Uuid::new_v4();
-            let snap_dir = format!("snapshots/{}", snap_id);
-
-            let manifest = self.manifest.lock().unwrap();
-            let force_full = manifest.should_force_full(step);
-            let base_snap = if force_full {
-                None
-            } else {
-                manifest.last_full_snapshot().cloned()
-            };
-            drop(manifest);
-
-            let rank_entry = self.save_rank_tensors(snap_id, &snap_dir, &base_snap, tensors)?;
-
-            let snapshot = Snapshot {
-                id: snap_id,
-                step,
-                created_at: Utc::now(),
-                ranks: {
-                    let mut m = HashMap::new();
-                    m.insert(self.config.rank, rank_entry);
-                    m
-                },
-                base_snapshot_id: base_snap.as_ref().map(|s| s.id),
-                metadata,
-                compression: self.config.compression.clone(),
-                finalized: true,
-            };
-
-            let mut manifest = self.manifest.lock().unwrap();
-            manifest.snapshots.push(snapshot);
-            self.persist_manifest(&manifest)?;
-            self.apply_retention(&mut manifest)?;
-            drop(manifest);
-
-            // Notify merger
-            if let Some(ref merger) = self.merger {
-                merger.notify();
-            }
-
-            // Notify remote syncer
-            if let Some(ref syncer) = self.syncer {
-                syncer.notify_save();
-            }
-
-            Ok(snap_id)
-        } else {
-            // Multi-rank: save this rank's tensors into a pre-created snapshot.
-            // The caller is responsible for coordination.
-            Err(RevolverError::Config(
+        if self.core.config.world_size != 1 {
+            return Err(RevolverError::Config(
                 "Multi-rank save requires explicit create_snapshot/save_rank/finalize flow. \
                  Use save_rank() instead."
                     .into(),
-            ))
+            ));
+        }
+
+        let snap_id = Uuid::new_v4();
+        if let Some(ref saver) = self.saver {
+            saver.submit(SaveJob {
+                snap_id,
+                step,
+                tensors,
+                metadata,
+            })?;
+        } else {
+            self.core.save_sync(snap_id, step, tensors, metadata)?;
+        }
+        Ok(snap_id)
+    }
+
+    /// Block until any in-flight background save completes and surface
+    /// its error, if any.
+    pub fn flush(&self) -> Result<()> {
+        match self.saver {
+            Some(ref s) => s.flush(),
+            None => Ok(()),
+        }
+    }
+
+    fn wait_idle(&self) {
+        if let Some(ref s) = self.saver {
+            s.wait_idle();
         }
     }
 
     /// Create a new snapshot entry (rank 0 only in multi-rank).
     /// Returns the snapshot ID that all ranks should use.
     pub fn create_snapshot(&self, step: u64, metadata: HashMap<String, String>) -> Result<Uuid> {
+        self.flush()?;
+        self.core.create_snapshot(step, metadata)
+    }
+
+    /// Save this rank's tensors into an existing snapshot.
+    /// Called by each rank independently.
+    pub fn save_rank(&self, snap_id: Uuid, tensors: Vec<TensorData>) -> Result<()> {
+        self.flush()?;
+        self.core.save_rank(snap_id, tensors)
+    }
+
+    /// Finalize a snapshot (rank 0 only in multi-rank).
+    /// Marks it as complete and triggers retention/merging.
+    pub fn finalize_snapshot(&self, snap_id: Uuid) -> Result<()> {
+        self.flush()?;
+        self.core.finalize_snapshot(snap_id)
+    }
+
+    /// Load a snapshot for this rank. Returns tensor name → raw bytes.
+    pub fn load(&self, snap_id: Uuid) -> Result<HashMap<String, Vec<u8>>> {
+        self.flush()?;
+        self.core.load(snap_id)
+    }
+
+    /// Load the latest finalized snapshot.
+    pub fn load_latest(&self) -> Result<(Uuid, HashMap<String, Vec<u8>>)> {
+        self.flush()?;
+        self.core.load_latest()
+    }
+
+    /// List all snapshots.
+    pub fn list_snapshots(&self) -> Vec<SnapshotInfo> {
+        self.wait_idle();
+        self.core.list_snapshots()
+    }
+
+    /// Force merge all pending deltas into a full checkpoint.
+    pub fn merge_now(&self) {
+        self.wait_idle();
+        self.core.merge_now();
+    }
+
+    /// Force sync all local data to remote storage immediately.
+    pub fn sync_now(&self) {
+        self.wait_idle();
+        self.core.sync_now();
+    }
+}
+
+impl Core {
+    /// Full single-rank save pipeline (runs on the caller thread or the
+    /// background save thread).
+    fn save_sync(
+        &self,
+        snap_id: Uuid,
+        step: u64,
+        tensors: Vec<TensorData>,
+        metadata: HashMap<String, String>,
+    ) -> Result<()> {
+        let snap_dir = format!("snapshots/{}", snap_id);
+
+        let manifest = self.manifest.lock().unwrap();
+        let force_full = manifest.should_force_full(step);
+        let base_snap = if force_full {
+            None
+        } else {
+            manifest.last_full_snapshot().cloned()
+        };
+        drop(manifest);
+
+        let rank_entry = self.save_rank_tensors(snap_id, &snap_dir, &base_snap, tensors)?;
+
+        let snapshot = Snapshot {
+            id: snap_id,
+            step,
+            created_at: Utc::now(),
+            ranks: {
+                let mut m = HashMap::new();
+                m.insert(self.config.rank, rank_entry);
+                m
+            },
+            base_snapshot_id: base_snap.as_ref().map(|s| s.id),
+            metadata,
+            compression: self.config.compression.clone(),
+            finalized: true,
+        };
+
+        let mut manifest = self.manifest.lock().unwrap();
+        manifest.snapshots.push(snapshot);
+        // apply_retention persists the manifest when done.
+        self.apply_retention(&mut manifest)?;
+        drop(manifest);
+
+        // Notify merger
+        if let Some(ref merger) = self.merger {
+            merger.notify();
+        }
+
+        // Notify remote syncer
+        if let Some(ref syncer) = self.syncer {
+            syncer.notify_save();
+        }
+
+        Ok(())
+    }
+
+    fn create_snapshot(&self, step: u64, metadata: HashMap<String, String>) -> Result<Uuid> {
         let snap_id = Uuid::new_v4();
 
         let manifest = self.manifest.lock().unwrap();
@@ -217,9 +330,7 @@ impl Coordinator {
         Ok(snap_id)
     }
 
-    /// Save this rank's tensors into an existing snapshot.
-    /// Called by each rank independently.
-    pub fn save_rank(&self, snap_id: Uuid, tensors: Vec<TensorData>) -> Result<()> {
+    fn save_rank(&self, snap_id: Uuid, tensors: Vec<TensorData>) -> Result<()> {
         // Re-read manifest from storage for multi-rank correctness
         // (another rank may have created the snapshot)
         self.reload_manifest()?;
@@ -251,9 +362,7 @@ impl Coordinator {
         Ok(())
     }
 
-    /// Finalize a snapshot (rank 0 only in multi-rank).
-    /// Marks it as complete and triggers retention/merging.
-    pub fn finalize_snapshot(&self, snap_id: Uuid) -> Result<()> {
+    fn finalize_snapshot(&self, snap_id: Uuid) -> Result<()> {
         // Re-read from storage to see all ranks' contributions
         self.reload_manifest()?;
 
@@ -272,7 +381,6 @@ impl Coordinator {
             return Err(RevolverError::NotFound(format!("Snapshot {snap_id}")));
         }
 
-        self.persist_manifest(&manifest)?;
         self.apply_retention(&mut manifest)?;
         drop(manifest);
 
@@ -287,8 +395,9 @@ impl Coordinator {
         Ok(())
     }
 
-    /// Load a snapshot for this rank. Returns tensor name → raw bytes.
-    pub fn load(&self, snap_id: Uuid) -> Result<HashMap<String, Vec<u8>>> {
+    fn load(&self, snap_id: Uuid) -> Result<HashMap<String, Vec<u8>>> {
+        use rayon::prelude::*;
+
         let manifest = self.manifest.lock().unwrap();
         let snap = manifest
             .find_snapshot(snap_id)
@@ -310,25 +419,84 @@ impl Coordinator {
             None
         };
 
-        let mut result = HashMap::new();
+        // Prefetch the base snapshot's entries + pack once, shared across
+        // all tensors (instead of re-reading per delta/skipped tensor).
+        type BaseCtx = (
+            Uuid,
+            HashMap<String, TensorEntry>,
+            CompressionAlgo,
+            Option<Arc<Vec<u8>>>,
+        );
+        let needs_base = rank_entry
+            .tensors
+            .iter()
+            .any(|t| t.storage != TensorStorage::Full);
+        let base_ctx: Option<BaseCtx> = match (needs_base, snap.base_snapshot_id) {
+            (true, Some(base_id)) => {
+                let manifest = self.manifest.lock().unwrap();
+                let base_snap = manifest.find_snapshot(base_id).cloned();
+                drop(manifest);
+                match base_snap {
+                    Some(bs) => match bs.ranks.get(&self.config.rank) {
+                        Some(re) => {
+                            let pack = re
+                                .pack_file
+                                .as_ref()
+                                .map(|p| self.storage.get(p))
+                                .transpose()?
+                                .map(Arc::new);
+                            let entries = re
+                                .tensors
+                                .iter()
+                                .map(|t| (t.name.clone(), t.clone()))
+                                .collect();
+                            Some((base_id, entries, bs.compression.clone(), pack))
+                        }
+                        None => None,
+                    },
+                    None => None,
+                }
+            }
+            _ => None,
+        };
 
-        for entry in &rank_entry.tensors {
-            let data = tensor::load_tensor(
-                entry,
-                snap.base_snapshot_id,
-                self.storage.as_ref(),
-                &snap.compression,
-                pack_data.as_deref(),
-                &|base_id, tensor_name| self.find_base_tensor_entry_with_pack(base_id, tensor_name),
-            )?;
-            result.insert(entry.name.clone(), data);
-        }
+        let resolver = |base_id: Uuid,
+                        tensor_name: &str|
+         -> Result<(TensorEntry, CompressionAlgo, Option<Arc<Vec<u8>>>)> {
+            if let Some((cached_id, entries, comp, pack)) = &base_ctx {
+                if *cached_id == base_id {
+                    let entry = entries.get(tensor_name).cloned().ok_or_else(|| {
+                        RevolverError::NotFound(format!(
+                            "Tensor '{}' not in base snapshot {base_id}",
+                            tensor_name
+                        ))
+                    })?;
+                    return Ok((entry, comp.clone(), pack.clone()));
+                }
+            }
+            self.find_base_tensor_entry_with_pack(base_id, tensor_name)
+        };
 
-        Ok(result)
+        let pairs: Result<Vec<(String, Vec<u8>)>> = rank_entry
+            .tensors
+            .par_iter()
+            .map(|entry| {
+                tensor::load_tensor(
+                    entry,
+                    snap.base_snapshot_id,
+                    self.storage.as_ref(),
+                    &snap.compression,
+                    pack_data.as_deref(),
+                    &resolver,
+                )
+                .map(|data| (entry.name.clone(), data))
+            })
+            .collect();
+
+        Ok(pairs?.into_iter().collect())
     }
 
-    /// Load the latest finalized snapshot.
-    pub fn load_latest(&self) -> Result<(Uuid, HashMap<String, Vec<u8>>)> {
+    fn load_latest(&self) -> Result<(Uuid, HashMap<String, Vec<u8>>)> {
         let manifest = self.manifest.lock().unwrap();
         let snap = manifest
             .snapshots
@@ -344,8 +512,7 @@ impl Coordinator {
         Ok((id, data))
     }
 
-    /// List all snapshots.
-    pub fn list_snapshots(&self) -> Vec<SnapshotInfo> {
+    fn list_snapshots(&self) -> Vec<SnapshotInfo> {
         let manifest = self.manifest.lock().unwrap();
         manifest
             .snapshots
@@ -380,15 +547,13 @@ impl Coordinator {
             .collect()
     }
 
-    /// Force merge all pending deltas into a full checkpoint.
-    pub fn merge_now(&self) {
+    fn merge_now(&self) {
         if let Some(ref merger) = self.merger {
             merger.force_full_merge();
         }
     }
 
-    /// Force sync all local data to remote storage immediately.
-    pub fn sync_now(&self) {
+    fn sync_now(&self) {
         if let Some(ref syncer) = self.syncer {
             syncer.sync_now();
         }
@@ -403,10 +568,10 @@ impl Coordinator {
         base_snap: &Option<Snapshot>,
         tensors: Vec<TensorData>,
     ) -> Result<RankEntry> {
-        // ── 1. Build base cache (single disk read) ──────────────────
-        let base_cache = self.build_base_cache(base_snap)?;
+        // ── 1. Build lazy base cache (no upfront disk read) ──────────
+        let base_cache = self.build_base_cache(base_snap);
 
-        // ── 2. Process tensors in parallel (no disk I/O) ────────────
+        // ── 2. Process tensors in parallel ───────────────────────────
         let mut processed = tensor::process_tensors_parallel(
             &tensors,
             base_cache.as_ref(),
@@ -414,42 +579,30 @@ impl Coordinator {
             self.config.delta_threshold,
             &self.config.save_dtype,
         )?;
+        drop(tensors); // raw tensor data no longer needed
 
-        // ── 3. Pack all write data into single buffer ───────────────
-        let mut pack_buf: Vec<u8> = Vec::new();
+        // ── 3. Assign pack offsets and write all parts in one file ──
+        let mut offset = 0u64;
         for pt in &mut processed {
             if let Some(ref data) = pt.write_data {
-                pt.entry.offset = pack_buf.len() as u64;
-                pack_buf.extend_from_slice(data);
+                pt.entry.offset = offset;
+                offset += data.len() as u64;
             }
         }
 
-        // ── 4. Single disk write ────────────────────────────────────
-        let pack_file = if !pack_buf.is_empty() {
-            // Hash the entire pack for integrity
-            let pack_hash = hash_hex(&pack_buf);
+        let pack_file = if offset > 0 {
+            let parts: Vec<&[u8]> = processed
+                .iter()
+                .filter_map(|pt| pt.write_data.as_deref())
+                .collect();
             let pack_filename = format!("{}/rank_{}.pack", snap_dir, self.config.rank);
-            self.storage.put(&pack_filename, &pack_buf)?;
-
-            // Set compressed hash per tensor (from their slice in the pack)
-            for pt in &mut processed {
-                if pt.write_data.is_some() {
-                    let start = pt.entry.offset as usize;
-                    let end = start + pt.entry.compressed_size as usize;
-                    pt.entry.sha256_compressed = Some(hash_hex(&pack_buf[start..end]));
-                }
-            }
-
-            drop(pack_buf); // Free the buffer
-
-            // Store the overall pack hash in metadata (optional, for verification)
-            let _ = pack_hash;
+            self.storage.put_parts(&pack_filename, &parts)?;
             Some(pack_filename)
         } else {
             None
         };
 
-        // ── 5. Build rank entry ─────────────────────────────────────
+        // ── 4. Build rank entry ─────────────────────────────────────
         let mut entries = Vec::new();
         let mut total_compressed = 0u64;
         let mut total_raw = 0u64;
@@ -480,18 +633,11 @@ impl Coordinator {
         })
     }
 
-    /// Build a BaseCache from the base snapshot.
-    /// Reads the pack file (or legacy individual files) in a single pass.
-    fn build_base_cache(&self, base_snap: &Option<Snapshot>) -> Result<Option<BaseCache>> {
-        let base = match base_snap {
-            Some(s) => s,
-            None => return Ok(None),
-        };
-
-        let rank_entry = match base.ranks.get(&self.config.rank) {
-            Some(re) => re,
-            None => return Ok(None),
-        };
+    /// Build a lazy BaseCache referring to the base snapshot.
+    /// Tensor data is read on demand during processing.
+    fn build_base_cache(&self, base_snap: &Option<Snapshot>) -> Option<BaseCache> {
+        let base = base_snap.as_ref()?;
+        let rank_entry = base.ranks.get(&self.config.rank)?;
 
         let entries: HashMap<String, TensorEntry> = rank_entry
             .tensors
@@ -499,45 +645,22 @@ impl Coordinator {
             .map(|t| (t.name.clone(), t.clone()))
             .collect();
 
-        // Try pack file first (single read)
-        if let Some(ref pack_file) = rank_entry.pack_file {
-            let pack_data = self.storage.get(pack_file)?;
-            return Ok(Some(BaseCache {
-                pack_data,
-                entries,
-                compression: base.compression.clone(),
-                legacy_files: HashMap::new(),
-            }));
-        }
-
-        // Legacy mode: pre-load all individual tensor files
-        let mut legacy_files = HashMap::new();
-        for entry in &rank_entry.tensors {
-            if entry.storage == TensorStorage::Full {
-                if let Some(ref filename) = entry.filename {
-                    match self.storage.get(filename) {
-                        Ok(data) => { legacy_files.insert(filename.clone(), data); }
-                        Err(_) => {} // Skip missing files
-                    }
-                }
-            }
-        }
-
-        Ok(Some(BaseCache {
-            pack_data: Vec::new(),
+        Some(BaseCache {
+            storage: Arc::clone(&self.storage),
+            pack_file: rank_entry.pack_file.clone(),
             entries,
             compression: base.compression.clone(),
-            legacy_files,
-        }))
+        })
     }
 
-    /// Find base tensor entry + pack data for loading.
+    /// Find base tensor entry + pack data for loading (fallback path for
+    /// base snapshots not covered by the per-load prefetch).
     /// Returns (TensorEntry, CompressionAlgo, Option<pack_data>).
     fn find_base_tensor_entry_with_pack(
         &self,
         base_id: Uuid,
         tensor_name: &str,
-    ) -> Result<(TensorEntry, CompressionAlgo, Option<Vec<u8>>)> {
+    ) -> Result<(TensorEntry, CompressionAlgo, Option<Arc<Vec<u8>>>)> {
         let manifest = self.manifest.lock().unwrap();
         let base_snap = manifest
             .find_snapshot(base_id)
@@ -563,16 +686,14 @@ impl Coordinator {
             .clone();
 
         let compression = base_snap.compression.clone();
+        let pack_file = rank_entry.pack_file.clone();
+        drop(manifest);
 
-        // Load pack file if present
-        let pack_data = if let Some(ref pack_file) = rank_entry.pack_file {
-            // TODO: cache this across calls (currently re-reads per tensor)
-            Some(self.storage.get(pack_file)?)
-        } else {
-            None
+        let pack_data = match pack_file {
+            Some(ref pack) => Some(Arc::new(self.storage.get(pack)?)),
+            None => None,
         };
 
-        drop(manifest);
         Ok((entry, compression, pack_data))
     }
 
@@ -703,6 +824,122 @@ impl Coordinator {
     }
 }
 
+// ── Background save worker ───────────────────────────────────────────
+
+struct SaveJob {
+    snap_id: Uuid,
+    step: u64,
+    tensors: Vec<TensorData>,
+    metadata: HashMap<String, String>,
+}
+
+struct SaverShared {
+    busy: bool,
+    error: Option<String>,
+}
+
+/// Dedicated thread that runs the save pipeline. At most one save is
+/// in flight (bound-1 queue): submitting waits for the previous job.
+struct AsyncSaver {
+    tx: Option<mpsc::Sender<SaveJob>>,
+    shared: Arc<(Mutex<SaverShared>, Condvar)>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl AsyncSaver {
+    fn new(core: Arc<Core>) -> Self {
+        let (tx, rx) = mpsc::channel::<SaveJob>();
+        let shared = Arc::new((
+            Mutex::new(SaverShared {
+                busy: false,
+                error: None,
+            }),
+            Condvar::new(),
+        ));
+        let shared2 = Arc::clone(&shared);
+
+        let handle = thread::Builder::new()
+            .name("revolver-async-saver".into())
+            .spawn(move || {
+                for job in rx {
+                    let result = core.save_sync(job.snap_id, job.step, job.tensors, job.metadata);
+                    let mut state = shared2.0.lock().unwrap();
+                    state.busy = false;
+                    if let Err(e) = result {
+                        state.error = Some(e.to_string());
+                    }
+                    drop(state);
+                    shared2.1.notify_all();
+                }
+            })
+            .expect("Failed to spawn revolver-async-saver thread");
+
+        AsyncSaver {
+            tx: Some(tx),
+            shared,
+            handle: Some(handle),
+        }
+    }
+
+    /// Wait until no save is in flight. Does not consume errors.
+    fn wait_idle(&self) {
+        let (lock, cvar) = &*self.shared;
+        let mut state = lock.lock().unwrap();
+        while state.busy {
+            state = cvar.wait(state).unwrap();
+        }
+    }
+
+    /// Wait until idle and surface any pending background error (once).
+    fn flush(&self) -> Result<()> {
+        let (lock, cvar) = &*self.shared;
+        let mut state = lock.lock().unwrap();
+        while state.busy {
+            state = cvar.wait(state).unwrap();
+        }
+        match state.error.take() {
+            Some(e) => Err(RevolverError::Storage(format!(
+                "Background save failed: {e}"
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    /// Submit a job, waiting for the previous one to drain first.
+    fn submit(&self, job: SaveJob) -> Result<()> {
+        self.flush()?;
+        {
+            let mut state = self.shared.0.lock().unwrap();
+            state.busy = true;
+        }
+        let tx = self
+            .tx
+            .as_ref()
+            .ok_or_else(|| RevolverError::Storage("Background saver is shut down".into()))?;
+        if tx.send(job).is_err() {
+            self.shared.0.lock().unwrap().busy = false;
+            return Err(RevolverError::Storage(
+                "Background saver channel closed".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn shutdown(&mut self) {
+        self.wait_idle();
+        self.tx.take(); // close channel → worker exits
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for AsyncSaver {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
 /// Public snapshot info returned by list_snapshots.
 #[derive(Debug, Clone)]
 pub struct SnapshotInfo {
@@ -759,6 +996,22 @@ mod tests {
         let snap_id = coord.save(100, sample_tensors(42), HashMap::new()).unwrap();
         let loaded = coord.load(snap_id).unwrap();
         assert_eq!(loaded["w"], vec![42u8; 8192]);
+    }
+
+    #[test]
+    fn sync_save_mode_roundtrips() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(dir.path()).unwrap());
+        let config = CoordinatorConfig {
+            compression: CompressionAlgo::Zstd { level: 1 },
+            async_save: false,
+            ..Default::default()
+        };
+        let coord = Coordinator::new(storage, config).unwrap();
+
+        let snap_id = coord.save(100, sample_tensors(7), HashMap::new()).unwrap();
+        let loaded = coord.load(snap_id).unwrap();
+        assert_eq!(loaded["w"], vec![7u8; 8192]);
     }
 
     #[test]
@@ -979,9 +1232,10 @@ mod tests {
         ];
 
         coord.save(1, tensors, HashMap::new()).unwrap();
+        coord.flush().unwrap(); // drain the background save
 
         // Check that a .pack file exists (not individual .bin files)
-        let manifest = coord.manifest.lock().unwrap();
+        let manifest = coord.core.manifest.lock().unwrap();
         let snap = &manifest.snapshots[0];
         let re = snap.ranks.get(&0).unwrap();
         assert!(re.pack_file.is_some(), "Expected pack_file to be set");

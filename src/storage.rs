@@ -13,8 +13,29 @@ pub trait StorageBackend: Send + Sync {
     /// Write bytes to the given relative path.
     fn put(&self, rel_path: &str, data: &[u8]) -> Result<()>;
 
+    /// Write the concatenation of `parts` to the given relative path.
+    /// Equivalent to `put(rel_path, parts.concat())` but lets backends
+    /// avoid materializing the concatenated buffer.
+    fn put_parts(&self, rel_path: &str, parts: &[&[u8]]) -> Result<()> {
+        let total: usize = parts.iter().map(|p| p.len()).sum();
+        let mut buf = Vec::with_capacity(total);
+        for p in parts {
+            buf.extend_from_slice(p);
+        }
+        self.put(rel_path, &buf)
+    }
+
     /// Read bytes from the given relative path.
     fn get(&self, rel_path: &str) -> Result<Vec<u8>>;
+
+    /// Read up to `len` bytes starting at `offset`.
+    /// May return fewer bytes if the object ends earlier.
+    fn get_range(&self, rel_path: &str, offset: u64, len: usize) -> Result<Vec<u8>> {
+        let data = self.get(rel_path)?;
+        let start = (offset as usize).min(data.len());
+        let end = start.saturating_add(len).min(data.len());
+        Ok(data[start..end].to_vec())
+    }
 
     /// Check if a path exists.
     fn exists(&self, rel_path: &str) -> Result<bool>;
@@ -79,22 +100,35 @@ impl LocalStorage {
 
 impl StorageBackend for LocalStorage {
     fn put(&self, rel_path: &str, data: &[u8]) -> Result<()> {
+        self.put_parts(rel_path, &[data])
+    }
+
+    fn put_parts(&self, rel_path: &str, parts: &[&[u8]]) -> Result<()> {
+        use std::io::Write;
+
         let path = self.full_path(rel_path);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
 
-        // Pad to page boundary for SSD longevity
-        let write_data = if self.page_size > 0 {
-            pad_to_page(data, self.page_size)
-        } else {
-            data.to_vec()
-        };
-
-        // Atomic write: temp file → rename
+        // Atomic write: temp file → rename. Parts are streamed directly
+        // to the file — no concatenated or padded copy of the data.
         let dir = path.parent().unwrap_or(Path::new("."));
-        let tmp = tempfile::NamedTempFile::new_in(dir)?;
-        std::fs::write(tmp.path(), &write_data)?;
+        let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+        {
+            let file = tmp.as_file_mut();
+            let mut total = 0usize;
+            for part in parts {
+                file.write_all(part)?;
+                total += part.len();
+            }
+            // Pad to page boundary for SSD longevity
+            if self.page_size > 0 && total % self.page_size != 0 {
+                let pad = self.page_size - total % self.page_size;
+                file.write_all(&vec![0u8; pad])?;
+            }
+            file.flush()?;
+        }
         tmp.persist(&path).map_err(|e| {
             RevolverError::Storage(format!("Failed to persist {}: {}", path.display(), e))
         })?;
@@ -107,6 +141,23 @@ impl StorageBackend for LocalStorage {
             return Err(RevolverError::NotFound(rel_path.to_string()));
         }
         Ok(std::fs::read(&path)?)
+    }
+
+    fn get_range(&self, rel_path: &str, offset: u64, len: usize) -> Result<Vec<u8>> {
+        use std::io::{Read, Seek, SeekFrom};
+
+        let path = self.full_path(rel_path);
+        let mut file = match std::fs::File::open(&path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(RevolverError::NotFound(rel_path.to_string()));
+            }
+            Err(e) => return Err(e.into()),
+        };
+        file.seek(SeekFrom::Start(offset))?;
+        let mut buf = Vec::with_capacity(len);
+        file.take(len as u64).read_to_end(&mut buf)?;
+        Ok(buf)
     }
 
     fn exists(&self, rel_path: &str) -> Result<bool> {
@@ -206,6 +257,33 @@ mod tests {
 
         let on_disk = std::fs::read(dir.path().join("test.bin")).unwrap();
         assert_eq!(on_disk.len(), 100); // No padding
+    }
+
+    #[test]
+    fn put_parts_concatenates() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalStorage::new(dir.path()).unwrap();
+
+        store
+            .put_parts("multi.bin", &[b"hello ", b"world", b"!"])
+            .unwrap();
+        let read = store.get("multi.bin").unwrap();
+        assert_eq!(&read[..12], b"hello world!");
+        assert_eq!(read.len(), 4096); // padded
+    }
+
+    #[test]
+    fn get_range_reads_slice() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalStorage::new_unaligned(dir.path()).unwrap();
+
+        let data: Vec<u8> = (0..=255).collect();
+        store.put("range.bin", &data).unwrap();
+
+        assert_eq!(store.get_range("range.bin", 10, 5).unwrap(), &data[10..15]);
+        // Past EOF → truncated, not an error
+        assert_eq!(store.get_range("range.bin", 250, 100).unwrap(), &data[250..]);
+        assert!(store.get_range("missing.bin", 0, 10).is_err());
     }
 
     #[test]

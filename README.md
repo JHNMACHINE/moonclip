@@ -30,20 +30,31 @@ Inspired by [DECK (Meta, PVLDB 2025)](https://doi.org/10.14778/3750601.3750621).
 
 ## Benchmarks
 
-Measured on MiniGPT 3.2M, CPU, bf16 checkpoints:
+MiniGPT 41.7M params, fp32 model + full AdamW optimizer state (~540 MB per
+checkpoint), 10 saves, CPU (`examples/benchmark_checkpoints.py`):
 
-| | Revolver (delta) | `torch.save` |
+| | Revolver | safetensors* |
 |---|---|---|
-| Save time | **0.4–0.5s** | ~50s (Python serialization) |
-| Storage per checkpoint | **26–51% smaller** | full state dict |
-| Cumulative storage (10 checkpoints) | **42.6% saved** vs naive |
-| Skipped tensors per save | 5–13 | 0 (saves everything) |
+| Avg save (training loop blocked) | **35 ms** | 316 ms |
+| Total for 10 saves | **0.35 s** | 3.2 s |
+| Load | 0.44 s | 0.03 s |
 
-Resume integrity verified: max diff 0.003906 (bf16 quantization noise, not data loss).
+\* safetensors saves the model only — no optimizer state, ~3× less data per checkpoint.
+
+Saves are asynchronous by default: `save()` returns as soon as the tensor
+data has been copied, while hashing, delta detection, zstd compression and
+the disk write run on a background thread and overlap with training. Call
+`flush()` when you need the checkpoint durably on disk; loads and
+`list_snapshots()` wait for pending saves automatically. Pass
+`async_save=False` for fully synchronous saves.
+
+Resume integrity verified: max weight diff 0.0 after save → load.
 
 ## Features
 
-- **Per-tensor delta tracking** — unchanged tensors are skipped entirely (zero I/O), changed tensors use XOR delta compression
+- **Async background saves** — `save()` returns in milliseconds; compression and I/O overlap with training (disable with `async_save=False`)
+- **Per-tensor delta tracking** — unchanged tensors are skipped entirely (zero I/O), changed tensors use XOR delta compression; a cheap sampled density check bails out early when everything changed
+- **Parallel zstd** — large tensors are compressed/decompressed as concatenated zstd frames across all cores
 - **Rust-native dtype casting** — `save_dtype="bf16"` casts fp32→bf16 in parallel Rust threads before compression, auto-uncasts on load
 - **4KB page-aligned writes** — eliminates SSD write amplification, extends drive lifespan
 - **Rank-aware distributed saves** — each rank saves its own shard independently, auto-detects `torchrun` env vars

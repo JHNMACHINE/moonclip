@@ -34,6 +34,7 @@ class RevolverManager:
         sync_every_n_saves: int = 100,
         save_dtype: str = "none",
         max_total_snapshots: Optional[int] = None,
+        async_save: bool = True,
     ) -> None:
         """
         Initialize the RevolverManager.
@@ -63,6 +64,11 @@ class RevolverManager:
             save_dtype: Target dtype for saving float tensors ("none", "bf16", "fp16").
                 If set, float tensors are cast in Rust before compression, and
                 auto-uncast back to original dtype on load.
+            async_save: Run single-rank saves on a background thread.
+                save_tensors() returns as soon as the tensor data has been
+                copied; hashing, compression and the disk write overlap with
+                training. Errors surface on the next save/load/flush call.
+                Loads and listing always wait for pending saves first.
         """
         ...
 
@@ -126,7 +132,14 @@ class RevolverManager:
         """
         ...
 
-    def load(self, snap_id: str) -> Dict[str, bytes]:
+    def flush(self) -> None:
+        """
+        Block until any in-flight background save completes.
+        Raises if the background save failed.
+        """
+        ...
+
+    def load(self, snap_id: str) -> Dict[str, bytearray]:
         """
         Load a snapshot.
 
@@ -134,16 +147,16 @@ class RevolverManager:
             snap_id: Snapshot UUID string.
 
         Returns:
-            Dict mapping tensor_name -> raw bytes.
+            Dict mapping tensor_name -> raw bytes (as bytearray).
         """
         ...
 
-    def load_latest(self) -> Tuple[str, Dict[str, bytes]]:
+    def load_latest(self) -> Tuple[str, Dict[str, bytearray]]:
         """
         Load the latest finalized snapshot.
 
         Returns:
-            Tuple of (snapshot_id_str, dict of tensor_name -> raw bytes).
+            Tuple of (snapshot_id_str, dict of tensor_name -> raw bytes as bytearray).
         """
         ...
 

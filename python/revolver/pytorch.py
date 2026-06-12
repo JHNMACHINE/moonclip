@@ -37,33 +37,58 @@ def _tensor_to_bytes(t: "torch.Tensor") -> bytes:
             return t.view(torch.uint8).numpy().tobytes()
 
 
+# Dtypes the Rust extension can ingest directly from a tensor's data_ptr.
+_DIRECT_DTYPES = {
+    torch.float32,
+    torch.float64,
+    torch.float16,
+    torch.bfloat16,
+    torch.int8,
+    torch.uint8,
+    torch.int16,
+    torch.int32,
+    torch.int64,
+    torch.bool,
+}
+if hasattr(torch, "uint16"):
+    _DIRECT_DTYPES.add(torch.uint16)
+
+
+_DTYPE_MAP = {
+    "float32": torch.float32,
+    "float16": torch.float16,
+    "bfloat16": torch.bfloat16,
+    "float64": torch.float64,
+    "int32": torch.int32,
+    "int64": torch.int64,
+    "int16": torch.int16,
+    "int8": torch.int8,
+    "uint8": torch.uint8,
+    "bool": torch.bool,
+}
+if hasattr(torch, "uint16"):
+    _DTYPE_MAP["uint16"] = torch.uint16
+
+
+def _tensor_from_raw(shape, dtype_str: str, raw) -> "torch.Tensor":
+    """Rebuild a tensor from raw bytes + shape + dtype string."""
+    dtype = _DTYPE_MAP.get(dtype_str, torch.float32)
+    if len(raw) == 0:
+        return torch.empty(shape, dtype=dtype)
+    buf = raw if isinstance(raw, bytearray) else bytearray(raw)
+    return torch.frombuffer(buf, dtype=dtype).reshape(shape).clone()
+
+
 def _reconstruct_from_tensors(meta: Any, tensors_in: dict) -> Any:
     """
     Recursively walks meta (the template structure).
     Replaces any tensor placeholder dicts with the reconstructed PyTorch tensor.
     """
-    DTYPE_MAP = {
-        "float32": torch.float32,
-        "float16": torch.float16,
-        "bfloat16": torch.bfloat16,
-        "float64": torch.float64,
-        "int32": torch.int32,
-        "int64": torch.int64,
-        "int16": torch.int16,
-        "int8": torch.int8,
-        "uint8": torch.uint8,
-        "bool": torch.bool,
-    }
-
     if isinstance(meta, dict) and "__tensor__" in meta:
-        prefix = meta["__tensor__"]
-        shape = meta["shape"]
-        dtype_str = meta["dtype"]
-        if prefix not in tensors_in:
+        key = meta["__tensor__"]
+        if key not in tensors_in:
             return None
-        raw = tensors_in[prefix]
-        dtype = DTYPE_MAP.get(dtype_str, torch.float32)
-        return torch.frombuffer(bytearray(raw), dtype=dtype).reshape(shape).clone()
+        return _tensor_from_raw(meta["shape"], meta["dtype"], tensors_in[key])
     elif isinstance(meta, dict):
         return {k: _reconstruct_from_tensors(v, tensors_in) for k, v in meta.items()}
     elif isinstance(meta, list):
@@ -72,6 +97,111 @@ def _reconstruct_from_tensors(meta: Any, tensors_in: dict) -> Any:
         return tuple(_reconstruct_from_tensors(v, tensors_in) for v in meta)
     else:
         return meta
+
+
+def _flatten_state(value: Any, key_prefix: str, counter: list, out_tensors: dict) -> Any:
+    """
+    Recursively replace tensors in a state-dict structure with placeholder
+    dicts, adding each tensor to `out_tensors` under a unique key.
+
+    The returned template mirrors the original structure; on load,
+    _reconstruct_from_tensors rebuilds it. Tensors are handed to the Rust
+    extension individually, so hashing/compression/delta tracking run in
+    parallel per tensor and nothing large goes through pickle.
+    """
+    if torch.is_tensor(value) and value.dtype in _DIRECT_DTYPES:
+        t = value.detach().cpu().contiguous()
+        key = f"{key_prefix}/t{counter[0]}"
+        counter[0] += 1
+        out_tensors[key] = t
+        return {
+            "__tensor__": key,
+            "shape": list(t.shape),
+            "dtype": str(t.dtype).replace("torch.", ""),
+        }
+    if isinstance(value, dict):
+        return {
+            k: _flatten_state(v, key_prefix, counter, out_tensors)
+            for k, v in value.items()
+        }
+    if isinstance(value, list):
+        return [_flatten_state(v, key_prefix, counter, out_tensors) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_flatten_state(v, key_prefix, counter, out_tensors) for v in value)
+    return value
+
+
+def _flatten_and_extract_tensors(val: Any, prefix: str, tensors_out: dict) -> Any:
+    """
+    Recursively walks val (which can be dict, list, tuple, tensor, etc.).
+    Extracts all Tensors into tensors_out as (shape, dtype, bytes) tuples,
+    keyed by their path under `prefix`.
+    Returns a copy of val where Tensors are replaced by placeholder dicts.
+    """
+    if torch.is_tensor(val):
+        t = val.detach().cpu().contiguous()
+        shape = list(t.shape)
+        dtype = str(t.dtype).replace("torch.", "")
+        tensors_out[prefix] = (shape, dtype, _tensor_to_bytes(t))
+        return {
+            "__tensor__": prefix,
+            "shape": shape,
+            "dtype": dtype,
+        }
+    elif isinstance(val, dict):
+        return {
+            k: _flatten_and_extract_tensors(v, f"{prefix}/{k}", tensors_out)
+            for k, v in val.items()
+        }
+    elif isinstance(val, list):
+        return [
+            _flatten_and_extract_tensors(v, f"{prefix}/{idx}", tensors_out)
+            for idx, v in enumerate(val)
+        ]
+    elif isinstance(val, tuple):
+        return tuple(
+            _flatten_and_extract_tensors(v, f"{prefix}/{idx}", tensors_out)
+            for idx, v in enumerate(val)
+        )
+    else:
+        return val
+
+
+def flatten_state_dict(
+    state_dict: dict,
+    prefix: str = "",
+) -> Tuple[dict, Any]:
+    """
+    Flatten a PyTorch state_dict into individual tensor bytes.
+
+    Extracts all tensors and returns them in the format expected by
+    RevolverManager.save_tensors() and CheckpointManager.save_raw().
+
+    Useful for the background executor pattern: serialize tensors in the
+    main thread, then submit the dict to a background thread for saving.
+
+    Args:
+        state_dict: A PyTorch state_dict (from model or optimizer).
+        prefix: Key prefix for tensor names (e.g. "model", "optimizer").
+
+    Returns:
+        Tuple of (tensors_dict, metadata_structure) where:
+        - tensors_dict: {name: (shape, dtype, bytes)}, including a
+          "<prefix>._metadata" entry (pickled template) so checkpoints
+          saved via save_raw can be applied back to objects on load
+        - metadata_structure: the state_dict with tensors replaced by
+          placeholder dicts that _reconstruct_from_tensors understands
+
+    Example:
+        tensors, meta = flatten_state_dict(model.state_dict(), "model")
+        # tensors = {"model/weight": ([512, 512], "float32", b"..."), ...}
+        # Submit to background:
+        executor.submit(mgr.save_raw, step=1000, tensors=tensors)
+    """
+    tensors_out: dict = {}
+    metadata = _flatten_and_extract_tensors(state_dict, prefix, tensors_out)
+    tensors_out[f"{prefix}._metadata"] = ([], "uint8", pickle.dumps(metadata))
+    return tensors_out, metadata
 
 
 class CheckpointManager:
@@ -96,6 +226,7 @@ class CheckpointManager:
         merge_max_chain: int = 10,
         save_dtype: str = "none",
         max_total_snapshots: Optional[int] = None,
+        async_save: bool = True,
         **kwargs,
     ):
         from revolver import RevolverManager
@@ -126,6 +257,7 @@ class CheckpointManager:
             merge_max_chain=merge_max_chain,
             save_dtype=save_dtype,
             max_total_snapshots=max_total_snapshots,
+            async_save=async_save,
             **kwargs,
         )
 
@@ -151,38 +283,50 @@ class CheckpointManager:
         """
         all_tensors = {}
 
-        # Modello: passiamo i tensori direttamente a Rust
+        # Modello: tensori passati direttamente a Rust (zero pickle), con un
+        # piccolo template "model._metadata" che conserva shape/dtype per la
+        # ricostruzione al load.
         if model is not None:
+            template = {}
             for name, param in model.state_dict().items():
-                t = param.detach().cpu().contiguous()
-                # Il nome sarà "model/layer.weight", coerentemente con il vecchio formato
-                all_tensors[f"model/{name}"] = t
+                if torch.is_tensor(param) and param.dtype in _DIRECT_DTYPES:
+                    t = param.detach().cpu().contiguous()
+                    key = f"model/{name}"
+                    all_tensors[key] = t
+                    template[name] = {
+                        "__tensor__": key,
+                        "shape": list(t.shape),
+                        "dtype": str(t.dtype).replace("torch.", ""),
+                    }
+                else:
+                    # Non-tensor or exotic dtype: keep it in the template
+                    template[name] = param
+            all_tensors["model._metadata"] = ([], "uint8", pickle.dumps(template))
 
-        def _add_blob(prefix: str, obj: Any):
-            """Single compressed blob — for optimizer/scheduler/aux state.
+        def _add_state(prefix: str, obj: Any):
+            """Per-tensor serialization for optimizer/scheduler/aux state.
 
-            Optimizer buffers (exp_avg, exp_avg_sq) change completely every
-            step, so per-tensor XOR deltas are useless. A single blob avoids
-            hundreds of Python→Rust round-trips and metadata overhead.
+            Each tensor (exp_avg, exp_avg_sq, ...) goes to Rust directly:
+            hashing and compression run in parallel per tensor and nothing
+            large is pickled. Only the non-tensor skeleton is pickled into
+            "<prefix>._metadata". Checkpoints saved by older versions as a
+            single "<prefix>._blob" are still loadable.
             """
             sd = obj.state_dict() if hasattr(obj, "state_dict") else obj
-            blob = pickle.dumps(sd)
-            all_tensors[f"{prefix}._blob"] = ([], "uint8", blob)
+            counter = [0]
+            template = _flatten_state(sd, prefix, counter, all_tensors)
+            all_tensors[f"{prefix}._metadata"] = ([], "uint8", pickle.dumps(template))
 
         if optimizer is not None:
-            _add_blob("optimizer", optimizer)
+            _add_state("optimizer", optimizer)
         if scheduler is not None:
-            _add_blob("scheduler", scheduler)
+            _add_state("scheduler", scheduler)
         if scaler is not None:
-            _add_blob("scaler", scaler)
+            _add_state("scaler", scaler)
         # extra items (se sono tensori) possono essere passati direttamente
         if extra:
             for name, obj in extra.items():
-                if torch.is_tensor(obj):
-                    all_tensors[f"extra/{name}"] = obj.detach().cpu().contiguous()
-                else:
-                    # altrimenti lo trattiamo come blob
-                    _add_blob(f"extra/{name}", obj)
+                _add_state(f"extra/{name}", obj)
 
         if self.world_size > 1:
             import torch.distributed as dist
@@ -355,6 +499,16 @@ class CheckpointManager:
     def sync_now(self):
         """Force sync all local data to remote storage."""
         self._mgr.sync_now()
+
+    def flush(self):
+        """Block until any in-flight background save completes.
+
+        Saves run on a background thread by default (async_save=True), so
+        save() returns as soon as the tensor data has been copied. Call
+        flush() when you need the checkpoint durably on disk (e.g. right
+        before exiting). Loads and list_snapshots() flush automatically.
+        """
+        self._mgr.flush()
 
     def save_raw(
         self,
