@@ -37,75 +37,6 @@ def _tensor_to_bytes(t: "torch.Tensor") -> bytes:
             return t.view(torch.uint8).numpy().tobytes()
 
 
-def _flatten_and_extract_tensors(val: Any, prefix: str, tensors_out: dict) -> Any:
-    """
-    Recursively walks val (which can be dict, list, tuple, tensor, etc.).
-    Extracts all Tensors into tensors_out (keyed by prefix).
-    Returns a copy of val where Tensors are replaced by placeholder dicts.
-    """
-    if torch.is_tensor(val):
-        t = val.detach().cpu().contiguous()
-        shape = list(t.shape)
-        dtype = str(t.dtype).replace("torch.", "")
-        raw_bytes = _tensor_to_bytes(t)
-        tensors_out[prefix] = (shape, dtype, raw_bytes)
-        return {
-            "__tensor__": prefix,
-            "shape": shape,
-            "dtype": dtype,
-        }
-    elif isinstance(val, dict):
-        return {
-            k: _flatten_and_extract_tensors(v, f"{prefix}/{k}", tensors_out)
-            for k, v in val.items()
-        }
-    elif isinstance(val, list):
-        return [
-            _flatten_and_extract_tensors(v, f"{prefix}/{idx}", tensors_out)
-            for idx, v in enumerate(val)
-        ]
-    elif isinstance(val, tuple):
-        return tuple(
-            _flatten_and_extract_tensors(v, f"{prefix}/{idx}", tensors_out)
-            for idx, v in enumerate(val)
-        )
-    else:
-        return val
-
-
-def flatten_state_dict(
-    state_dict: dict,
-    prefix: str = "",
-) -> Tuple[dict, Any]:
-    """
-    Flatten a PyTorch state_dict into individual tensor bytes.
-
-    Extracts all tensors and returns them in the format expected by
-    RevolverManager.save_tensors() and CheckpointManager.save_raw().
-
-    Useful for the background executor pattern: serialize tensors in the
-    main thread, then submit the dict to a background thread for saving.
-
-    Args:
-        state_dict: A PyTorch state_dict (from model or optimizer).
-        prefix: Key prefix for tensor names (e.g. "model", "optimizer").
-
-    Returns:
-        Tuple of (tensors_dict, metadata_structure) where:
-        - tensors_dict: {name: (shape, dtype, bytes)}
-        - metadata_structure: the state_dict with tensors replaced by placeholders
-
-    Example:
-        tensors, meta = flatten_state_dict(model.state_dict(), "model")
-        # tensors = {"model/weight": ([512, 512], "float32", b"..."), ...}
-        # Submit to background:
-        executor.submit(mgr.save_raw, step=1000, tensors=tensors)
-    """
-    tensors_out: dict = {}
-    metadata = _flatten_and_extract_tensors(state_dict, prefix, tensors_out)
-    return tensors_out, metadata
-
-
 def _reconstruct_from_tensors(meta: Any, tensors_in: dict) -> Any:
     """
     Recursively walks meta (the template structure).
@@ -218,12 +149,12 @@ class CheckpointManager:
         """
         all_tensors = {}
 
-        def _add_tracked(prefix: str, obj: Any):
-            """Per-tensor delta tracking — for model weights."""
-            sd = obj.state_dict() if hasattr(obj, "state_dict") else obj
-            meta = _flatten_and_extract_tensors(sd, prefix, all_tensors)
-            meta_bytes = pickle.dumps(meta)
-            all_tensors[f"{prefix}._metadata"] = ([], "uint8", meta_bytes)
+        # Modello: passiamo i tensori direttamente a Rust
+        if model is not None:
+            for name, param in model.state_dict().items():
+                t = param.detach().cpu().contiguous()
+                # Il nome sarà "model/layer.weight", coerentemente con il vecchio formato
+                all_tensors[f"model/{name}"] = t
 
         def _add_blob(prefix: str, obj: Any):
             """Single compressed blob — for optimizer/scheduler/aux state.
@@ -236,17 +167,20 @@ class CheckpointManager:
             blob = pickle.dumps(sd)
             all_tensors[f"{prefix}._blob"] = ([], "uint8", blob)
 
-        if model is not None:
-            _add_tracked("model", model)
         if optimizer is not None:
             _add_blob("optimizer", optimizer)
         if scheduler is not None:
             _add_blob("scheduler", scheduler)
         if scaler is not None:
             _add_blob("scaler", scaler)
+        # extra items (se sono tensori) possono essere passati direttamente
         if extra:
             for name, obj in extra.items():
-                _add_tracked(name, obj)
+                if torch.is_tensor(obj):
+                    all_tensors[f"extra/{name}"] = obj.detach().cpu().contiguous()
+                else:
+                    # altrimenti lo trattiamo come blob
+                    _add_blob(f"extra/{name}", obj)
 
         if self.world_size > 1:
             import torch.distributed as dist

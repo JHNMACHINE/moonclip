@@ -25,20 +25,72 @@ fn extract_metadata(metadata: Option<Bound<'_, PyDict>>) -> PyResult<HashMap<Str
     }
 }
 
+fn get_element_size(dtype: &str) -> PyResult<usize> {
+    match dtype {
+        "torch.float32" | "torch.int32" => Ok(4),
+        "torch.float64" | "torch.int64" => Ok(8),
+        "torch.float16" | "torch.bfloat16" => Ok(2),
+        "torch.int8" | "torch.uint8" => Ok(1),
+        "torch.bool" => Ok(1),
+        _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "unsupported dtype {}",
+            dtype
+        ))),
+    }
+}
+
 fn extract_tensors(tensors: &Bound<'_, PyDict>) -> PyResult<Vec<TensorData>> {
     let mut result = Vec::new();
     for (key, value) in tensors.iter() {
         let name: String = key.extract()?;
-        let tuple = value.downcast::<PyTuple>()?;
-        let shape: Vec<usize> = tuple.get_item(0)?.extract()?;
-        let dtype: String = tuple.get_item(1)?.extract()?;
-        let data: Vec<u8> = tuple.get_item(2)?.extract()?;
-        result.push(TensorData {
-            name,
-            shape,
-            dtype,
-            data,
-        });
+        // Vecchio formato: tupla (shape, dtype, bytes)
+        if let Ok(tuple) = value.downcast::<PyTuple>() {
+            let shape: Vec<usize> = tuple.get_item(0)?.extract()?;
+            let dtype: String = tuple.get_item(1)?.extract()?;
+            let data: Vec<u8> = tuple.get_item(2)?.extract()?;
+            result.push(TensorData {
+                name,
+                shape,
+                dtype,
+                data,
+            });
+        }
+        // Nuovo formato: tensore PyTorch direttamente
+        else if let Ok(tensor) = value.downcast::<PyAny>() {
+            if tensor.hasattr("data_ptr")? {
+                let shape: Vec<usize> = tensor.getattr("shape")?.extract()?;
+                let dtype_full = tensor.getattr("dtype")?.str()?.to_string();
+                // Togliamo il prefisso "torch." per uniformità
+                let dtype = dtype_full
+                    .strip_prefix("torch.")
+                    .unwrap_or(&dtype_full)
+                    .to_string();
+                let numel: usize = tensor.call_method0("numel")?.extract()?;
+                let data_ptr: usize = tensor.call_method0("data_ptr")?.extract()?;
+                let element_size = get_element_size(&format!("torch.{}", dtype))?; // ri-aggiungiamo per la funzione
+                let nbytes = numel * element_size;
+                let data_slice: &[u8] =
+                    unsafe { std::slice::from_raw_parts(data_ptr as *const u8, nbytes) };
+                // Copia efficiente in Vec<u8>
+                let data = data_slice.to_vec();
+                result.push(TensorData {
+                    name,
+                    shape,
+                    dtype,
+                    data,
+                });
+            } else {
+                return Err(pyo3::exceptions::PyTypeError::new_err(format!(
+                    "Value for '{}' is not a supported type (must be tuple or torch.Tensor)",
+                    name
+                )));
+            }
+        } else {
+            return Err(pyo3::exceptions::PyTypeError::new_err(format!(
+                "Invalid value for key '{}'",
+                name
+            )));
+        }
     }
     Ok(result)
 }
@@ -101,7 +153,9 @@ impl RevolverManager {
         let compression = if compression_level == 0 {
             CompressionAlgo::None
         } else {
-            CompressionAlgo::Zstd { level: compression_level }
+            CompressionAlgo::Zstd {
+                level: compression_level,
+            }
         };
 
         let mut config = CoordinatorConfig {
@@ -119,7 +173,10 @@ impl RevolverManager {
             },
             delta_threshold,
             merger: if merge_stride > 0 {
-                Some(MergerConfig { stride: merge_stride, max_chain_depth: merge_max_chain })
+                Some(MergerConfig {
+                    stride: merge_stride,
+                    max_chain_depth: merge_max_chain,
+                })
             } else {
                 None
             },
@@ -130,14 +187,18 @@ impl RevolverManager {
 
         let storage: Arc<dyn crate::storage::StorageBackend> = if let Some(bucket) = s3_bucket {
             let ak = s3_access_key.ok_or_else(|| {
-                pyo3::exceptions::PyValueError::new_err("s3_access_key required when s3_bucket is set")
+                pyo3::exceptions::PyValueError::new_err(
+                    "s3_access_key required when s3_bucket is set",
+                )
             })?;
             let sk = s3_secret_key.ok_or_else(|| {
-                pyo3::exceptions::PyValueError::new_err("s3_secret_key required when s3_bucket is set")
+                pyo3::exceptions::PyValueError::new_err(
+                    "s3_secret_key required when s3_bucket is set",
+                )
             })?;
 
-            let remote: Arc<dyn crate::storage::StorageBackend> =
-                Arc::new(S3Storage::new(S3Config {
+            let remote: Arc<dyn crate::storage::StorageBackend> = Arc::new(S3Storage::new(
+                S3Config {
                     bucket: bucket.into(),
                     prefix: s3_prefix.into(),
                     region: s3_region.into(),
@@ -146,7 +207,9 @@ impl RevolverManager {
                     secret_key: sk.into(),
                     path_style: s3_path_style,
                     timeout_secs: 30,
-                }.with_auto_path_style())?);
+                }
+                .with_auto_path_style(),
+            )?);
 
             let local: Arc<dyn crate::storage::StorageBackend> =
                 Arc::new(LocalStorage::new(storage_root)?);
@@ -183,11 +246,7 @@ impl RevolverManager {
 
     /// Create a new snapshot (multi-rank: rank 0 only).
     #[pyo3(signature = (step, metadata = None))]
-    fn create_snapshot(
-        &self,
-        step: u64,
-        metadata: Option<Bound<'_, PyDict>>,
-    ) -> PyResult<String> {
+    fn create_snapshot(&self, step: u64, metadata: Option<Bound<'_, PyDict>>) -> PyResult<String> {
         let meta = extract_metadata(metadata)?;
         let id = self.inner.create_snapshot(step, meta)?;
         Ok(id.to_string())
@@ -224,7 +283,10 @@ impl RevolverManager {
     }
 
     /// Load the latest snapshot.
-    fn load_latest<'py>(&self, py: Python<'py>) -> PyResult<(Bound<'py, PyString>, Bound<'py, PyDict>)> {
+    fn load_latest<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<(Bound<'py, PyString>, Bound<'py, PyDict>)> {
         // Release GIL for Rust decompression + delta reconstruction
         let (id, tensors) = py.allow_threads(|| self.inner.load_latest())?;
         let dict = PyDict::new(py);
@@ -274,6 +336,6 @@ impl RevolverManager {
 #[pymodule]
 fn revolver(m: &Bound<'_, pyo3::types::PyModule>) -> PyResult<()> {
     m.add_class::<RevolverManager>()?;
-    m.add("__version__", "1.1.0")?;
+    m.add("__version__", "1.1.3")?;
     Ok(())
 }
