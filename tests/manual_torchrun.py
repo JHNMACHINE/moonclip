@@ -2,10 +2,10 @@
 Test: Multi-rank checkpoint save/load via torchrun.
 
 Usage:
-    torchrun --nproc_per_node=2 examples/torchrun_test.py
+    torchrun --nproc_per_node=2 tests/manual_torchrun.py
 
 On Windows (if torchrun has libuv issues):
-    python examples/torchrun_test.py --spawn
+    python tests/manual_torchrun.py --spawn
 
 Verifies:
 1. CheckpointManager auto-detects RANK and WORLD_SIZE

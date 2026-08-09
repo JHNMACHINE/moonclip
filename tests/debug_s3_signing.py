@@ -5,7 +5,7 @@ This does EXACTLY what src/s3.rs does, step by step, so we can see
 where the signature diverges from what MinIO expects.
 
 Usage:
-    python debug_s3_signing.py --endpoint http://192.168.1.50:9000 \
+    python tests/debug_s3_signing.py --endpoint http://192.168.1.50:9000 \
         --bucket moonclip-test --access-key minioadmin --secret-key minioadmin
 """
 

@@ -208,6 +208,10 @@ def train(
 
     t_start = time.perf_counter()
 
+    # Bound before the loop: the final checkpoint and the summary below both
+    # read avg_loss, and with n_epochs == 0 the loop body never assigns it.
+    avg_loss = 0.0
+
     for epoch in range(n_epochs):
         epoch_loss = 0.0
         epoch_steps = 0
@@ -269,7 +273,9 @@ def train(
                     f"{elapsed:.1f}s"
                 )
 
-        avg_loss = epoch_loss / epoch_steps
+        # Guarded like the in-loop average above: an epoch that produced no
+        # steps would otherwise divide by zero.
+        avg_loss = epoch_loss / max(epoch_steps, 1)
         print(f"  → Epoch {epoch+1} done | avg loss: {avg_loss:.4f}")
 
     # Final checkpoint

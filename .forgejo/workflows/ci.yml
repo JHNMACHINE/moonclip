@@ -59,6 +59,12 @@ jobs:
         run: |
           . "$HOME/.cargo/env"
           python --version
+          # maturin develop refuses to install into a bare interpreter — it
+          # needs VIRTUAL_ENV or CONDA_PREFIX even inside a container. The
+          # stdlib venv module seeds pip on its own, so this stays pip-only.
+          python -m venv /opt/venv
+          export VIRTUAL_ENV=/opt/venv
+          export PATH="/opt/venv/bin:$PATH"
           pip install --quiet maturin pytest
           maturin develop
           pytest tests/ -v

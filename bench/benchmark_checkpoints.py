@@ -23,13 +23,14 @@ from __future__ import annotations
 import argparse
 import gc
 import glob
+import io
 import math
 import os
 import shutil
 import sys
 import time
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -135,7 +136,10 @@ class MiniGPT(nn.Module):
         return self.head(self.ln_f(x))
 
 
-MODEL_CONFIGS = {
+# Annotated as Any-valued: these dicts are unpacked into MiniGPT(**cfg), and
+# without it the inferred dict[str, int] makes the bool parameter tie_weights
+# look like it is being handed an int.
+MODEL_CONFIGS: Dict[str, Dict[str, Any]] = {
     "small": dict(vocab_size=256, d_model=256, n_heads=4, n_layers=4, max_seq_len=128),
     "medium": dict(
         vocab_size=32000, d_model=512, n_heads=8, n_layers=8, max_seq_len=256
@@ -208,7 +212,7 @@ def fresh_dir(path: str) -> str:
     return path
 
 
-def fake_training_step(model: nn.Module, optimizer: torch.optim.Optimizer, device: str):
+def fake_training_step(model: MiniGPT, optimizer: torch.optim.Optimizer, device: str):
     seq_len = min(model.max_seq_len, 32)
     vocab = model.token_emb.num_embeddings
     x = torch.randint(0, vocab, (4, seq_len), device=device)
@@ -696,7 +700,9 @@ ALL_METHODS = {
 def main():
     # The report uses box-drawing characters; Windows consoles may default
     # to a legacy codepage (cp1252) that can't encode them.
-    if hasattr(sys.stdout, "reconfigure"):
+    # isinstance rather than hasattr: reconfigure() lives on TextIOWrapper,
+    # not on the TextIO protocol, and hasattr does not narrow the type.
+    if isinstance(sys.stdout, io.TextIOWrapper):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
     parser = argparse.ArgumentParser(

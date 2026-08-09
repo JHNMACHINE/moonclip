@@ -1,5 +1,8 @@
 /target
-/bench*
+# Generated benchmark checkpoints (~4 GB), not the benchmark sources. The
+# rule used to be /bench*, which also swallowed benches/ and bench/ — source
+# directories that belong in the repo.
+/bench_baseline/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

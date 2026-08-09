@@ -33,7 +33,7 @@ Inspired by [DECK (Meta, PVLDB 2025)](https://doi.org/10.14778/3750601.3750621).
 ## Benchmarks
 
 MiniGPT 41.7M params, fp32 model + full AdamW optimizer state (~540 MB per
-checkpoint), 10 saves, CPU (`examples/benchmark_checkpoints.py`):
+checkpoint), 10 saves, CPU (`bench/benchmark_checkpoints.py`):
 
 | | Moonclip | safetensors* |
 |---|---|---|
@@ -62,7 +62,7 @@ Resume integrity verified: max weight diff 0.0 after save → load.
 - **Rank-aware distributed saves** — each rank saves its own shard independently, auto-detects `torchrun` env vars
 - **Hierarchical delta merging** — background thread consolidates deltas to keep load times fast
 - **S3 backend** — local SSD as primary (fast), batched sync to S3/MinIO/R2 in background
-- **SHA-256 integrity checks** — every tensor verified on read, corruption detected immediately
+- **xxHash3-128 integrity checks** — every tensor verified on read, corruption detected immediately
 - **Auto-resume** — `mgr.resume()` loads the latest checkpoint if it exists, returns the next step
 
 ## Installation
@@ -134,7 +134,7 @@ src/
 ├── s3.rs            # S3-compatible storage (AWS SigV4)
 ├── storage.rs       # StorageBackend trait + LocalStorage (4KB aligned)
 ├── background.rs    # Background thread infrastructure
-├── hash.rs          # SHA-256 integrity
+├── hash.rs          # xxHash3-128 integrity
 ├── python.rs        # PyO3 bindings
 └── error.rs         # Error types
 ```
