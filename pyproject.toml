@@ -3,8 +3,8 @@ requires = ["maturin>=1.5,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "revolver"
-version = "1.1.0"
+name = "moonclip"
+version = "1.0.0"
 description = "High-performance ML checkpoint management — per-tensor delta tracking, Rust-native compression, rank-aware distributed saves"
 requires-python = ">=3.9"
 license = {text = "Apache-2.0"}
@@ -14,7 +14,7 @@ authors = [
 readme = "README.md"
 keywords = ["checkpointing", "machine-learning", "deep-learning", "pytorch", "distributed", "delta-compression", "fsdp"]
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
     "License :: OSI Approved :: Apache Software License",
@@ -32,18 +32,17 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://codeberg.org/JHNMACHINE/revolver"
-Repository = "https://codeberg.org/JHNMACHINE/revolver"
-Issues = "https://codeberg.org/JHNMACHINE/revolver/issues"
+Homepage = "https://codeberg.org/JHNMACHINE/moonclip"
+Repository = "https://codeberg.org/JHNMACHINE/moonclip"
+Issues = "https://codeberg.org/JHNMACHINE/moonclip/issues"
 
 [project.optional-dependencies]
 torch = ["torch>=2.0"]
 
 [tool.maturin]
-features = ["pyo3/extension-module"]
+features = ["extension-module"]
 python-source = "python"
-module-name = "revolver.revolver"
-environment = {PYO3_USE_ABI3_FORWARD_COMPATIBILITY = "1"}
+module-name = "moonclip.moonclip"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

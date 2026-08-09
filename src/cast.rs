@@ -1,6 +1,6 @@
 use rayon::prelude::*;
 
-use crate::error::{Result, RevolverError};
+use crate::error::{Result, MoonclipError};
 
 /// Supported storage dtypes for casting.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,7 +60,7 @@ pub fn is_castable_float(dtype: &str) -> bool {
 /// With round-to-nearest-even for better accuracy.
 pub fn fp32_to_bf16(data: &[u8]) -> Result<Vec<u8>> {
     if data.len() % 4 != 0 {
-        return Err(RevolverError::Config(format!(
+        return Err(MoonclipError::Config(format!(
             "fp32 data length {} is not a multiple of 4",
             data.len()
         )));
@@ -109,7 +109,7 @@ pub fn fp32_to_bf16(data: &[u8]) -> Result<Vec<u8>> {
 /// bf16 → fp32 is just padding the lower 16 bits with zeros.
 pub fn bf16_to_fp32(data: &[u8]) -> Result<Vec<u8>> {
     if data.len() % 2 != 0 {
-        return Err(RevolverError::Config(format!(
+        return Err(MoonclipError::Config(format!(
             "bf16 data length {} is not a multiple of 2",
             data.len()
         )));
@@ -147,7 +147,7 @@ pub fn bf16_to_fp32(data: &[u8]) -> Result<Vec<u8>> {
 /// IEEE 754 half-precision: sign(1) + exponent(5) + mantissa(10)
 pub fn fp32_to_fp16(data: &[u8]) -> Result<Vec<u8>> {
     if data.len() % 4 != 0 {
-        return Err(RevolverError::Config(format!(
+        return Err(MoonclipError::Config(format!(
             "fp32 data length {} is not a multiple of 4",
             data.len()
         )));
@@ -186,7 +186,7 @@ pub fn fp32_to_fp16(data: &[u8]) -> Result<Vec<u8>> {
 /// Cast fp16 bytes back to fp32 bytes (parallel).
 pub fn fp16_to_fp32(data: &[u8]) -> Result<Vec<u8>> {
     if data.len() % 2 != 0 {
-        return Err(RevolverError::Config(format!(
+        return Err(MoonclipError::Config(format!(
             "fp16 data length {} is not a multiple of 2",
             data.len()
         )));
@@ -391,11 +391,14 @@ mod tests {
 
     #[test]
     fn bf16_negative() {
-        let fp32: Vec<u8> = (-3.14f32).to_le_bytes().to_vec();
+        // Any float with a fractional part that bf16 cannot hold exactly will
+        // do. Not 3.14: clippy reads it as a botched `f32::consts::PI` and
+        // `approx_constant` is deny-by-default, so it fails the build.
+        let fp32: Vec<u8> = (-3.6f32).to_le_bytes().to_vec();
         let bf16 = fp32_to_bf16(&fp32).unwrap();
         let back = bf16_to_fp32(&bf16).unwrap();
         let val = f32::from_le_bytes([back[0], back[1], back[2], back[3]]);
-        assert!((val - (-3.14)).abs() < 0.05);
+        assert!((val - (-3.6)).abs() < 0.05);
         assert!(val < 0.0);
     }
 
@@ -449,10 +452,11 @@ mod tests {
 
     #[test]
     fn uncast_tensor_roundtrip() {
-        let data = 3.14f32.to_le_bytes().to_vec();
+        // See bf16_negative on the choice of constant.
+        let data = 3.6f32.to_le_bytes().to_vec();
         let (casted, stored_dtype) = cast_tensor(&data, "float32", &DType::BFloat16).unwrap();
         let uncasted = uncast_tensor(&casted, &stored_dtype, "float32").unwrap();
         let val = f32::from_le_bytes([uncasted[0], uncasted[1], uncasted[2], uncasted[3]]);
-        assert!((val - 3.14).abs() < 0.05);
+        assert!((val - 3.6).abs() < 0.05);
     }
 }

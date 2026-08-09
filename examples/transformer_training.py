@@ -1,5 +1,5 @@
 """
-Real transformer training with Revolver checkpointing.
+Real transformer training with Moonclip checkpointing.
 
 Trains a small GPT-style causal language model on synthetic text data,
 demonstrating checkpoint save/resume with per-tensor delta tracking.
@@ -13,7 +13,7 @@ Usage:
     python transformer_training.py --fresh-start          # Ignore existing ckpts, start over
 
 Requirements:
-    pip install torch revolver
+    pip install torch moonclip
 """
 
 import argparse
@@ -27,7 +27,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
-from revolver import CheckpointManager
+from moonclip import CheckpointManager
 
 
 # ─── Model ───────────────────────────────────────────────────────────
@@ -155,7 +155,7 @@ class SyntheticTextDataset(Dataset):
 # ─── Training ────────────────────────────────────────────────────────
 
 def train(
-    ckpt_dir: str = "./revolver_training_ckpts",
+    ckpt_dir: str = "./moonclip_training_ckpts",
     fresh_start: bool = False,
     n_epochs: int = 5,
     batch_size: int = 32,
@@ -182,7 +182,7 @@ def train(
         compression_level=3,
         max_full_snapshots=3,
         full_every_steps=200,
-        delta_threshold=0.5,
+        delta_max_ratio=0.95,
         save_dtype=save_dtype,
     )
 
@@ -316,7 +316,7 @@ def train(
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train MiniGPT with Revolver checkpointing")
+    parser = argparse.ArgumentParser(description="Train MiniGPT with Moonclip checkpointing")
     parser.add_argument("--fresh-start", action="store_true",
                         help="Ignore existing checkpoints and start from scratch")
     parser.add_argument("--epochs", type=int, default=5)
@@ -325,7 +325,7 @@ if __name__ == "__main__":
     parser.add_argument("--save-every", type=int, default=50)
     parser.add_argument("--save-dtype", type=str, default="fp32", choices=["fp32", "bf16"],
                         help="Dtype for checkpoint storage. Training is always fp32.")
-    parser.add_argument("--ckpt-dir", type=str, default="./revolver_training_ckpts")
+    parser.add_argument("--ckpt-dir", type=str, default="./moonclip_training_ckpts")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
 

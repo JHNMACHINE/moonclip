@@ -7,6 +7,7 @@ pub mod error;
 pub mod hash;
 pub mod manifest;
 pub mod merger;
+#[cfg(feature = "python")]
 pub mod python;
 pub mod remote_sync;
 pub mod s3;

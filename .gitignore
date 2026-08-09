@@ -75,4 +75,5 @@ docs/_build/
 .python-version
 
 # Training artifacts
-revolver_*_ckpts/
+moonclip_*_ckpts/
+.claude

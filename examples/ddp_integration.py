@@ -1,5 +1,5 @@
 """
-Example: Revolver with PyTorch Distributed Data Parallel (DDP).
+Example: Moonclip with PyTorch Distributed Data Parallel (DDP).
 
 Spawns 2 processes, trains a toy model, saves and loads checkpoints.
 
@@ -18,7 +18,7 @@ import torch.multiprocessing as mp
 import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from revolver import CheckpointManager
+from moonclip import CheckpointManager
 
 
 class ToyModel(nn.Module):

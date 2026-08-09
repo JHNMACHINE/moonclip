@@ -1,8 +1,8 @@
 """
-revolver.pytorch — PyTorch-aware checkpoint manager.
+moonclip.pytorch — PyTorch-aware checkpoint manager.
 
 Usage:
-    from revolver import CheckpointManager
+    from moonclip import CheckpointManager
 
     mgr = CheckpointManager("./checkpoints")
     mgr.save(step=1000, model=model, optimizer=optimizer, metadata={"loss": "0.634"})
@@ -17,7 +17,7 @@ from typing import Any, Dict, Optional, Tuple
 
 import torch
 
-from revolver._env import _detect_distributed_env
+from moonclip._env import _detect_distributed_env
 
 
 def _tensor_to_bytes(t: "torch.Tensor") -> bytes:
@@ -175,7 +175,7 @@ def flatten_state_dict(
     Flatten a PyTorch state_dict into individual tensor bytes.
 
     Extracts all tensors and returns them in the format expected by
-    RevolverManager.save_tensors() and CheckpointManager.save_raw().
+    MoonclipManager.save_tensors() and CheckpointManager.save_raw().
 
     Useful for the background executor pattern: serialize tensors in the
     main thread, then submit the dict to a background thread for saving.
@@ -206,7 +206,7 @@ def flatten_state_dict(
 
 class CheckpointManager:
     """
-    PyTorch-aware wrapper around RevolverManager.
+    PyTorch-aware wrapper around MoonclipManager.
 
     Handles per-tensor serialization: each tensor from the state_dict
     is stored individually, enabling per-tensor delta tracking (DECK-style).
@@ -219,7 +219,7 @@ class CheckpointManager:
         max_full_snapshots: int = 5,
         max_deltas_per_full: int = 10,
         full_every_steps: int = 5000,
-        delta_threshold: float = 0.5,
+        delta_max_ratio: float = 0.95,
         world_size: Optional[int] = None,
         rank: Optional[int] = None,
         merge_stride: int = 0,
@@ -229,7 +229,17 @@ class CheckpointManager:
         async_save: bool = True,
         **kwargs,
     ):
-        from revolver import RevolverManager
+        from moonclip import MoonclipManager
+
+        if "delta_threshold" in kwargs:
+            raise TypeError(
+                "delta_threshold was removed in favour of delta_max_ratio, which "
+                "has different semantics: it caps the size of a compressed delta "
+                "relative to the compressed full tensor, instead of thresholding "
+                "the fraction of differing bytes. The old criterion rejected "
+                "essentially every delta on dense training. Drop the argument to "
+                "take the default (0.95), or set delta_max_ratio explicitly."
+            )
 
         # Auto-detect from torchrun / torch.distributed environment
         if world_size is None or rank is None:
@@ -244,13 +254,13 @@ class CheckpointManager:
         self.save_dtype = save_dtype
         self._best_metric: Optional[float] = None
 
-        self._mgr = RevolverManager(
+        self._mgr = MoonclipManager(
             storage_root=storage_root,
             compression_level=compression_level,
             max_full_snapshots=max_full_snapshots,
             max_deltas_per_full=max_deltas_per_full,
             full_every_steps=full_every_steps,
-            delta_threshold=delta_threshold,
+            delta_max_ratio=delta_max_ratio,
             world_size=world_size,
             rank=rank,
             merge_stride=merge_stride,
@@ -590,7 +600,7 @@ class CheckpointManager:
         """Print a human-readable summary of checkpoint statistics."""
         s = self.stats()
         if s["total_snapshots"] == 0:
-            print("[Revolver] No checkpoints yet")
+            print("[Moonclip] No checkpoints yet")
             return
 
         def _fmt(b):
@@ -603,7 +613,7 @@ class CheckpointManager:
             return f"{b} B"
 
         print(f"\n{'─' * 60}")
-        print("  Revolver Checkpoint Stats")
+        print("  Moonclip Checkpoint Stats")
         print(f"{'─' * 60}")
         print(
             f"  Snapshots:  {s['total_snapshots']}  ({s['full_snapshots']} full, {s['delta_snapshots']} delta)"
@@ -681,7 +691,7 @@ class CheckpointManager:
             scaler=scaler,
             metadata=meta,
         )
-        print(f"[Revolver] New best {metric_name}={metric:.6f} at step {step}")
+        print(f"[Moonclip] New best {metric_name}={metric:.6f} at step {step}")
         return snap_id
 
     def save_final(
@@ -715,7 +725,7 @@ class CheckpointManager:
         )
         self.merge_now()
         self.sync_now()
-        print(f"[Revolver] Final checkpoint saved at step {step}")
+        print(f"[Moonclip] Final checkpoint saved at step {step}")
         return snap_id
 
     def save_to_pt(
@@ -730,7 +740,7 @@ class CheckpointManager:
         Export the current state as a standard PyTorch .pt file.
 
         Creates a file compatible with torch.load(). Useful for
-        sharing models without requiring Revolver.
+        sharing models without requiring Moonclip.
 
         Args:
             path: Output file path (e.g. "model.pt").
@@ -753,7 +763,7 @@ class CheckpointManager:
 
         torch.save(state, path)
         size_mb = os.path.getsize(path) / (1024 * 1024)
-        print(f"[Revolver] Exported to {path} ({size_mb:.1f} MB)")
+        print(f"[Moonclip] Exported to {path} ({size_mb:.1f} MB)")
         return path
 
     def save_to_safetensors(
@@ -796,6 +806,6 @@ class CheckpointManager:
         save_file(tensors, path, metadata=metadata)
         size_mb = os.path.getsize(path) / (1024 * 1024)
         print(
-            f"[Revolver] Exported to {path} ({size_mb:.1f} MB, {len(tensors)} tensors)"
+            f"[Moonclip] Exported to {path} ({size_mb:.1f} MB, {len(tensors)} tensors)"
         )
         return path

@@ -2,7 +2,7 @@ from typing import Dict, List, Optional, Tuple, Any
 
 __version__: str
 
-class RevolverManager:
+class MoonclipManager:
     """
     High-performance checkpoint manager for ML training.
 
@@ -17,7 +17,7 @@ class RevolverManager:
         max_full_snapshots: int = 5,
         max_deltas_per_full: int = 10,
         full_every_steps: int = 5000,
-        delta_threshold: float = 0.5,
+        delta_max_ratio: float = 0.95,
         world_size: int = 1,
         rank: int = 0,
         merge_stride: int = 0,
@@ -37,7 +37,7 @@ class RevolverManager:
         async_save: bool = True,
     ) -> None:
         """
-        Initialize the RevolverManager.
+        Initialize the MoonclipManager.
 
         Args:
             storage_root: Local directory to store snapshots.
@@ -45,7 +45,9 @@ class RevolverManager:
             max_full_snapshots: Max number of full snapshots to retain.
             max_deltas_per_full: Max delta snapshots to allow between full saves.
             full_every_steps: Force a full snapshot every N steps.
-            delta_threshold: If changed bytes fraction exceeds this, save as full snapshot.
+            delta_max_ratio: Store a tensor as a XOR delta only when the compressed
+                delta is smaller than this fraction of the compressed full tensor.
+                Above it, save the tensor in full.
             world_size: Total number of ranks in multi-rank training.
             rank: Rank of this manager instance.
             merge_stride: Stride for delta merging (0 = disable).

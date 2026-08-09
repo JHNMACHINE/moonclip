@@ -1,17 +1,40 @@
-use crate::error::{Result, RevolverError};
+use crate::compression;
+use crate::error::{Result, MoonclipError};
+use crate::manifest::CompressionAlgo;
 use rayon::prelude::*;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Size threshold: tensors smaller than this won't be delta-encoded
 /// (the overhead isn't worth it).
 const DELTA_MIN_SIZE: usize = 4096;
 
+/// Window compared when deciding whether a delta is worth storing.
+const DECISION_SAMPLE: usize = 64 * 1024;
+
+/// Below this many bytes a sample is too short to judge reliably.
+const DECISION_MIN: usize = 8 * 1024;
+
 /// Parallel chunk size for XOR / density scans.
 const SCAN_CHUNK: usize = 1 << 20;
 
-/// XOR two equal-length buffers into a new buffer (parallel, vectorizable).
+/// XOR two equal-length buffers into a new buffer (parallel, vectorized).
+///
+/// Panics if the lengths differ. Both callers check first; without the assert
+/// the zip below would silently stop at the shorter buffer and leave the tail
+/// of the result as zeros, which reads as a valid delta and would corrupt the
+/// restored tensor rather than fail.
 fn xor_bytes(base: &[u8], target: &[u8]) -> Vec<u8> {
-    let mut out = vec![0u8; base.len()];
+    let n = base.len();
+    assert_eq!(n, target.len(), "xor_bytes requires equal lengths");
+
+    // `vec![0u8; n]` looks like a wasted pass — every byte is overwritten
+    // below — but it is not: this lowers to `alloc_zeroed`, and at these sizes
+    // the allocator serves the request with fresh kernel pages that are
+    // already zero and are faulted in lazily. No memset runs. Filling an
+    // uninitialised buffer instead was measured and made no difference on
+    // compute_delta and made apply_delta slightly worse, so the unsafe that
+    // would be needed to do it buys nothing.
+    let mut out = vec![0u8; n];
+
     out.par_chunks_mut(SCAN_CHUNK)
         .zip(base.par_chunks(SCAN_CHUNK).zip(target.par_chunks(SCAN_CHUNK)))
         .for_each(|(o, (b, t))| {
@@ -19,60 +42,72 @@ fn xor_bytes(base: &[u8], target: &[u8]) -> Vec<u8> {
                 o[i] = b[i] ^ t[i];
             }
         });
+
     out
 }
 
-/// Compute a XOR delta between `base` and `target`, but only if the
-/// fraction of differing bytes is below `threshold`.
+/// Whether two buffers are byte-identical.
 ///
-/// This fuses the old compute_delta + delta_density steps: the density
-/// scan runs first (no allocation) with an early exit as soon as the
-/// changed-byte budget is exceeded — the common case after optimizer
-/// steps, where nearly every byte changes. The delta buffer is only
-/// materialized when it will actually be used.
-///
-/// Returns `None` if sizes differ, the buffer is too small, the buffers
-/// are identical, or the density is at or above `threshold`.
-pub fn delta_if_sparse(base: &[u8], target: &[u8], threshold: f64) -> Option<Vec<u8>> {
-    if base.len() != target.len() || base.len() < DELTA_MIN_SIZE {
-        return None;
-    }
-
-    let limit = (base.len() as f64 * threshold) as usize;
-    let count = AtomicUsize::new(0);
-    let exceeded = base
-        .par_chunks(SCAN_CHUNK)
-        .zip(target.par_chunks(SCAN_CHUNK))
-        .try_for_each(|(b, t)| {
-            if count.load(Ordering::Relaxed) > limit {
-                return Err(());
-            }
-            let local: usize = b.iter().zip(t).map(|(x, y)| (x != y) as usize).sum();
-            if count.fetch_add(local, Ordering::Relaxed) + local > limit {
-                Err(())
-            } else {
-                Ok(())
-            }
-        })
-        .is_err();
-
-    if exceeded || count.load(Ordering::Relaxed) == 0 {
-        return None; // too dense, or identical (caller skips via hash)
-    }
-
-    Some(xor_bytes(base, target))
+/// `base == target` computes the same answer, but single-threaded. On an
+/// unchanged tensor — a frozen embedding table, a parameter group that took no
+/// gradient — that memcmp *is* the entire cost of deciding to skip the tensor,
+/// and the skip is supposed to be the cheap path. Splitting it over the pool
+/// keeps the short-circuit: `any` stops scheduling chunks as soon as one
+/// reports a difference, so the common changed case still bails out early.
+fn buffers_equal(base: &[u8], target: &[u8]) -> bool {
+    base.len() == target.len()
+        && !base
+            .par_chunks(SCAN_CHUNK)
+            .zip(target.par_chunks(SCAN_CHUNK))
+            .any(|(b, t)| b != t)
 }
 
-/// Fraction of differing bytes between two sample buffers.
-/// Used to cheaply estimate delta density from a decompressed prefix
-/// of the base tensor before committing to a full decompression.
-pub fn sample_density(a: &[u8], b: &[u8]) -> f64 {
-    let n = a.len().min(b.len());
-    if n == 0 {
-        return 1.0;
+/// Decide whether XOR-delta encoding is worth it, by comparing the
+/// *compressed* size of a delta sample against the compressed size of the
+/// same window stored in full. Returns true when the delta wins by at
+/// least the margin implied by `max_ratio`.
+///
+/// The fraction of differing bytes — the criterion used previously — is a
+/// poor predictor for float tensors. After a typical optimizer step
+/// roughly three bytes in four change, so any density threshold below
+/// ~0.75 rejects every delta; yet the XOR still zeroes the sign, exponent
+/// and high mantissa bits, leaving a buffer that compresses far better
+/// than the raw weights. Measured on fp32 weights with zstd-3, a delta
+/// beats a full save by 18% at density 0.70 and by 30% at density 0.53 —
+/// both of which the old 0.5 threshold discarded. Comparing compressed
+/// sizes measures the thing we actually care about.
+///
+/// `base` and `target` may be prefixes of the real buffers: only the
+/// leading `DECISION_SAMPLE` bytes are ever examined, which keeps the
+/// probe cheap enough to run per tensor.
+pub fn pays_off(
+    base: &[u8],
+    target: &[u8],
+    compression: &CompressionAlgo,
+    max_ratio: f64,
+) -> bool {
+    let n = base.len().min(target.len()).min(DECISION_SAMPLE);
+    if n < DECISION_MIN {
+        return true; // too little to judge — let the exact path decide
     }
-    let diff = a[..n].iter().zip(&b[..n]).filter(|(x, y)| x != y).count();
-    diff as f64 / n as f64
+
+    let xor: Vec<u8> = base[..n]
+        .iter()
+        .zip(&target[..n])
+        .map(|(a, b)| a ^ b)
+        .collect();
+
+    match (
+        compression::compress(&xor, compression),
+        compression::compress(&target[..n], compression),
+    ) {
+        (Ok(delta_c), Ok(full_c)) if !full_c.is_empty() => {
+            (delta_c.len() as f64) < (full_c.len() as f64) * max_ratio
+        }
+        // Compression failed on the probe: don't let a sampling problem
+        // block the delta, the exact path still produces a correct result.
+        _ => true,
+    }
 }
 
 /// Compute a byte-level XOR delta between `base` and `target`.
@@ -87,11 +122,14 @@ pub fn compute_delta(base: &[u8], target: &[u8]) -> Option<Vec<u8>> {
     if base.len() != target.len() {
         return None; // shape change → full save
     }
-    if base == target {
-        return None; // identical → skip
-    }
+    // Size before content: a tensor under the threshold is rejected either
+    // way, so testing it first saves scanning buffers whose answer is already
+    // determined.
     if base.len() < DELTA_MIN_SIZE {
         return None; // too small to bother
+    }
+    if buffers_equal(base, target) {
+        return None; // identical → skip
     }
 
     Some(xor_bytes(base, target))
@@ -100,7 +138,7 @@ pub fn compute_delta(base: &[u8], target: &[u8]) -> Option<Vec<u8>> {
 /// Apply a XOR delta to a base to recover the target.
 pub fn apply_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>> {
     if base.len() != delta.len() {
-        return Err(RevolverError::Delta(format!(
+        return Err(MoonclipError::Delta(format!(
             "base length {} != delta length {}",
             base.len(),
             delta.len()
@@ -147,7 +185,6 @@ mod tests {
     fn identical_returns_none() {
         let data = vec![0u8; 8192];
         assert!(compute_delta(&data, &data).is_none());
-        assert!(delta_if_sparse(&data, &data, 0.5).is_none());
     }
 
     #[test]
@@ -155,7 +192,6 @@ mod tests {
         let a = vec![0u8; 100];
         let b = vec![0u8; 200];
         assert!(compute_delta(&a, &b).is_none());
-        assert!(delta_if_sparse(&a, &b, 0.5).is_none());
     }
 
     #[test]
@@ -164,7 +200,6 @@ mod tests {
         let mut b = a.clone();
         b[0] = 1;
         assert!(compute_delta(&a, &b).is_none());
-        assert!(delta_if_sparse(&a, &b, 0.5).is_none());
     }
 
     #[test]
@@ -177,47 +212,104 @@ mod tests {
         assert!(density > 0.99, "fully different should have density ~1.0, got {density}");
     }
 
-    #[test]
-    fn delta_if_sparse_accepts_sparse() {
-        let base = vec![0u8; 100_000];
-        let mut target = base.clone();
-        target[0] = 1;
-        target[50_000] = 2;
+    const ZSTD3: CompressionAlgo = CompressionAlgo::Zstd { level: 3 };
 
-        let delta = delta_if_sparse(&base, &target, 0.5).unwrap();
-        let recovered = apply_delta(&base, &delta).unwrap();
-        assert_eq!(target, recovered);
-    }
+    /// Deterministic xorshift — keeps the tests reproducible without
+    /// pulling in an RNG dependency.
+    struct Rng(u64);
 
-    #[test]
-    fn delta_if_sparse_rejects_dense() {
-        let base = vec![0u8; 100_000];
-        let target = vec![255u8; 100_000];
-        assert!(delta_if_sparse(&base, &target, 0.5).is_none());
-    }
-
-    #[test]
-    fn delta_if_sparse_threshold_boundary() {
-        // ~60% of bytes changed → rejected at 0.5, accepted at 0.7
-        let base = vec![0u8; 100_000];
-        let mut target = base.clone();
-        for i in 0..60_000 {
-            target[i] = 1;
+    impl Rng {
+        fn next_u64(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
         }
-        assert!(delta_if_sparse(&base, &target, 0.5).is_none());
-        assert!(delta_if_sparse(&base, &target, 0.7).is_some());
+
+        /// Uniform in [-1, 1).
+        fn next_f32(&mut self) -> f32 {
+            (self.next_u64() >> 40) as f32 / (1u32 << 23) as f32 * 2.0 - 1.0
+        }
+    }
+
+    fn byte_density(a: &[u8], b: &[u8]) -> f64 {
+        let diff = a.iter().zip(b).filter(|(x, y)| x != y).count();
+        diff as f64 / a.len() as f64
+    }
+
+    /// Incompressible bytes, standing in for real weight data. A base of
+    /// constant bytes would compress to nothing in full form, and a delta
+    /// against it would legitimately save nothing.
+    fn noise(len: usize, seed: u64) -> Vec<u8> {
+        let mut rng = Rng(seed);
+        (0..len).map(|_| rng.next_u64() as u8).collect()
     }
 
     #[test]
-    fn sample_density_estimates() {
-        let a = vec![0u8; 1000];
-        let mut b = a.clone();
-        for i in 0..500 {
-            b[i] = 1;
-        }
-        let d = sample_density(&a, &b);
-        assert!((d - 0.5).abs() < 1e-9);
-        assert_eq!(sample_density(&[], &[]), 1.0);
+    fn pays_off_accepts_sparse_change() {
+        let base = noise(100_000, 0xabcd);
+        let mut target = base.clone();
+        target[0] ^= 1;
+        target[50_000] ^= 2;
+        assert!(pays_off(&base, &target, &ZSTD3, 0.95));
+    }
+
+    #[test]
+    fn pays_off_rejects_unrelated_data() {
+        // Two independent random buffers: the XOR is just as random as the
+        // target itself, so the delta buys nothing and costs an extra
+        // indirection at load time.
+        let base = noise(100_000, 0x1234_5678);
+        let target = noise(100_000, 0x8765_4321);
+        assert!(!pays_off(&base, &target, &ZSTD3, 0.95));
+    }
+
+    /// Regression: fp32 weights nudged by an optimizer step change roughly
+    /// three bytes in four, so the old byte-density criterion (threshold
+    /// 0.5) rejected every delta — the XOR path was effectively dead code
+    /// on dense training. The XOR is still far more compressible than the
+    /// raw weights, and must be accepted.
+    #[test]
+    fn pays_off_accepts_float_weights_after_optimizer_step() {
+        let mut rng = Rng(0xdead_beef);
+        let n = 32_768; // 128 KB of fp32
+        let weights: Vec<f32> = (0..n).map(|_| rng.next_f32() * 0.02).collect();
+        // Relative update of ~1e-3, the typical magnitude of an AdamW step.
+        let updated: Vec<f32> = weights
+            .iter()
+            .map(|w| w * (1.0 + 1e-3 * rng.next_f32()))
+            .collect();
+
+        let base: Vec<u8> = weights.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let target: Vec<u8> = updated.iter().flat_map(|w| w.to_le_bytes()).collect();
+
+        let density = byte_density(&base[..DECISION_SAMPLE], &target[..DECISION_SAMPLE]);
+        assert!(
+            density > 0.5,
+            "precondition: the old criterion must reject this, got density {density}"
+        );
+        assert!(
+            pays_off(&base, &target, &ZSTD3, 0.95),
+            "XOR delta of nudged fp32 weights must beat a full save"
+        );
+    }
+
+    #[test]
+    fn pays_off_defaults_true_on_short_sample() {
+        let base = vec![0u8; DECISION_MIN - 1];
+        let target = vec![255u8; DECISION_MIN - 1];
+        assert!(pays_off(&base, &target, &ZSTD3, 0.95));
+    }
+
+    #[test]
+    fn pays_off_honours_max_ratio() {
+        // A change sparse enough to compress well, but a max_ratio of 0
+        // demands an impossible win.
+        let base = noise(100_000, 0x5555);
+        let mut target = base.clone();
+        target[0] ^= 1;
+        assert!(pays_off(&base, &target, &ZSTD3, 0.95));
+        assert!(!pays_off(&base, &target, &ZSTD3, 0.0));
     }
 
     #[test]
@@ -250,6 +342,45 @@ mod tests {
     #[test]
     fn delta_density_all_zero() {
         assert_eq!(delta_density(&vec![0u8; 1000]), 0.0);
+    }
+
+    /// `xor_bytes` fills an uninitialised buffer, so every byte must be
+    /// written before the Vec is handed back as `Vec<u8>`. A size that is an
+    /// exact multiple of SCAN_CHUNK (as `delta_multimegabyte` uses) cannot
+    /// catch a mishandled tail: the ragged last chunk is the interesting case.
+    #[test]
+    fn xor_fills_ragged_tail() {
+        for extra in [1usize, 7, 4095, SCAN_CHUNK - 1] {
+            let size = 2 * SCAN_CHUNK + extra;
+            let base = noise(size, 0x51de);
+            let mut target = base.clone();
+            // Differ only in the very last byte: everything else XORs to zero,
+            // so an unwritten tail shows up as garbage instead of 0.
+            *target.last_mut().unwrap() ^= 0xff;
+
+            let delta = compute_delta(&base, &target).expect("sizes match, content differs");
+            assert_eq!(delta.len(), size);
+            assert_eq!(*delta.last().unwrap(), 0xff, "tail byte wrong at extra={extra}");
+            assert!(
+                delta[..size - 1].iter().all(|&b| b == 0),
+                "untouched region must XOR to zero at extra={extra}"
+            );
+            assert_eq!(apply_delta(&base, &delta).unwrap(), target);
+        }
+    }
+
+    /// The parallel equality check must not be fooled by a difference that
+    /// falls outside the first chunk.
+    #[test]
+    fn identical_detected_across_chunks() {
+        let size = 3 * SCAN_CHUNK + 17;
+        let base = noise(size, 0xfeed);
+        assert!(compute_delta(&base, &base.clone()).is_none());
+
+        // A single differing byte in the final chunk must defeat the skip.
+        let mut target = base.clone();
+        target[size - 3] ^= 1;
+        assert!(compute_delta(&base, &target).is_some());
     }
 
     #[test]

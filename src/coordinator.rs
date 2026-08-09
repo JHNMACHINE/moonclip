@@ -6,7 +6,7 @@ use chrono::Utc;
 use uuid::Uuid;
 
 use crate::cast::DType;
-use crate::error::{Result, RevolverError};
+use crate::error::{Result, MoonclipError};
 use crate::manifest::*;
 use crate::merger::{DeltaMerger, MergerConfig};
 use crate::remote_sync::{RemoteSyncConfig, RemoteSyncer};
@@ -20,7 +20,10 @@ pub struct CoordinatorConfig {
     pub compression: CompressionAlgo,
     pub retention: RetentionPolicy,
     pub lineage: LineageConfig,
-    pub delta_threshold: f64,
+    /// A tensor is stored as a XOR delta only when the delta compresses to
+    /// less than this fraction of the compressed full tensor. See
+    /// [`crate::delta::pays_off`].
+    pub delta_max_ratio: f64,
     pub merger: Option<MergerConfig>,
     pub remote_storage: Option<Arc<dyn StorageBackend>>,
     pub remote_sync: Option<RemoteSyncConfig>,
@@ -41,7 +44,7 @@ impl Default for CoordinatorConfig {
             compression: CompressionAlgo::Zstd { level: 3 },
             retention: RetentionPolicy::default(),
             lineage: LineageConfig::default(),
-            delta_threshold: 0.5,
+            delta_max_ratio: 0.95,
             merger: None,
             remote_storage: None,
             remote_sync: None,
@@ -84,9 +87,9 @@ impl Coordinator {
                     .map(|i| i + 1)
                     .unwrap_or(0);
                 serde_json::from_slice(&data[..end])
-                    .map_err(|e| RevolverError::Serialization(e.to_string()))?
+                    .map_err(|e| MoonclipError::Serialization(e.to_string()))?
             }
-            Err(RevolverError::NotFound(_)) => Manifest {
+            Err(MoonclipError::NotFound(_)) => Manifest {
                 world_size: config.world_size,
                 retention: config.retention.clone(),
                 lineage: config.lineage.clone(),
@@ -154,7 +157,7 @@ impl Coordinator {
         metadata: HashMap<String, String>,
     ) -> Result<Uuid> {
         if self.core.config.world_size != 1 {
-            return Err(RevolverError::Config(
+            return Err(MoonclipError::Config(
                 "Multi-rank save requires explicit create_snapshot/save_rank/finalize flow. \
                  Use save_rank() instead."
                     .into(),
@@ -338,7 +341,7 @@ impl Core {
         let manifest = self.manifest.lock().unwrap();
         let snap = manifest
             .find_snapshot(snap_id)
-            .ok_or_else(|| RevolverError::NotFound(format!("Snapshot {snap_id}")))?
+            .ok_or_else(|| MoonclipError::NotFound(format!("Snapshot {snap_id}")))?
             .clone();
 
         let base_snap = snap
@@ -372,13 +375,13 @@ impl Core {
             let expected = self.config.world_size;
             let actual = snap.ranks.len() as u32;
             if actual < expected {
-                return Err(RevolverError::Config(format!(
+                return Err(MoonclipError::Config(format!(
                     "Cannot finalize: only {actual}/{expected} ranks have saved"
                 )));
             }
             snap.finalized = true;
         } else {
-            return Err(RevolverError::NotFound(format!("Snapshot {snap_id}")));
+            return Err(MoonclipError::NotFound(format!("Snapshot {snap_id}")));
         }
 
         self.apply_retention(&mut manifest)?;
@@ -401,12 +404,12 @@ impl Core {
         let manifest = self.manifest.lock().unwrap();
         let snap = manifest
             .find_snapshot(snap_id)
-            .ok_or_else(|| RevolverError::NotFound(format!("Snapshot {snap_id}")))?
+            .ok_or_else(|| MoonclipError::NotFound(format!("Snapshot {snap_id}")))?
             .clone();
         drop(manifest);
 
         let rank_entry = snap.ranks.get(&self.config.rank).ok_or_else(|| {
-            RevolverError::NotFound(format!(
+            MoonclipError::NotFound(format!(
                 "Rank {} not found in snapshot {snap_id}",
                 self.config.rank
             ))
@@ -466,7 +469,7 @@ impl Core {
             if let Some((cached_id, entries, comp, pack)) = &base_ctx {
                 if *cached_id == base_id {
                     let entry = entries.get(tensor_name).cloned().ok_or_else(|| {
-                        RevolverError::NotFound(format!(
+                        MoonclipError::NotFound(format!(
                             "Tensor '{}' not in base snapshot {base_id}",
                             tensor_name
                         ))
@@ -480,6 +483,7 @@ impl Core {
         let pairs: Result<Vec<(String, Vec<u8>)>> = rank_entry
             .tensors
             .par_iter()
+            .filter(|entry| entry.storage != TensorStorage::Alias)
             .map(|entry| {
                 tensor::load_tensor(
                     entry,
@@ -493,7 +497,26 @@ impl Core {
             })
             .collect();
 
-        Ok(pairs?.into_iter().collect())
+        let mut out: HashMap<String, Vec<u8>> = pairs?.into_iter().collect();
+
+        // Second pass: aliases share bytes with a tensor already loaded above.
+        for entry in &rank_entry.tensors {
+            if entry.storage != TensorStorage::Alias {
+                continue;
+            }
+            let target = entry.alias_of.as_deref().ok_or_else(|| {
+                MoonclipError::NotFound(format!("Alias '{}' has no target", entry.name))
+            })?;
+            let data = out.get(target).cloned().ok_or_else(|| {
+                MoonclipError::NotFound(format!(
+                    "Alias '{}' points at '{}', which is not in this snapshot",
+                    entry.name, target
+                ))
+            })?;
+            out.insert(entry.name.clone(), data);
+        }
+
+        Ok(out)
     }
 
     fn load_latest(&self) -> Result<(Uuid, HashMap<String, Vec<u8>>)> {
@@ -503,7 +526,7 @@ impl Core {
             .iter()
             .rev()
             .find(|s| s.finalized)
-            .ok_or_else(|| RevolverError::NotFound("No finalized snapshots".into()))?
+            .ok_or_else(|| MoonclipError::NotFound("No finalized snapshots".into()))?
             .clone();
         drop(manifest);
 
@@ -571,14 +594,46 @@ impl Core {
         // ── 1. Build lazy base cache (no upfront disk read) ──────────
         let base_cache = self.build_base_cache(base_snap);
 
-        // ── 2. Process tensors in parallel ───────────────────────────
+        // ── 2. Deduplicate, then process the survivors in parallel ───
+        // Tied embeddings and repeated buffers hold identical bytes under
+        // several names; store them once and point the rest at the copy.
+        let dedup = tensor::dedup_plan(&tensors);
+        let unique: Vec<&TensorData> = tensors
+            .iter()
+            .zip(&dedup)
+            .filter(|(_, alias)| alias.is_none())
+            .map(|(t, _)| t)
+            .collect();
+
         let mut processed = tensor::process_tensors_parallel(
-            &tensors,
+            &unique,
             base_cache.as_ref(),
             &self.config.compression,
-            self.config.delta_threshold,
+            self.config.delta_max_ratio,
             &self.config.save_dtype,
         )?;
+        drop(unique);
+
+        // Alias entries inherit dtype/cast/hash from the stored tensor, so
+        // they must be built after processing. They carry no data, so they
+        // do not affect the pack offsets assigned below.
+        let stored: HashMap<&str, &TensorEntry> = processed
+            .iter()
+            .map(|pt| (pt.entry.name.as_str(), &pt.entry))
+            .collect();
+        let alias_entries: Vec<TensorEntry> = tensors
+            .iter()
+            .zip(&dedup)
+            .filter_map(|(t, alias)| {
+                let target = stored.get(alias.as_deref()?)?;
+                Some(tensor::make_alias_entry(t, target))
+            })
+            .collect();
+        drop(stored);
+        processed.extend(alias_entries.into_iter().map(|entry| tensor::ProcessedTensor {
+            entry,
+            write_data: None,
+        }));
         drop(tensors); // raw tensor data no longer needed
 
         // ── 3. Assign pack offsets and write all parts in one file ──
@@ -614,7 +669,8 @@ impl Core {
             total_compressed += pt.entry.compressed_size;
             total_raw += pt.entry.raw_size;
             match pt.entry.storage {
-                TensorStorage::Skipped => skipped += 1,
+                // Aliases write no bytes, same as a skipped tensor.
+                TensorStorage::Skipped | TensorStorage::Alias => skipped += 1,
                 TensorStorage::DeltaXor => delta += 1,
                 TensorStorage::Full => full += 1,
             }
@@ -664,10 +720,10 @@ impl Core {
         let manifest = self.manifest.lock().unwrap();
         let base_snap = manifest
             .find_snapshot(base_id)
-            .ok_or_else(|| RevolverError::NotFound(format!("Base snapshot {base_id}")))?;
+            .ok_or_else(|| MoonclipError::NotFound(format!("Base snapshot {base_id}")))?;
 
         let rank_entry = base_snap.ranks.get(&self.config.rank).ok_or_else(|| {
-            RevolverError::NotFound(format!(
+            MoonclipError::NotFound(format!(
                 "Rank {} not in base snapshot {base_id}",
                 self.config.rank
             ))
@@ -678,7 +734,7 @@ impl Core {
             .iter()
             .find(|t| t.name == tensor_name)
             .ok_or_else(|| {
-                RevolverError::NotFound(format!(
+                MoonclipError::NotFound(format!(
                     "Tensor '{}' not in base snapshot {base_id}",
                     tensor_name
                 ))
@@ -709,19 +765,19 @@ impl Core {
                     .unwrap_or(0);
                 let trimmed = &data[..end];
                 let new_manifest: Manifest = serde_json::from_slice(trimmed)
-                    .map_err(|e| RevolverError::Serialization(e.to_string()))?;
+                    .map_err(|e| MoonclipError::Serialization(e.to_string()))?;
                 let mut m = self.manifest.lock().unwrap();
                 *m = new_manifest;
                 Ok(())
             }
-            Err(RevolverError::NotFound(_)) => Ok(()),
+            Err(MoonclipError::NotFound(_)) => Ok(()),
             Err(e) => Err(e),
         }
     }
 
     fn persist_manifest(&self, manifest: &Manifest) -> Result<()> {
         let json = serde_json::to_vec_pretty(manifest)
-            .map_err(|e| RevolverError::Serialization(e.to_string()))?;
+            .map_err(|e| MoonclipError::Serialization(e.to_string()))?;
         self.storage.put("manifest.json", &json)
     }
 
@@ -859,7 +915,7 @@ impl AsyncSaver {
         let shared2 = Arc::clone(&shared);
 
         let handle = thread::Builder::new()
-            .name("revolver-async-saver".into())
+            .name("moonclip-async-saver".into())
             .spawn(move || {
                 for job in rx {
                     let result = core.save_sync(job.snap_id, job.step, job.tensors, job.metadata);
@@ -872,7 +928,7 @@ impl AsyncSaver {
                     shared2.1.notify_all();
                 }
             })
-            .expect("Failed to spawn revolver-async-saver thread");
+            .expect("Failed to spawn moonclip-async-saver thread");
 
         AsyncSaver {
             tx: Some(tx),
@@ -898,7 +954,7 @@ impl AsyncSaver {
             state = cvar.wait(state).unwrap();
         }
         match state.error.take() {
-            Some(e) => Err(RevolverError::Storage(format!(
+            Some(e) => Err(MoonclipError::Storage(format!(
                 "Background save failed: {e}"
             ))),
             None => Ok(()),
@@ -906,19 +962,37 @@ impl AsyncSaver {
     }
 
     /// Submit a job, waiting for the previous one to drain first.
+    ///
+    /// The wait and the claim of the in-flight slot happen under a single
+    /// lock acquisition. Doing them separately — wait for idle, release,
+    /// re-acquire, set busy — lets two threads both observe an idle saver and
+    /// both queue a job. That breaks the bound-1 invariant, and because
+    /// `busy` is one flag for what is then two outstanding jobs, the worker
+    /// clears it after the first completes: `flush()` returns while a save is
+    /// still queued, and the caller sees a manifest missing that snapshot.
     fn submit(&self, job: SaveJob) -> Result<()> {
-        self.flush()?;
-        {
-            let mut state = self.shared.0.lock().unwrap();
-            state.busy = true;
-        }
         let tx = self
             .tx
             .as_ref()
-            .ok_or_else(|| RevolverError::Storage("Background saver is shut down".into()))?;
+            .ok_or_else(|| MoonclipError::Storage("Background saver is shut down".into()))?;
+
+        let (lock, cvar) = &*self.shared;
+        let mut state = lock.lock().unwrap();
+        while state.busy {
+            state = cvar.wait(state).unwrap();
+        }
+        // Surface a failure from the previous save before starting another,
+        // matching what the old `self.flush()?` on entry did.
+        if let Some(e) = state.error.take() {
+            return Err(MoonclipError::Storage(format!("Background save failed: {e}")));
+        }
+        state.busy = true;
+        drop(state);
+
         if tx.send(job).is_err() {
-            self.shared.0.lock().unwrap().busy = false;
-            return Err(RevolverError::Storage(
+            lock.lock().unwrap().busy = false;
+            cvar.notify_all();
+            return Err(MoonclipError::Storage(
                 "Background saver channel closed".into(),
             ));
         }
@@ -973,7 +1047,7 @@ mod tests {
                 full_snapshot_every_steps: 10000,
                 max_total_snapshots: None,
             },
-            delta_threshold: 0.5,
+            delta_max_ratio: 0.95,
             ..Default::default()
         };
         Coordinator::new(storage, config).unwrap()
@@ -1050,7 +1124,7 @@ mod tests {
                 full_snapshot_every_steps: 5, // full every 5 steps
                 max_total_snapshots: Some(4), // hard cap at 4
             },
-            delta_threshold: 0.5,
+            delta_max_ratio: 0.95,
             ..Default::default()
         };
         let coord = Coordinator::new(storage, config).unwrap();
@@ -1084,7 +1158,7 @@ mod tests {
                 full_snapshot_every_steps: 1, // force full every step
                 max_total_snapshots: None,
             },
-            delta_threshold: 0.5,
+            delta_max_ratio: 0.95,
             ..Default::default()
         };
         let coord = Coordinator::new(storage, config).unwrap();
@@ -1176,7 +1250,7 @@ mod tests {
                 full_snapshot_every_steps: 3,
                 max_total_snapshots: None,
             },
-            delta_threshold: 0.5,
+            delta_max_ratio: 0.95,
             ..Default::default()
         };
         let coord = Coordinator::new(storage, config).unwrap();
@@ -1219,6 +1293,62 @@ mod tests {
         assert_eq!(snaps[0].metadata["loss"], "0.123");
         assert_eq!(snaps[0].metadata["lr"], "3e-4");
         assert_eq!(snaps[0].metadata["epoch"], "5");
+    }
+
+    /// Every concurrent `save()` must be in the manifest once `flush()`
+    /// returns.
+    ///
+    /// Regression: `submit` waited for the saver to go idle, released the
+    /// lock, then re-acquired it to set `busy`. Two threads could both clear
+    /// the wait and both queue a job against what is a single flag, so the
+    /// worker cleared `busy` after the first of them finished — `flush()`
+    /// returned with a save still queued and the manifest came up short.
+    ///
+    /// Repeated, because one pass through a lost-update window is not
+    /// guaranteed to lose anything: the pre-fix code failed a few runs in ten.
+    #[test]
+    fn concurrent_saves_all_land() {
+        const THREADS: u64 = 10;
+        const TRIALS: usize = 20;
+
+        for trial in 0..TRIALS {
+            let dir = tempfile::tempdir().unwrap();
+            let storage: Arc<dyn StorageBackend> =
+                Arc::new(LocalStorage::new(dir.path()).unwrap());
+            let config = CoordinatorConfig {
+                world_size: 1,
+                rank: 0,
+                compression: CompressionAlgo::Zstd { level: 1 },
+                retention: RetentionPolicy {
+                    // Deliberately generous: a short manifest must mean a lost
+                    // save, never retention pruning.
+                    max_full_snapshots: 1000,
+                    max_deltas_per_full: 1000,
+                    full_snapshot_every_steps: 100_000,
+                    max_total_snapshots: None,
+                },
+                delta_max_ratio: 0.95,
+                ..Default::default()
+            };
+            let coord = Arc::new(Coordinator::new(storage, config).unwrap());
+
+            let handles: Vec<_> = (1..=THREADS)
+                .map(|step| {
+                    let c = Arc::clone(&coord);
+                    thread::spawn(move || c.save(step, sample_tensors(step as u8), HashMap::new()))
+                })
+                .collect();
+            for h in handles {
+                h.join().expect("worker panicked").expect("save failed");
+            }
+            coord.flush().unwrap();
+
+            assert_eq!(
+                coord.list_snapshots().len(),
+                THREADS as usize,
+                "trial {trial}: a concurrent save is missing from the manifest"
+            );
+        }
     }
 
     #[test]

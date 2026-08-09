@@ -1,5 +1,5 @@
 """
-PyTorch-specific integration tests for Revolver.
+PyTorch-specific integration tests for Moonclip.
 Requires: pip install torch
 Skipped automatically if torch is not installed.
 """
@@ -15,7 +15,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "python"))
 
 torch = pytest.importorskip("torch")
 
-from revolver import CheckpointManager
+from moonclip import CheckpointManager
 
 
 class TestCheckpointManager:

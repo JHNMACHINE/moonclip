@@ -60,7 +60,7 @@ fn collect_tensors(tensors: &Bound<'_, PyDict>) -> PyResult<Vec<PendingTensor>> 
     for (key, value) in tensors.iter() {
         let name: String = key.extract()?;
         // Vecchio formato: tupla (shape, dtype, bytes)
-        if let Ok(tuple) = value.downcast::<PyTuple>() {
+        if let Ok(tuple) = value.cast::<PyTuple>() {
             let shape: Vec<usize> = tuple.get_item(0)?.extract()?;
             let dtype: String = tuple.get_item(1)?.extract()?;
             let data: Vec<u8> = tuple.get_item(2)?.extract()?;
@@ -71,37 +71,32 @@ fn collect_tensors(tensors: &Bound<'_, PyDict>) -> PyResult<Vec<PendingTensor>> 
                 bytes: PendingBytes::Owned(data),
             });
         }
-        // Nuovo formato: tensore PyTorch direttamente
-        else if let Ok(tensor) = value.downcast::<PyAny>() {
-            if tensor.hasattr("data_ptr")? {
-                let shape: Vec<usize> = tensor.getattr("shape")?.extract()?;
-                let dtype_full = tensor.getattr("dtype")?.str()?.to_string();
-                let dtype = dtype_full
-                    .strip_prefix("torch.")
-                    .unwrap_or(&dtype_full)
-                    .to_string();
-                let numel: usize = tensor.call_method0("numel")?.extract()?;
-                let data_ptr: usize = tensor.call_method0("data_ptr")?.extract()?;
-                let element_size = get_element_size(&format!("torch.{}", dtype))?;
-                let nbytes = numel * element_size;
-                result.push(PendingTensor {
-                    name,
-                    shape,
-                    dtype,
-                    bytes: PendingBytes::Borrowed {
-                        ptr: data_ptr,
-                        len: nbytes,
-                    },
-                });
-            } else {
-                return Err(pyo3::exceptions::PyTypeError::new_err(format!(
-                    "Value for '{}' is not a supported type (must be tuple or torch.Tensor)",
-                    name
-                )));
-            }
+        // Nuovo formato: tensore PyTorch direttamente. `value` is already a
+        // Bound<PyAny>, so the presence of `data_ptr` is the only test that
+        // distinguishes a tensor here.
+        else if value.hasattr("data_ptr")? {
+            let shape: Vec<usize> = value.getattr("shape")?.extract()?;
+            let dtype_full = value.getattr("dtype")?.str()?.to_string();
+            let dtype = dtype_full
+                .strip_prefix("torch.")
+                .unwrap_or(&dtype_full)
+                .to_string();
+            let numel: usize = value.call_method0("numel")?.extract()?;
+            let data_ptr: usize = value.call_method0("data_ptr")?.extract()?;
+            let element_size = get_element_size(&format!("torch.{}", dtype))?;
+            let nbytes = numel * element_size;
+            result.push(PendingTensor {
+                name,
+                shape,
+                dtype,
+                bytes: PendingBytes::Borrowed {
+                    ptr: data_ptr,
+                    len: nbytes,
+                },
+            });
         } else {
             return Err(pyo3::exceptions::PyTypeError::new_err(format!(
-                "Invalid value for key '{}'",
+                "Value for '{}' is not a supported type (must be tuple or torch.Tensor)",
                 name
             )));
         }
@@ -139,12 +134,12 @@ fn materialize_tensors(pending: Vec<PendingTensor>) -> Vec<TensorData> {
 
 /// High-performance checkpoint manager for ML training.
 #[pyclass]
-pub struct RevolverManager {
+pub struct MoonclipManager {
     inner: Coordinator,
 }
 
 #[pymethods]
-impl RevolverManager {
+impl MoonclipManager {
     #[new]
     #[pyo3(signature = (
         storage_root = "./checkpoints",
@@ -152,7 +147,7 @@ impl RevolverManager {
         max_full_snapshots = 5,
         max_deltas_per_full = 10,
         full_every_steps = 5000,
-        delta_threshold = 0.5,
+        delta_max_ratio = 0.95,
         world_size = 1,
         rank = 0,
         merge_stride = 0,
@@ -177,7 +172,7 @@ impl RevolverManager {
         max_full_snapshots: usize,
         max_deltas_per_full: usize,
         full_every_steps: u64,
-        delta_threshold: f64,
+        delta_max_ratio: f64,
         world_size: u32,
         rank: u32,
         merge_stride: usize,
@@ -218,7 +213,7 @@ impl RevolverManager {
                 rollback_interval_steps,
                 max_rollback_snapshots,
             },
-            delta_threshold,
+            delta_max_ratio,
             merger: if merge_stride > 0 {
                 Some(MergerConfig {
                     stride: merge_stride,
@@ -263,16 +258,14 @@ impl RevolverManager {
                 Arc::new(LocalStorage::new(storage_root)?);
 
             config.remote_storage = Some(Arc::clone(&remote));
-            config.remote_sync = Some(RemoteSyncConfig {
-                sync_every_n_saves: sync_every_n_saves,
-            });
+            config.remote_sync = Some(RemoteSyncConfig { sync_every_n_saves });
             local
         } else {
             Arc::new(LocalStorage::new(storage_root)?)
         };
 
         let inner = Coordinator::new(storage, config)?;
-        Ok(RevolverManager { inner })
+        Ok(MoonclipManager { inner })
     }
 
     /// Save a checkpoint (single-rank mode).
@@ -286,7 +279,7 @@ impl RevolverManager {
     ) -> PyResult<String> {
         let pending = collect_tensors(&tensors)?;
         let meta = extract_metadata(metadata)?;
-        let id = py.allow_threads(|| {
+        let id = py.detach(|| {
             let tensor_data = materialize_tensors(pending);
             self.inner.save(step, tensor_data, meta)
         })?;
@@ -306,7 +299,7 @@ impl RevolverManager {
         let uuid = uuid::Uuid::parse_str(snap_id)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
         let pending = collect_tensors(&tensors)?;
-        py.allow_threads(|| {
+        py.detach(|| {
             let tensor_data = materialize_tensors(pending);
             self.inner.save_rank(uuid, tensor_data)
         })?;
@@ -324,7 +317,7 @@ impl RevolverManager {
     /// Block until any in-flight background save completes.
     /// Raises if the background save failed.
     fn flush(&self, py: Python<'_>) -> PyResult<()> {
-        py.allow_threads(|| self.inner.flush())?;
+        py.detach(|| self.inner.flush())?;
         Ok(())
     }
 
@@ -332,7 +325,7 @@ impl RevolverManager {
     fn load<'py>(&self, py: Python<'py>, snap_id: &str) -> PyResult<Bound<'py, PyDict>> {
         let uuid = uuid::Uuid::parse_str(snap_id)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
-        let tensors = py.allow_threads(|| self.inner.load(uuid))?;
+        let tensors = py.detach(|| self.inner.load(uuid))?;
         let dict = PyDict::new(py);
         for (name, data) in tensors {
             dict.set_item(name, PyByteArray::new(py, &data))?;
@@ -345,7 +338,7 @@ impl RevolverManager {
         &self,
         py: Python<'py>,
     ) -> PyResult<(Bound<'py, PyString>, Bound<'py, PyDict>)> {
-        let (id, tensors) = py.allow_threads(|| self.inner.load_latest())?;
+        let (id, tensors) = py.detach(|| self.inner.load_latest())?;
         let dict = PyDict::new(py);
         for (name, data) in tensors {
             dict.set_item(name, PyByteArray::new(py, &data))?;
@@ -356,7 +349,7 @@ impl RevolverManager {
 
     /// List all finalized snapshots.
     fn list_snapshots<'py>(&self, py: Python<'py>) -> PyResult<Vec<Bound<'py, PyDict>>> {
-        let snaps = py.allow_threads(|| self.inner.list_snapshots());
+        let snaps = py.detach(|| self.inner.list_snapshots());
         let mut result = Vec::new();
         for s in snaps {
             let d = PyDict::new(py);
@@ -381,18 +374,18 @@ impl RevolverManager {
 
     /// Force merge all pending deltas.
     fn merge_now(&self, py: Python<'_>) {
-        py.allow_threads(|| self.inner.merge_now());
+        py.detach(|| self.inner.merge_now());
     }
 
     /// Force sync to remote storage.
     fn sync_now(&self, py: Python<'_>) {
-        py.allow_threads(|| self.inner.sync_now());
+        py.detach(|| self.inner.sync_now());
     }
 }
 
 #[pymodule]
-fn revolver(m: &Bound<'_, pyo3::types::PyModule>) -> PyResult<()> {
-    m.add_class::<RevolverManager>()?;
-    m.add("__version__", "1.2.0")?;
+fn moonclip(m: &Bound<'_, pyo3::types::PyModule>) -> PyResult<()> {
+    m.add_class::<MoonclipManager>()?;
+    m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }

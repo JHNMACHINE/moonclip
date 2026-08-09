@@ -14,6 +14,10 @@ pub enum TensorStorage {
     DeltaXor,
     /// Tensor unchanged from base — no data stored, just a reference.
     Skipped,
+    /// Byte-for-byte identical to another tensor in the *same* snapshot
+    /// (see `alias_of`) — no data stored. Tied embeddings and repeated
+    /// buffers would otherwise be written once per name.
+    Alias,
 }
 
 /// Metadata for a single tensor within a rank's checkpoint.
@@ -31,6 +35,10 @@ pub struct TensorEntry {
     pub original_dtype: Option<String>,
     /// How this tensor is stored.
     pub storage: TensorStorage,
+    /// For `Alias`: the name of the tensor in this same snapshot that
+    /// holds the bytes. None for every other storage kind.
+    #[serde(default)]
+    pub alias_of: Option<String>,
     /// Path to the compressed data file (None if Skipped).
     /// With packed files, this is None — use RankEntry.pack_file instead.
     pub filename: Option<String>,

@@ -1,6 +1,6 @@
 use rayon::prelude::*;
 
-use crate::error::{Result, RevolverError};
+use crate::error::{Result, MoonclipError};
 use crate::manifest::CompressionAlgo;
 
 /// Chunk size for parallel compression. Each chunk becomes an independent
@@ -20,13 +20,13 @@ pub fn compress(data: &[u8], algo: &CompressionAlgo) -> Result<Vec<u8>> {
         CompressionAlgo::Zstd { level } => {
             if data.len() <= PARALLEL_CHUNK {
                 return zstd::bulk::compress(data, *level)
-                    .map_err(|e| RevolverError::Compression(e.to_string()));
+                    .map_err(|e| MoonclipError::Compression(e.to_string()));
             }
             let frames: std::io::Result<Vec<Vec<u8>>> = data
                 .par_chunks(PARALLEL_CHUNK)
                 .map(|chunk| zstd::bulk::compress(chunk, *level))
                 .collect();
-            let frames = frames.map_err(|e| RevolverError::Compression(e.to_string()))?;
+            let frames = frames.map_err(|e| MoonclipError::Compression(e.to_string()))?;
             let total: usize = frames.iter().map(|f| f.len()).sum();
             let mut out = Vec::with_capacity(total);
             for f in &frames {
@@ -103,12 +103,12 @@ pub fn decompress(data: &[u8], algo: &CompressionAlgo) -> Result<Vec<u8>> {
                         }
                         Ok(())
                     })
-                    .map_err(RevolverError::Compression)?;
+                    .map_err(MoonclipError::Compression)?;
                 return Ok(out);
             }
 
             zstd::decode_all(std::io::Cursor::new(data))
-                .map_err(|e| RevolverError::Compression(e.to_string()))
+                .map_err(|e| MoonclipError::Compression(e.to_string()))
         }
     }
 }
@@ -127,7 +127,7 @@ pub fn decompress_prefix(data: &[u8], algo: &CompressionAlgo, max_bytes: usize) 
         CompressionAlgo::Zstd { .. } => {
             use std::io::Read;
             let mut decoder = zstd::stream::read::Decoder::new(std::io::Cursor::new(data))
-                .map_err(|e| RevolverError::Compression(e.to_string()))?;
+                .map_err(|e| MoonclipError::Compression(e.to_string()))?;
             let mut out = vec![0u8; max_bytes];
             let mut filled = 0;
             while filled < max_bytes {
@@ -136,7 +136,7 @@ pub fn decompress_prefix(data: &[u8], algo: &CompressionAlgo, max_bytes: usize) 
                     Ok(n) => filled += n,
                     // Truncated input: keep whatever was already decoded.
                     Err(_) if filled > 0 => break,
-                    Err(e) => return Err(RevolverError::Compression(e.to_string())),
+                    Err(e) => return Err(MoonclipError::Compression(e.to_string())),
                 }
             }
             out.truncate(filled);

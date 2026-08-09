@@ -5,7 +5,7 @@ use std::thread;
 
 use uuid::Uuid;
 
-use crate::error::{Result, RevolverError};
+use crate::error::{Result, MoonclipError};
 
 /// A job sent from the main thread to the background saver.
 pub struct SaveJob {
@@ -65,7 +65,7 @@ impl BackgroundSaver {
         let shared_clone = Arc::clone(&shared);
 
         let handle = thread::Builder::new()
-            .name("revolver-bg-saver".into())
+            .name("moonclip-bg-saver".into())
             .spawn(move || {
                 for job in rx {
                     let snap_id = job.snap_id;
@@ -124,9 +124,9 @@ impl BackgroundSaver {
 
         self.sender
             .as_ref()
-            .ok_or_else(|| RevolverError::Storage("Background saver is shut down".into()))?
+            .ok_or_else(|| MoonclipError::Storage("Background saver is shut down".into()))?
             .send(job)
-            .map_err(|_| RevolverError::Storage("Background saver channel closed".into()))?;
+            .map_err(|_| MoonclipError::Storage("Background saver channel closed".into()))?;
 
         Ok(())
     }
@@ -162,7 +162,7 @@ impl BackgroundSaver {
         // Check if the last save had an error
         if let Some(ref result) = state.last_result {
             if let Some(ref err) = result.error {
-                return Err(RevolverError::Storage(format!(
+                return Err(MoonclipError::Storage(format!(
                     "Previous background save (step {}) failed: {}",
                     result.step, err
                 )));
@@ -185,7 +185,7 @@ impl BackgroundSaver {
         if let Some(handle) = self.handle.take() {
             handle
                 .join()
-                .map_err(|_| RevolverError::Storage("Background thread panicked".into()))?;
+                .map_err(|_| MoonclipError::Storage("Background thread panicked".into()))?;
         }
 
         Ok(())

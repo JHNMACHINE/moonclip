@@ -1,5 +1,5 @@
 """
-Example: integrating Revolver into Harold's training loop.
+Example: integrating Moonclip into Model's training loop.
 
 Drop-in replacement for checkpoint.py with background async saves.
 Uses the public flatten_state_dict + save_raw API for zero-block saves.
@@ -7,9 +7,9 @@ Uses the public flatten_state_dict + save_raw API for zero-block saves.
 
 import time
 import concurrent.futures
-from typing import Any, Optional, Dict
+from typing import Any, Optional
 
-from revolver import CheckpointManager, flatten_state_dict
+from moonclip import CheckpointManager, flatten_state_dict
 
 
 # ─── Setup ───────────────────────────────────────────────────────────
@@ -20,7 +20,7 @@ manager = CheckpointManager(
     max_full_snapshots=3,
     max_deltas_per_full=10,
     full_every_steps=5000,
-    delta_threshold=0.5,
+    delta_max_ratio=0.95,
     save_dtype="bf16",
 )
 
@@ -66,7 +66,7 @@ def save_checkpoint(step: int, model: Any, optimizer: Any, scheduler: Any = None
         tensors=all_tensors,
         metadata=metadata,
     )
-    print(f"[Revolver] Submitted step {step} (background)")
+    print(f"[Moonclip] Submitted step {step} (background)")
 
 
 def save_checkpoint_sync(step: int, model: Any, optimizer: Any, **kwargs):
@@ -83,7 +83,7 @@ def save_checkpoint_sync(step: int, model: Any, optimizer: Any, **kwargs):
         metadata={k: str(v) for k, v in kwargs.items()},
     )
     elapsed = time.perf_counter() - t0
-    print(f"[Revolver] Saved step {step} → {snap_id[:8]}... ({elapsed:.2f}s sync)")
+    print(f"[Moonclip] Saved step {step} → {snap_id[:8]}... ({elapsed:.2f}s sync)")
     return snap_id
 
 

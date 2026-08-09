@@ -25,7 +25,7 @@ import torch.multiprocessing as mp
 import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from revolver import CheckpointManager
+from moonclip import CheckpointManager
 
 
 def run_test(rank=None, world_size=None, ckpt_dir=None):
@@ -41,7 +41,7 @@ def run_test(rank=None, world_size=None, ckpt_dir=None):
     # Share ckpt_dir from rank 0
     if ckpt_dir is None:
         if rank == 0:
-            ckpt_dir = tempfile.mkdtemp(prefix="revolver_torchrun_")
+            ckpt_dir = tempfile.mkdtemp(prefix="moonclip_torchrun_")
         else:
             ckpt_dir = ""
         objects = [ckpt_dir]

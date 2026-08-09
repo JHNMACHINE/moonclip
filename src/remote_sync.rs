@@ -2,7 +2,7 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
 
-use crate::error::{Result, RevolverError};
+use crate::error::{Result, MoonclipError};
 use crate::storage::StorageBackend;
 
 /// Configuration for batched remote sync.
@@ -58,18 +58,18 @@ impl RemoteSyncer {
         let sync_every = config.sync_every_n_saves;
 
         let handle = thread::Builder::new()
-            .name("revolver-remote-sync".into())
+            .name("moonclip-remote-sync".into())
             .spawn(move || {
                 for cmd in rx {
                     match cmd {
                         SyncCommand::SyncPrefix(prefix) => {
                             if let Err(e) = sync_prefix(&local, &remote, &prefix) {
-                                eprintln!("[Revolver sync] Error syncing '{}': {}", prefix, e);
+                                eprintln!("[Moonclip sync] Error syncing '{}': {}", prefix, e);
                             }
                         }
                         SyncCommand::SyncAll => {
                             if let Err(e) = sync_prefix(&local, &remote, "") {
-                                eprintln!("[Revolver sync] Error syncing all: {}", e);
+                                eprintln!("[Moonclip sync] Error syncing all: {}", e);
                             }
                         }
                         SyncCommand::Shutdown => break,
@@ -143,7 +143,7 @@ fn sync_prefix(
                 remote.put(prefix, &data)?;
                 return Ok(());
             }
-            Err(RevolverError::NotFound(_)) => return Ok(()),
+            Err(MoonclipError::NotFound(_)) => return Ok(()),
             Err(e) => return Err(e),
         }
     }
@@ -170,7 +170,7 @@ fn sync_prefix(
 
     if synced > 0 {
         eprintln!(
-            "[Revolver sync] Synced {} files, skipped {} (prefix: '{}')",
+            "[Moonclip sync] Synced {} files, skipped {} (prefix: '{}')",
             synced, skipped, prefix
         );
     }

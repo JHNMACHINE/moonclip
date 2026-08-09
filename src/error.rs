@@ -1,7 +1,7 @@
 use thiserror::Error;
 
 #[derive(Error, Debug)]
-pub enum RevolverError {
+pub enum MoonclipError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
@@ -27,10 +27,11 @@ pub enum RevolverError {
     Config(String),
 }
 
-pub type Result<T> = std::result::Result<T, RevolverError>;
+pub type Result<T> = std::result::Result<T, MoonclipError>;
 
-impl From<RevolverError> for pyo3::PyErr {
-    fn from(err: RevolverError) -> pyo3::PyErr {
+#[cfg(feature = "python")]
+impl From<MoonclipError> for pyo3::PyErr {
+    fn from(err: MoonclipError) -> pyo3::PyErr {
         pyo3::exceptions::PyRuntimeError::new_err(err.to_string())
     }
 }

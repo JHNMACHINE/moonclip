@@ -1,21 +1,21 @@
 """
-Checkpoint benchmark: Revolver vs torch.save vs safetensors vs Accelerate vs Lightning.
+Checkpoint benchmark: Moonclip vs torch.save vs safetensors vs Accelerate vs Lightning.
 
 Measures save time, load time, and disk usage across multiple checkpoint saves
 during a real training run. Each method uses its natural retention policy to
 show real-world disk footprint.
 
-Revolver saves run asynchronously by default: save() returns as soon as the
+Moonclip saves run asynchronously by default: save() returns as soon as the
 tensor data has been copied, while hashing, delta detection, compression and
 the disk write overlap with the next training steps. On top of that it keeps
 cumulative disk savings over many saves via per-tensor delta tracking, zstd
 compression, and built-in retention.
 
 Usage:
-    pip install revolver torch safetensors accelerate pytorch-lightning
+    pip install moonclip torch safetensors accelerate pytorch-lightning
     python benchmark_checkpoints.py
     python benchmark_checkpoints.py --n-saves 20 --model-size large
-    python benchmark_checkpoints.py --methods revolver torch safetensors
+    python benchmark_checkpoints.py --methods moonclip torch safetensors
 """
 
 from __future__ import annotations
@@ -491,10 +491,10 @@ def bench_lightning(
     return result
 
 
-# ─── Method: Revolver ────────────────────────────────────────────────
+# ─── Method: Moonclip ────────────────────────────────────────────────
 
 
-def bench_revolver(
+def bench_moonclip(
     model_cfg: dict,
     n_saves: int,
     steps_between: int,
@@ -503,17 +503,17 @@ def bench_revolver(
     keep: int,
 ) -> BenchmarkResult:
     try:
-        from revolver import CheckpointManager
+        from moonclip import CheckpointManager
     except ImportError:
-        r = BenchmarkResult(method="revolver", model_params=0)
-        r.error = "not installed (pip install revolver)"
+        r = BenchmarkResult(method="moonclip", model_params=0)
+        r.error = "not installed (pip install moonclip)"
         return r
 
-    ckpt_dir = fresh_dir(os.path.join(base_dir, "revolver"))
+    ckpt_dir = fresh_dir(os.path.join(base_dir, "moonclip"))
     model = MiniGPT(**model_cfg).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
     n_params = sum(p.numel() for p in model.parameters())
-    result = BenchmarkResult(method="revolver", model_params=n_params)
+    result = BenchmarkResult(method="moonclip", model_params=n_params)
 
     mgr = CheckpointManager(
         storage_root=ckpt_dir,
@@ -521,7 +521,7 @@ def bench_revolver(
         max_full_snapshots=keep,
         max_deltas_per_full=50,
         full_every_steps=keep * steps_between,
-        delta_threshold=0.5,
+        delta_max_ratio=0.95,
     )
 
     for i in range(n_saves):
@@ -627,8 +627,8 @@ def print_report(results: List[BenchmarkResult], n_saves: int, keep: int):
     if sf:
         print("\n  * safetensors: model-only (no optimizer), weight tying disabled")
 
-    # Revolver insight
-    rev = next((r for r in valid if r.method == "revolver"), None)
+    # Moonclip insight
+    rev = next((r for r in valid if r.method == "moonclip"), None)
     tr = next((r for r in valid if r.method == "torch.save"), None)
     if rev and tr:
         disk_pct = (
@@ -641,17 +641,17 @@ def print_report(results: List[BenchmarkResult], n_saves: int, keep: int):
         print(f"\n  {'─' * (w - 4)}")
         if disk_pct > 0:
             print(
-                f"  Revolver: {fmt_bytes(rev.final_disk_bytes)} on disk "
+                f"  Moonclip: {fmt_bytes(rev.final_disk_bytes)} on disk "
                 f"({disk_pct:.1f}% less than torch.save)"
             )
         else:
             print(
-                f"  Revolver: {fmt_bytes(rev.final_disk_bytes)} on disk "
+                f"  Moonclip: {fmt_bytes(rev.final_disk_bytes)} on disk "
                 f"vs {fmt_bytes(tr.final_disk_bytes)} for torch.save"
             )
         if rev_hist != tr_hist:
             print(
-                f"  Revolver keeps {rev_hist} accessible checkpoints "
+                f"  Moonclip keeps {rev_hist} accessible checkpoints "
                 f"vs {tr_hist} for torch.save"
             )
         print("  Per-tensor delta tracking + zstd compression + built-in retention")
@@ -689,7 +689,7 @@ ALL_METHODS = {
     "safetensors": bench_safetensors,
     "accelerate": bench_accelerate,
     "lightning": bench_lightning,
-    "revolver": bench_revolver,
+    "moonclip": bench_moonclip,
 }
 
 

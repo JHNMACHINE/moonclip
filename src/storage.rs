@@ -1,4 +1,4 @@
-use crate::error::{Result, RevolverError};
+use crate::error::{Result, MoonclipError};
 use std::path::{Path, PathBuf};
 
 // ─── Constants ──────────────────────────────────────────────────────
@@ -60,7 +60,7 @@ pub fn pad_to_page(data: &[u8], page_size: usize) -> Vec<u8> {
     if page_size == 0 || data.len() % page_size == 0 {
         return data.to_vec();
     }
-    let padded_len = ((data.len() + page_size - 1) / page_size) * page_size;
+    let padded_len = data.len().div_ceil(page_size) * page_size;
     let mut padded = Vec::with_capacity(padded_len);
     padded.extend_from_slice(data);
     padded.resize(padded_len, 0u8);
@@ -130,7 +130,7 @@ impl StorageBackend for LocalStorage {
             file.flush()?;
         }
         tmp.persist(&path).map_err(|e| {
-            RevolverError::Storage(format!("Failed to persist {}: {}", path.display(), e))
+            MoonclipError::Storage(format!("Failed to persist {}: {}", path.display(), e))
         })?;
         Ok(())
     }
@@ -138,7 +138,7 @@ impl StorageBackend for LocalStorage {
     fn get(&self, rel_path: &str) -> Result<Vec<u8>> {
         let path = self.full_path(rel_path);
         if !path.exists() {
-            return Err(RevolverError::NotFound(rel_path.to_string()));
+            return Err(MoonclipError::NotFound(rel_path.to_string()));
         }
         Ok(std::fs::read(&path)?)
     }
@@ -150,7 +150,7 @@ impl StorageBackend for LocalStorage {
         let mut file = match std::fs::File::open(&path) {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(RevolverError::NotFound(rel_path.to_string()));
+                return Err(MoonclipError::NotFound(rel_path.to_string()));
             }
             Err(e) => return Err(e.into()),
         };

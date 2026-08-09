@@ -24,7 +24,7 @@ class CheckpointManager:
         max_full_snapshots: int = 5,
         max_deltas_per_full: int = 10,
         full_every_steps: int = 5000,
-        delta_threshold: float = 0.5,
+        delta_max_ratio: float = 0.95,
         world_size: Optional[int] = None,
         rank: Optional[int] = None,
         merge_stride: int = 0,

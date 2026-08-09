@@ -1,5 +1,5 @@
 """
-Example: training a small Transformer on CPU with Revolver checkpointing.
+Example: training a small Transformer on CPU with Moonclip checkpointing.
 
 Demonstrates using CheckpointManager to save and restore model, optimizer,
 and scheduler states during real training, with background async saves.
@@ -13,7 +13,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
-from revolver import CheckpointManager, flatten_state_dict
+from moonclip import CheckpointManager, flatten_state_dict
 
 
 # ─── Simple Transformer Model ────────────────────────────────────────

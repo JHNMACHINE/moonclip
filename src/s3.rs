@@ -2,7 +2,7 @@ use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 use std::fmt::Write as FmtWrite;
 
-use crate::error::{Result, RevolverError};
+use crate::error::{Result, MoonclipError};
 use crate::storage::StorageBackend;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -307,7 +307,7 @@ impl S3Storage {
         key: &str,
         body: Option<&[u8]>,
         query_params: &[(&str, &str)],
-    ) -> std::result::Result<ureq::Response, RevolverError> {
+    ) -> std::result::Result<ureq::Response, MoonclipError> {
         let payload_hash = match body {
             Some(data) => sha256_hex(data),
             None => sha256_hex(b""),
@@ -329,7 +329,7 @@ impl S3Storage {
             "PUT" => self.agent.put(&signed.url),
             "DELETE" => self.agent.delete(&signed.url),
             "HEAD" => self.agent.head(&signed.url),
-            _ => return Err(RevolverError::Storage(format!("Unknown method: {method}"))),
+            _ => return Err(MoonclipError::Storage(format!("Unknown method: {method}"))),
         };
 
         for (k, v) in &signed.headers {
@@ -345,9 +345,9 @@ impl S3Storage {
         response.map_err(|e| match e {
             ureq::Error::Status(code, resp) => {
                 let body = resp.into_string().unwrap_or_default();
-                RevolverError::Storage(format!("S3 HTTP {code}: {body}"))
+                MoonclipError::Storage(format!("S3 HTTP {code}: {body}"))
             }
-            ureq::Error::Transport(t) => RevolverError::Storage(format!("S3 transport error: {t}")),
+            ureq::Error::Transport(t) => MoonclipError::Storage(format!("S3 transport error: {t}")),
         })
     }
 }
@@ -365,7 +365,7 @@ impl StorageBackend for S3Storage {
             // Convert 404 to NotFound
             let msg = e.to_string();
             if msg.contains("404") || msg.contains("NoSuchKey") {
-                RevolverError::NotFound(rel_path.to_string())
+                MoonclipError::NotFound(rel_path.to_string())
             } else {
                 e
             }
@@ -374,7 +374,7 @@ impl StorageBackend for S3Storage {
         let mut buf = Vec::new();
         resp.into_reader()
             .read_to_end(&mut buf)
-            .map_err(|e| RevolverError::Storage(format!("S3 read error: {e}")))?;
+            .map_err(|e| MoonclipError::Storage(format!("S3 read error: {e}")))?;
         Ok(buf)
     }
 
@@ -382,7 +382,7 @@ impl StorageBackend for S3Storage {
         let key = self.config.object_key(rel_path);
         match self.do_request("HEAD", &key, None, &[]) {
             Ok(_) => Ok(true),
-            Err(RevolverError::Storage(msg)) if msg.contains("404") => Ok(false),
+            Err(MoonclipError::Storage(msg)) if msg.contains("404") => Ok(false),
             Err(e) => Err(e),
         }
     }
@@ -415,7 +415,7 @@ impl StorageBackend for S3Storage {
 
             let body = resp
                 .into_string()
-                .map_err(|e| RevolverError::Storage(format!("S3 list parse error: {e}")))?;
+                .map_err(|e| MoonclipError::Storage(format!("S3 list parse error: {e}")))?;
 
             // Parse XML response (minimal, no full XML parser needed)
             for key in extract_xml_values(&body, "Key") {

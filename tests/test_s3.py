@@ -1,12 +1,12 @@
 """
-Debug script: replicate Revolver's SigV4 signing in Python and test against MinIO.
+Debug script: replicate Moonclip's SigV4 signing in Python and test against MinIO.
 
 This does EXACTLY what src/s3.rs does, step by step, so we can see
 where the signature diverges from what MinIO expects.
 
 Usage:
     python debug_s3_signing.py --endpoint http://192.168.1.50:9000 \
-        --bucket revolver-test --access-key minioadmin --secret-key minioadmin
+        --bucket moonclip-test --access-key minioadmin --secret-key minioadmin
 """
 
 import argparse
@@ -56,7 +56,7 @@ def sign_and_send(
     body: bytes | None = None,
     query_params: dict | None = None,
 ) -> requests.Response:
-    """Replicate Revolver's sign_request + do_request exactly."""
+    """Replicate Moonclip's sign_request + do_request exactly."""
 
     now = datetime.now(timezone.utc)
     date_stamp = now.strftime("%Y%m%d")
@@ -160,7 +160,7 @@ def main():
     args = parser.parse_args()
 
     test_key = "debug-test/hello.txt"
-    test_body = b"Hello from Revolver debug script!"
+    test_body = b"Hello from Moonclip debug script!"
 
     # Test 1: PUT
     print("\n[TEST 1] PUT object")
@@ -217,7 +217,7 @@ def main():
         print(f"  -> {resp.status_code}")
     else:
         print("\n  PUT failed, skipping remaining tests.")
-        print("  The canonical request above shows EXACTLY what Revolver signs.")
+        print("  The canonical request above shows EXACTLY what Moonclip signs.")
         print("  Compare with MinIO's expected signing to find the mismatch.")
 
 

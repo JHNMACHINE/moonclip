@@ -1,13 +1,15 @@
-# Revolver
+# Moonclip
 
 **Stop losing checkpoints. Start training fearlessly.**
 
-Revolver is a high-performance checkpoint engine for ML training, written in Rust with Python bindings. It tracks per-tensor deltas, skips unchanged weights entirely, and compresses the rest — saving checkpoints in **0.4s instead of minutes**, with **40%+ less storage**.
+Moonclip is a high-performance checkpoint engine for ML training, written in Rust with Python bindings. It tracks per-tensor deltas, skips unchanged weights entirely, and compresses the rest — saving checkpoints in **0.4s instead of minutes**, with **40%+ less storage**.
+
+A moonclip is the ring that holds a full circle of rounds so a revolver reloads in one motion, instead of one chamber at a time. That is the idea here: your whole training state goes down and comes back in a single movement, not tensor by tensor.
 
 Three lines in your training loop. That's it.
 
 ```python
-from revolver import CheckpointManager
+from moonclip import CheckpointManager
 
 mgr = CheckpointManager("./checkpoints", save_dtype="bf16")
 start_step = mgr.resume(model=model, optimizer=optimizer, scheduler=scheduler)
@@ -24,7 +26,7 @@ for step in range(start_step, 100_000):
 
 Every ML engineer has lost a training run. The spot instance dies, the node crashes, the disk fills up — and your last checkpoint was 2 hours ago. So you save more often, but now checkpointing is the bottleneck: a 3B model in bf16 is ~5.5 GB per save, and `torch.save` blocks your training loop every time.
 
-Revolver fixes this at the storage layer. Instead of dumping the full state dict every time, it diffs against the previous checkpoint at the tensor level: unchanged tensors → zero I/O, changed tensors → XOR delta + zstd compression. The result is saves that are both faster and smaller.
+Moonclip fixes this at the storage layer. Instead of dumping the full state dict every time, it diffs against the previous checkpoint at the tensor level: unchanged tensors → zero I/O, changed tensors → XOR delta + zstd compression. The result is saves that are both faster and smaller.
 
 Inspired by [DECK (Meta, PVLDB 2025)](https://doi.org/10.14778/3750601.3750621).
 
@@ -33,7 +35,7 @@ Inspired by [DECK (Meta, PVLDB 2025)](https://doi.org/10.14778/3750601.3750621).
 MiniGPT 41.7M params, fp32 model + full AdamW optimizer state (~540 MB per
 checkpoint), 10 saves, CPU (`examples/benchmark_checkpoints.py`):
 
-| | Revolver | safetensors* |
+| | Moonclip | safetensors* |
 |---|---|---|
 | Avg save (training loop blocked) | **35 ms** | 316 ms |
 | Total for 10 saves | **0.35 s** | 3.2 s |
@@ -69,19 +71,19 @@ Resume integrity verified: max weight diff 0.0 after save → load.
 
 ```bash
 # From git (recommended)
-pip install git+https://codeberg.org/JHNMACHINE/revolver.git
+pip install git+https://codeberg.org/JHNMACHINE/moonclip.git
 
 # On cloud instances (Vast.ai, RunPod, Lambda, etc.)
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 source $HOME/.cargo/env
-pip install git+https://codeberg.org/JHNMACHINE/revolver.git
+pip install git+https://codeberg.org/JHNMACHINE/moonclip.git
 ```
 
 ### Build from source
 
 ```bash
-git clone https://codeberg.org/JHNMACHINE/revolver.git
-cd revolver
+git clone https://codeberg.org/JHNMACHINE/moonclip.git
+cd moonclip
 pip install maturin
 maturin develop --release
 ```
@@ -105,7 +107,7 @@ mgr = CheckpointManager(
 
 ## Multi-GPU (FSDP / DDP)
 
-Revolver auto-detects `torchrun` environment variables. No configuration needed:
+Moonclip auto-detects `torchrun` environment variables. No configuration needed:
 
 ```bash
 torchrun --nproc_per_node=8 train.py

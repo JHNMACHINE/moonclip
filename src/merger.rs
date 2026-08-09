@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use crate::compression;
 use crate::delta;
-use crate::error::{Result, RevolverError};
+use crate::error::{Result, MoonclipError};
 use crate::hash::hash_hex;
 use crate::manifest::*;
 use crate::storage::StorageBackend;
@@ -53,7 +53,7 @@ impl DeltaMerger {
         let (tx, rx) = mpsc::channel();
 
         let handle = thread::Builder::new()
-            .name("revolver-bg-merger".into())
+            .name("moonclip-bg-merger".into())
             .spawn(move || {
                 for cmd in rx {
                     match cmd {
@@ -61,14 +61,14 @@ impl DeltaMerger {
                             if let Err(e) =
                                 do_stride_merge(&config, &storage, &manifest, &compression)
                             {
-                                eprintln!("[Revolver merger] stride merge error: {e}");
+                                eprintln!("[Moonclip merger] stride merge error: {e}");
                             }
                         }
                         MergeCommand::ForceFullMerge => {
                             if let Err(e) =
                                 do_full_merge(&storage, &manifest, &compression)
                             {
-                                eprintln!("[Revolver merger] full merge error: {e}");
+                                eprintln!("[Moonclip merger] full merge error: {e}");
                             }
                         }
                         MergeCommand::Shutdown => break,
@@ -145,7 +145,7 @@ fn do_full_merge(
     let base_snap = manifest
         .last_full_snapshot()
         .cloned()
-        .ok_or_else(|| RevolverError::NotFound("No full snapshot".into()))?;
+        .ok_or_else(|| MoonclipError::NotFound("No full snapshot".into()))?;
 
     let base_id = base_snap.id;
 
@@ -180,12 +180,40 @@ fn do_full_merge(
         let mut total_raw = 0u64;
 
         for base_tensor in &base_rank.tensors {
-            let mut current_data = load_tensor_data(
-                base_tensor,
-                &base_snap,
-                storage,
-                compression,
-            )?;
+            // What the delta chain does to this tensor after the base.
+            let chain: Vec<&TensorEntry> = deltas
+                .iter()
+                .filter_map(|d| d.ranks.get(&rank))
+                .filter_map(|r| r.tensors.iter().find(|t| t.name == base_tensor.name))
+                .collect();
+
+            // An alias holds no bytes of its own. Unless the chain later
+            // overwrites it, carry the reference through — the tensor it
+            // points at is materialized in this same rank entry.
+            let stays_alias = base_tensor.storage == TensorStorage::Alias
+                && chain.iter().all(|t| {
+                    matches!(t.storage, TensorStorage::Skipped | TensorStorage::Alias)
+                });
+            if stays_alias {
+                let latest = chain
+                    .iter()
+                    .rev()
+                    .find(|t| t.storage == TensorStorage::Alias)
+                    .copied()
+                    .unwrap_or(base_tensor);
+                total_raw += latest.raw_size;
+                merged_tensors.push(latest.clone());
+                continue;
+            }
+
+            let mut current_data = if base_tensor.storage == TensorStorage::Alias {
+                // A Full later in the chain replaces this wholesale; a
+                // delta can never target an alias, since deltas are only
+                // computed against Full bases.
+                Vec::new()
+            } else {
+                load_tensor_data(base_tensor, &base_snap, storage, compression)?
+            };
 
             for delta_snap in &deltas {
                 if let Some(delta_rank) = delta_snap.ranks.get(&rank) {
@@ -195,7 +223,9 @@ fn do_full_merge(
                         .find(|t| t.name == base_tensor.name)
                     {
                         match delta_tensor.storage {
-                            TensorStorage::Skipped => {}
+                            // Unchanged, or a reference whose bytes are
+                            // materialized under the target's own name.
+                            TensorStorage::Skipped | TensorStorage::Alias => {}
                             TensorStorage::Full => {
                                 current_data = load_tensor_data(
                                     delta_tensor,
@@ -234,6 +264,7 @@ fn do_full_merge(
                 shape: base_tensor.shape.clone(),
                 dtype: base_tensor.dtype.clone(),
                 storage: TensorStorage::Full,
+                alias_of: None,
                 filename: Some(filename),
                 offset: 0,
                 compressed_size: compressed.len() as u64,
@@ -244,7 +275,11 @@ fn do_full_merge(
             });
         }
 
-        let full_count = merged_tensors.len();
+        let alias_count = merged_tensors
+            .iter()
+            .filter(|t| t.storage == TensorStorage::Alias)
+            .count();
+        let full_count = merged_tensors.len() - alias_count;
         merged_ranks.insert(
             rank,
             RankEntry {
@@ -253,7 +288,7 @@ fn do_full_merge(
                 pack_file: None, // Merger still uses individual files
                 total_compressed,
                 total_raw,
-                skipped_count: 0,
+                skipped_count: alias_count,
                 delta_count: 0,
                 full_count,
             },
@@ -300,7 +335,7 @@ fn do_full_merge(
     manifest.snapshots.sort_by_key(|s| s.step);
 
     let json = serde_json::to_vec_pretty(&*manifest)
-        .map_err(|e| RevolverError::Serialization(e.to_string()))?;
+        .map_err(|e| MoonclipError::Serialization(e.to_string()))?;
     storage.put("manifest.json", &json)?;
 
     Ok(())
@@ -338,7 +373,7 @@ fn load_compressed_data(
         }
     }
 
-    Err(RevolverError::NotFound(format!(
+    Err(MoonclipError::NotFound(format!(
         "No data found for tensor '{}'", entry.name
     )))
 }
@@ -354,7 +389,7 @@ fn load_tensor_data(
             let compressed = load_compressed_data(entry, snap, storage)?;
             compression::decompress(&compressed, compression)
         }
-        _ => Err(RevolverError::Delta(format!(
+        _ => Err(MoonclipError::Delta(format!(
             "Merger can only process Full tensors, got {:?} for '{}'",
             entry.storage, entry.name
         ))),

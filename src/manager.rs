@@ -7,7 +7,7 @@ use uuid::Uuid;
 use crate::background::{BackgroundSaver, SaveJob, SaveResult};
 use crate::compression;
 use crate::delta;
-use crate::error::{Result, RevolverError};
+use crate::error::{Result, MoonclipError};
 use crate::hash::sha256_hex;
 use crate::manifest::*;
 use crate::merger::{DeltaMerger, MergerConfig};
@@ -187,7 +187,7 @@ impl ManagerInner {
 
     pub fn persist_manifest(&self, manifest: &Manifest) -> Result<()> {
         let json = serde_json::to_vec_pretty(manifest)
-            .map_err(|e| RevolverError::Serialization(e.to_string()))?;
+            .map_err(|e| MoonclipError::Serialization(e.to_string()))?;
         self.storage.put("manifest.json", &json)
     }
 
@@ -278,8 +278,8 @@ impl CheckpointManager {
     ) -> Result<Self> {
         let manifest = match storage.get("manifest.json") {
             Ok(data) => serde_json::from_slice(&data)
-                .map_err(|e| RevolverError::Serialization(e.to_string()))?,
-            Err(RevolverError::NotFound(_)) => Manifest {
+                .map_err(|e| MoonclipError::Serialization(e.to_string()))?,
+            Err(MoonclipError::NotFound(_)) => Manifest {
                 retention: config.retention.clone(),
                 ..Default::default()
             },
@@ -371,7 +371,7 @@ impl CheckpointManager {
         metadata: HashMap<String, String>,
     ) -> Result<Uuid> {
         let bg = self.bg_saver.as_ref().ok_or_else(|| {
-            RevolverError::Config(
+            MoonclipError::Config(
                 "Background saving not enabled. Create manager with enable_background=true".into(),
             )
         })?;
@@ -430,7 +430,7 @@ impl CheckpointManager {
             .snapshots
             .iter()
             .find(|s| s.id == snap_id)
-            .ok_or_else(|| RevolverError::NotFound(format!("Snapshot {snap_id}")))?
+            .ok_or_else(|| MoonclipError::NotFound(format!("Snapshot {snap_id}")))?
             .clone();
         drop(manifest);
 
@@ -445,7 +445,7 @@ impl CheckpointManager {
         let snap = manifest
             .snapshots
             .last()
-            .ok_or_else(|| RevolverError::NotFound("No snapshots available".into()))?
+            .ok_or_else(|| MoonclipError::NotFound("No snapshots available".into()))?
             .clone();
         drop(manifest);
 
@@ -497,7 +497,7 @@ impl CheckpointManager {
                 // Verify integrity of compressed data
                 let actual_hash = sha256_hex(&compressed);
                 if actual_hash != shard.sha256 {
-                    return Err(RevolverError::IntegrityError {
+                    return Err(MoonclipError::IntegrityError {
                         expected: shard.sha256.clone(),
                         actual: actual_hash,
                     });
@@ -510,7 +510,7 @@ impl CheckpointManager {
                 let raw =
                     if shard.tensors.first().map(|t| t.dtype.as_str()) == Some("delta_xor") {
                         let base_id = snap.base_snapshot_id.ok_or_else(|| {
-                            RevolverError::Delta(
+                            MoonclipError::Delta(
                                 "Delta snapshot has no base_snapshot_id".into(),
                             )
                         })?;
@@ -524,7 +524,7 @@ impl CheckpointManager {
                 if let Some(tensor) = shard.tensors.first() {
                     let actual = sha256_hex(&raw);
                     if actual != tensor.sha256 {
-                        return Err(RevolverError::IntegrityError {
+                        return Err(MoonclipError::IntegrityError {
                             expected: tensor.sha256.clone(),
                             actual,
                         });
@@ -548,7 +548,7 @@ impl CheckpointManager {
             .snapshots
             .iter()
             .find(|s| s.id == snap_id)
-            .ok_or_else(|| RevolverError::NotFound(format!("Snapshot {snap_id}")))?
+            .ok_or_else(|| MoonclipError::NotFound(format!("Snapshot {snap_id}")))?
             .clone();
         drop(manifest);
 
@@ -556,7 +556,7 @@ impl CheckpointManager {
             .components
             .get(kind)
             .ok_or_else(|| {
-                RevolverError::NotFound(format!("{:?} in snapshot {snap_id}", kind))
+                MoonclipError::NotFound(format!("{:?} in snapshot {snap_id}", kind))
             })?;
 
         let shard = &shards[0];
@@ -565,7 +565,7 @@ impl CheckpointManager {
 
         if shard.tensors.first().map(|t| t.dtype.as_str()) == Some("delta_xor") {
             let base_id = snap.base_snapshot_id.ok_or_else(|| {
-                RevolverError::Delta("Delta chain broken: no base_snapshot_id".into())
+                MoonclipError::Delta("Delta chain broken: no base_snapshot_id".into())
             })?;
             let base_data = self.load_component_raw(base_id, kind)?;
             delta::apply_delta(&base_data, &decompressed)

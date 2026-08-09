@@ -14,12 +14,12 @@ Usage with MinIO (local S3):
 
     # Create bucket (via MinIO console at http://localhost:9001 or mc cli):
     mc alias set local http://localhost:9000 minioadmin minioadmin
-    mc mb local/revolver-test
+    mc mb local/moonclip-test
 
     # Train:
     python examples/s3_training.py \
         --s3-endpoint http://localhost:9000 \
-        --s3-bucket revolver-test \
+        --s3-bucket moonclip-test \
         --s3-access-key minioadmin \
         --s3-secret-key minioadmin
 
@@ -39,13 +39,13 @@ Usage with Cloudflare R2:
 
 Usage with environment variables (recommended for CI/production):
     export S3_ENDPOINT=http://localhost:9000
-    export S3_BUCKET=revolver-test
+    export S3_BUCKET=moonclip-test
     export S3_ACCESS_KEY=minioadmin
     export S3_SECRET_KEY=minioadmin
     python examples/s3_training.py
 
 Requirements:
-    pip install torch revolver
+    pip install torch moonclip
     # For MinIO: docker
 """
 
@@ -57,7 +57,7 @@ import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from revolver import CheckpointManager
+from moonclip import CheckpointManager
 from torch.utils.data import DataLoader, Dataset
 
 # ─── Model (same MiniGPT from transformer_training.py) ──────────────
@@ -221,7 +221,7 @@ def train(args):
         compression_level=3,
         max_full_snapshots=3,
         full_every_steps=200,
-        delta_threshold=0.5,
+        delta_max_ratio=0.95,
         save_dtype=args.save_dtype,
         **s3_kwargs,
     )
@@ -339,7 +339,7 @@ def train(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Train MiniGPT with S3-backed Revolver checkpoints"
+        description="Train MiniGPT with S3-backed Moonclip checkpoints"
     )
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--batch-size", type=int, default=32)
@@ -348,7 +348,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--save-dtype", type=str, default="bf16", choices=["fp32", "bf16"]
     )
-    parser.add_argument("--ckpt-dir", type=str, default="./revolver_s3_ckpts")
+    parser.add_argument("--ckpt-dir", type=str, default="./moonclip_s3_ckpts")
     parser.add_argument(
         "--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu"
     )
@@ -361,7 +361,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--s3-prefix",
         type=str,
-        default=os.environ.get("S3_PREFIX", "revolver-training/"),
+        default=os.environ.get("S3_PREFIX", "moonclip-training/"),
     )
     parser.add_argument(
         "--s3-endpoint", type=str, default=os.environ.get("S3_ENDPOINT")

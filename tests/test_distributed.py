@@ -20,7 +20,7 @@ class TestDistributedEnvDetection:
         monkeypatch.delenv("WORLD_SIZE", raising=False)
         monkeypatch.delenv("LOCAL_RANK", raising=False)
 
-        from revolver._env import _detect_distributed_env
+        from moonclip._env import _detect_distributed_env
         ws, r = _detect_distributed_env()
         assert ws == 1
         assert r == 0
@@ -30,7 +30,7 @@ class TestDistributedEnvDetection:
         monkeypatch.setenv("RANK", "3")
         monkeypatch.setenv("WORLD_SIZE", "8")
 
-        from revolver._env import _detect_distributed_env
+        from moonclip._env import _detect_distributed_env
         ws, r = _detect_distributed_env()
         assert ws == 8
         assert r == 3
@@ -40,7 +40,7 @@ class TestDistributedEnvDetection:
         monkeypatch.setenv("RANK", "2")
         monkeypatch.delenv("WORLD_SIZE", raising=False)
 
-        from revolver._env import _detect_distributed_env
+        from moonclip._env import _detect_distributed_env
         ws, r = _detect_distributed_env()
         assert ws == 1
         assert r == 0
@@ -50,7 +50,7 @@ class TestDistributedEnvDetection:
         monkeypatch.setenv("RANK", "abc")
         monkeypatch.setenv("WORLD_SIZE", "xyz")
 
-        from revolver._env import _detect_distributed_env
+        from moonclip._env import _detect_distributed_env
         ws, r = _detect_distributed_env()
         assert ws == 1
         assert r == 0
@@ -60,7 +60,7 @@ class TestDistributedEnvDetection:
         monkeypatch.setenv("RANK", "0")
         monkeypatch.setenv("WORLD_SIZE", "4")
 
-        from revolver._env import _detect_distributed_env
+        from moonclip._env import _detect_distributed_env
         ws, r = _detect_distributed_env()
         assert ws == 4
         assert r == 0
@@ -70,7 +70,7 @@ class TestDistributedEnvDetection:
         monkeypatch.setenv("RANK", "0")
         monkeypatch.setenv("WORLD_SIZE", "1")
 
-        from revolver._env import _detect_distributed_env
+        from moonclip._env import _detect_distributed_env
         ws, r = _detect_distributed_env()
         assert ws == 1
         assert r == 0
@@ -87,7 +87,7 @@ class TestCheckpointManagerAutoDetect:
         monkeypatch.setenv("RANK", "2")
         monkeypatch.setenv("WORLD_SIZE", "4")
 
-        from revolver import CheckpointManager
+        from moonclip import CheckpointManager
         mgr = CheckpointManager(storage_root=str(tmp_path))
         assert mgr.world_size == 4
         assert mgr.rank == 2
@@ -96,7 +96,7 @@ class TestCheckpointManagerAutoDetect:
         monkeypatch.setenv("RANK", "5")
         monkeypatch.setenv("WORLD_SIZE", "8")
 
-        from revolver import CheckpointManager
+        from moonclip import CheckpointManager
         mgr = CheckpointManager(storage_root=str(tmp_path), world_size=2, rank=1)
         assert mgr.world_size == 2
         assert mgr.rank == 1
@@ -105,7 +105,7 @@ class TestCheckpointManagerAutoDetect:
         monkeypatch.delenv("RANK", raising=False)
         monkeypatch.delenv("WORLD_SIZE", raising=False)
 
-        from revolver import CheckpointManager
+        from moonclip import CheckpointManager
         mgr = CheckpointManager(storage_root=str(tmp_path))
         assert mgr.world_size == 1
         assert mgr.rank == 0

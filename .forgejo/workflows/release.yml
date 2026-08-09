@@ -9,27 +9,57 @@ jobs:
   build-and-publish:
     runs-on: codeberg-small
     container:
-      image: rust:1.86-bookworm
+      # The PyPA manylinux image ships every supported CPython under
+      # /opt/python/cp3XX-cp3XX/bin/, each with pip. That removes the need for
+      # a Python version manager entirely, and — unlike building on plain
+      # bookworm — the wheels come out tagged manylinux_2_28 instead of
+      # linux_x86_64, which is the difference between installable and not.
+      image: quay.io/pypa/manylinux_2_28_x86_64
     steps:
-      - name: Install deps
+      - name: Install Rust
         run: |
-          apt-get update -qq
-          apt-get install -y -qq git python3 python3-pip python3-venv
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain 1.90.0 --profile minimal
 
       - name: Checkout
         run: |
           git clone --depth 1 --branch ${{ forgejo.ref_name }} ${{ forgejo.server_url }}/${{ forgejo.repository }}.git .
 
-      - name: Build wheel
+      # One native wheel per interpreter rather than a single abi3 wheel: the
+      # stable ABI would cost PyO3's fast paths, which is the wrong trade for
+      # this library. Built in one job so the shared dependencies compile once.
+      - name: Build wheels
         run: |
-          python3 -m venv /opt/venv
-          /opt/venv/bin/pip install maturin twine
-          export VIRTUAL_ENV=/opt/venv
-          export PATH="/opt/venv/bin:$PATH"
-          export PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1
-          maturin build --release --interpreter python3
+          set -eu
+          . "$HOME/.cargo/env"
+          VERSIONS="cp39 cp310 cp311 cp312 cp313 cp314"
+
+          INTERPRETERS=""
+          for v in $VERSIONS; do
+            py="/opt/python/$v-$v/bin/python"
+            test -x "$py" || { echo "Interpreter missing: $py" >&2; exit 1; }
+            INTERPRETERS="$INTERPRETERS $py"
+          done
+
+          /opt/python/cp312-cp312/bin/pip install --quiet maturin twine
+          PATH="/opt/python/cp312-cp312/bin:$PATH"
+          export PATH
+
+          echo "Building for:$INTERPRETERS"
+          maturin build --release --interpreter $INTERPRETERS
+
           echo "=== Built wheels ==="
           ls -la target/wheels/
+
+          # Assert one wheel per version by ABI tag. A plain count would pass
+          # if every wheel targeted the same interpreter, which is exactly the
+          # failure this build has to rule out.
+          for v in $VERSIONS; do
+            if ! ls target/wheels/ | grep -q "$v"; then
+              echo "No wheel built for $v" >&2
+              exit 1
+            fi
+          done
 
       - name: Publish to Codeberg Packages
         env:
@@ -37,7 +67,4 @@ jobs:
           TWINE_USERNAME: ${{ forgejo.repository_owner }}
           TWINE_PASSWORD: ${{ secrets.PUBLISH_TOKEN }}
         run: |
-          export PATH="/opt/venv/bin:$PATH"
-          WHEEL=$(find target/wheels -name '*.whl' -type f | head -1)
-          echo "Uploading: $WHEEL"
-          twine upload "$WHEEL"
+          /opt/python/cp312-cp312/bin/twine upload target/wheels/*.whl

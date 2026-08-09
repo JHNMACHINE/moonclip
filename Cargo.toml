@@ -1,17 +1,33 @@
 [package]
-name = "revolver"
-version = "1.2.0"
+name = "moonclip"
+version = "1.0.0"
 edition = "2021"
+# Set by pyo3 0.29, the highest MSRV among the dependencies. Declared so a
+# toolchain that is too old fails with that message instead of an unrelated
+# error from deep inside a dependency.
+rust-version = "1.83"
 description = "High-performance checkpoint management for ML training"
 license = "Apache-2.0"
-repository = "https://codeberg.org/JHNMACHINE/revolver"
+repository = "https://codeberg.org/JHNMACHINE/moonclip"
 
 [lib]
-name = "revolver"
-crate-type = ["cdylib"]
+name = "moonclip"
+# rlib so the engine can be used from other Rust projects, cdylib for the
+# Python extension module.
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+# PyO3 bindings. Off by default so `cargo build` and `cargo test` produce a
+# plain Rust library with no Python linkage.
+python = ["dep:pyo3"]
+# What maturin builds with: links the bindings as a Python extension module.
+# Kept separate from `python` because enabling extension-module breaks
+# linking for test and example binaries.
+extension-module = ["python", "pyo3/extension-module"]
 
 [dependencies]
-pyo3 = { version = "0.24", features = ["extension-module"] }
+pyo3 = { version = "0.29", optional = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 bincode = "1.3"
@@ -28,6 +44,10 @@ walkdir = "2"
 tempfile = "3"
 ureq = "2"
 hex = "0.4"
+
+[[bench]]
+name = "delta_bench"
+harness = false
 
 [profile.release]
 lto = true
