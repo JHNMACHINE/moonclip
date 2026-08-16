@@ -1023,11 +1023,30 @@ impl AsyncSaver {
             .name("moonclip-async-saver".into())
             .spawn(move || {
                 for job in rx {
-                    let result = core.save_sync(job.snap_id, job.step, job.tensors, job.metadata);
+                    // A panic here used to kill this thread with `busy` still
+                    // set and nobody left to clear it, so the next `submit`
+                    // waited on the condvar forever: the training loop hung
+                    // silently and permanently, which on rented hardware is an
+                    // idle GPU billing until a human notices. Catching it turns
+                    // a panic into the same thing a storage failure already is
+                    // — an error the next save, flush or load reports.
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        core.save_sync(job.snap_id, job.step, job.tensors, job.metadata)
+                    }));
+
                     let mut state = shared2.0.lock().unwrap();
                     state.busy = false;
-                    if let Err(e) = result {
-                        state.error = Some(e.to_string());
+                    match result {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => state.error = Some(e.to_string()),
+                        Err(panic) => {
+                            let what = panic
+                                .downcast_ref::<&str>()
+                                .map(|s| (*s).to_string())
+                                .or_else(|| panic.downcast_ref::<String>().cloned())
+                                .unwrap_or_else(|| "unknown payload".into());
+                            state.error = Some(format!("save thread panicked: {what}"));
+                        }
                     }
                     drop(state);
                     shared2.1.notify_all();
@@ -1478,5 +1497,217 @@ mod tests {
             re.pack_file.as_ref().unwrap().ends_with(".pack"),
             "Expected .pack extension"
         );
+    }
+
+    // ── Retention ───────────────────────────────────────────────────
+    //
+    // Retention deletes files. The tests above count what survives, which is
+    // the easy half: a count still passes when the survivors have been ruined.
+    // A delta whose base was pruned is a snapshot the manifest still lists and
+    // nothing can read, and a training run finds that out at resume.
+
+    /// Weights that change a little each step, the way training leaves them,
+    /// and large enough for the delta engine to engage at all — the 100-byte
+    /// tensors the older retention tests use are under `DELTA_MIN_SIZE`, so
+    /// they never build the delta chains that make pruning dangerous.
+    fn evolving_state(step: u64) -> Vec<TensorData> {
+        let mut data = vec![7u8; 8192];
+        data[(step as usize * 37) % 8192] = step as u8;
+        data[0] = step as u8; // marker: which step these bytes are
+        vec![TensorData {
+            name: "w".into(),
+            shape: vec![8192],
+            dtype: "uint8".into(),
+            data,
+        }]
+    }
+
+    #[test]
+    fn every_snapshot_left_after_retention_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(dir.path()).unwrap());
+        let config = CoordinatorConfig {
+            world_size: 1,
+            rank: 0,
+            compression: CompressionAlgo::Zstd { level: 1 },
+            retention: RetentionPolicy {
+                max_full_snapshots: 2,
+                max_deltas_per_full: 5,
+                full_snapshot_every_steps: 3,
+                max_total_snapshots: Some(6),
+            },
+            delta_max_ratio: 0.95,
+            ..Default::default()
+        };
+        let coord = Coordinator::new(storage, config).unwrap();
+
+        // Long enough that retention prunes several times over.
+        for step in 0..14u64 {
+            coord.save(step, evolving_state(step), HashMap::new()).unwrap();
+        }
+        coord.flush().unwrap();
+
+        let snaps = coord.list_snapshots();
+        assert!(!snaps.is_empty(), "retention removed everything");
+        assert!(snaps.len() <= 6, "the total cap was not applied");
+
+        for info in &snaps {
+            let loaded = coord
+                .load(info.id)
+                .unwrap_or_else(|e| panic!("step {} survived retention but cannot be read: {e}", info.step));
+            let w = loaded.get("w").expect("tensor missing from a listed snapshot");
+            assert_eq!(
+                w[0], info.step as u8,
+                "step {} came back as the state of another step",
+                info.step
+            );
+            assert_eq!(w.len(), 8192);
+        }
+    }
+
+    /// A backend that panics rather than returning an error, standing in for
+    /// any bug that unwinds inside the save pipeline.
+    struct PanickingStorage;
+
+    impl StorageBackend for PanickingStorage {
+        fn put(&self, _rel_path: &str, _data: &[u8]) -> Result<()> {
+            panic!("disk on fire")
+        }
+        fn get(&self, rel_path: &str) -> Result<Vec<u8>> {
+            Err(MoonclipError::NotFound(rel_path.into()))
+        }
+        fn exists(&self, _rel_path: &str) -> Result<bool> {
+            Ok(false)
+        }
+        fn delete(&self, _rel_path: &str) -> Result<()> {
+            Ok(())
+        }
+        fn list(&self, _prefix: &str) -> Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// A panic on the background saver must surface as an error, never as a
+    /// hang.
+    ///
+    /// Regression: the worker died with `busy` still set and no one left to
+    /// clear it, so the next `submit` waited on the condvar forever. The
+    /// training loop stopped without a message, which on rented hardware is an
+    /// idle GPU billing until a human notices. This is exactly how the bug was
+    /// found — the test that provoked it ran for ten minutes before being
+    /// killed.
+    ///
+    /// Run on a side thread with a deadline, so a regression fails this test
+    /// instead of hanging the whole suite the way it did the first time.
+    #[test]
+    fn a_panic_in_the_save_thread_is_reported_not_hung() {
+        let (done_tx, done_rx) = mpsc::channel();
+
+        thread::spawn(move || {
+            let storage: Arc<dyn StorageBackend> = Arc::new(PanickingStorage);
+            let coord = Coordinator::new(
+                storage,
+                CoordinatorConfig {
+                    compression: CompressionAlgo::Zstd { level: 1 },
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+            let _ = coord.save(0, evolving_state(0), HashMap::new());
+            // Either this save or the flush has to report the failure; what
+            // matters is that one of them returns at all.
+            let second = coord.save(1, evolving_state(1), HashMap::new());
+            let flushed = coord.flush();
+            let _ = done_tx.send(second.is_err() || flushed.is_err());
+        });
+
+        match done_rx.recv_timeout(std::time::Duration::from_secs(30)) {
+            Ok(reported) => assert!(
+                reported,
+                "the panic was swallowed: neither the next save nor flush reported it"
+            ),
+            Err(_) => panic!(
+                "the save path hung after a panic on the background thread \
+                 instead of reporting it"
+            ),
+        }
+    }
+
+    /// `rollback_interval_steps` reaches this from the Python constructor, and
+    /// zero is the value someone will use to mean "no rollback snapshots".
+    /// Retention runs inside every save, so a panic here is a lost run.
+    #[test]
+    fn a_rollback_interval_of_zero_does_not_bring_down_the_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(dir.path()).unwrap());
+        let config = CoordinatorConfig {
+            world_size: 1,
+            rank: 0,
+            compression: CompressionAlgo::Zstd { level: 1 },
+            lineage: LineageConfig {
+                rollback_interval_steps: 0,
+                max_rollback_snapshots: 3,
+            },
+            ..Default::default()
+        };
+        let coord = Coordinator::new(storage, config).unwrap();
+
+        for step in 0..4u64 {
+            coord.save(step, evolving_state(step), HashMap::new()).unwrap();
+        }
+        coord.flush().unwrap();
+        assert!(!coord.list_snapshots().is_empty());
+    }
+
+    /// Snapshots on the rollback interval are meant to outlive the ordinary
+    /// retention cap — that is the whole point of keeping them.
+    #[test]
+    fn rollback_snapshots_survive_the_retention_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(dir.path()).unwrap());
+        let config = CoordinatorConfig {
+            world_size: 1,
+            rank: 0,
+            compression: CompressionAlgo::Zstd { level: 1 },
+            retention: RetentionPolicy {
+                max_full_snapshots: 1,
+                max_deltas_per_full: 2,
+                full_snapshot_every_steps: 2,
+                max_total_snapshots: Some(3),
+            },
+            lineage: LineageConfig {
+                rollback_interval_steps: 4,
+                max_rollback_snapshots: 3,
+            },
+            delta_max_ratio: 0.95,
+            ..Default::default()
+        };
+        let coord = Coordinator::new(storage, config).unwrap();
+
+        for step in 0..12u64 {
+            coord.save(step, evolving_state(step), HashMap::new()).unwrap();
+        }
+        coord.flush().unwrap();
+
+        let snaps = coord.list_snapshots();
+        let protected: Vec<u64> = snaps
+            .iter()
+            .filter(|s| !s.is_delta && s.step % 4 == 0)
+            .map(|s| s.step)
+            .collect();
+        assert!(
+            !protected.is_empty(),
+            "every rollback-interval snapshot was pruned; steps left: {:?}",
+            snaps.iter().map(|s| s.step).collect::<Vec<_>>()
+        );
+
+        // And they have to be readable, not merely listed.
+        for info in snaps.iter().filter(|s| !s.is_delta && s.step % 4 == 0) {
+            let loaded = coord.load(info.id).unwrap_or_else(|e| {
+                panic!("rollback snapshot at step {} cannot be read: {e}", info.step)
+            });
+            assert_eq!(loaded.get("w").unwrap()[0], info.step as u8);
+        }
     }
 }

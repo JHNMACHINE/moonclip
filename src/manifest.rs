@@ -249,6 +249,14 @@ impl Manifest {
 
     /// Get IDs of snapshots marked as rollback-safe.
     pub fn rollback_snapshot_ids(&self) -> Vec<Uuid> {
+        // Zero disables rollback protection, the same meaning zero carries
+        // for `merge_stride`, `compression_level` and `sync_every_n_saves`.
+        // Reaching the modulo with it panics, and this runs inside retention,
+        // which runs inside every save.
+        if self.lineage.rollback_interval_steps == 0 {
+            return Vec::new();
+        }
+
         self.snapshots
             .iter()
             .filter(|s| {

@@ -165,7 +165,21 @@ impl StorageBackend for LocalStorage {
             .filter(|e| e.file_type().is_file())
         {
             if let Ok(rel) = entry.path().strip_prefix(&self.root) {
-                files.push(rel.to_string_lossy().to_string());
+                // Join with '/' rather than handing back the OS separator.
+                // Every other part of this abstraction speaks '/': `put`,
+                // `get`, the manifest's `filename` fields, and S3 object keys.
+                //
+                // On Windows this returned `snapshots\s1\rank_0.pack`, and the
+                // remote syncer fed it straight to S3 as an object key. The
+                // upload succeeded and reported success — under a key nothing
+                // would ever ask for again. The checkpoint was in the bucket
+                // and unreachable, which is worse than not having uploaded it.
+                let key = rel
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("/");
+                files.push(key);
             }
         }
         Ok(files)
@@ -175,6 +189,35 @@ impl StorageBackend for LocalStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Listed keys must be usable as keys — by `get` here, and by whatever
+    /// backend the syncer is pushing to.
+    ///
+    /// Regression: this returned native separators, so on Windows the remote
+    /// syncer created S3 objects called `snapshots\s1\rank_0.pack`. The upload
+    /// reported success and the checkpoint was unreadable from then on.
+    #[test]
+    fn listed_keys_are_slash_separated_and_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalStorage::new_unaligned(dir.path()).unwrap();
+
+        store.put("snapshots/s1/rank_0.pack", b"pack bytes").unwrap();
+        store.put("snapshots/s2/rank_0.pack", b"more bytes").unwrap();
+
+        let listed = store.list("snapshots").unwrap();
+        assert_eq!(listed.len(), 2, "got {listed:?}");
+
+        for key in &listed {
+            assert!(
+                !key.contains('\\'),
+                "a listed key carries a native separator: {key:?}"
+            );
+            assert!(key.starts_with("snapshots/"), "got {key:?}");
+            // The round trip is the point: a key that cannot be read back is
+            // not a key.
+            assert!(store.get(key).is_ok(), "listed key {key} could not be read");
+        }
+    }
 
     #[test]
     fn local_roundtrip() {
