@@ -216,6 +216,7 @@ impl MoonclipManager {
         sync_every_n_saves = 100,
         save_dtype = "none",
         async_save = true,
+        keep_base_in_memory = true,
     ))]
     fn new(
         storage_root: &str,
@@ -241,6 +242,7 @@ impl MoonclipManager {
         sync_every_n_saves: u64,
         save_dtype: &str,
         async_save: bool,
+        keep_base_in_memory: bool,
     ) -> PyResult<Self> {
         let compression = if compression_level == 0 {
             CompressionAlgo::None
@@ -277,6 +279,7 @@ impl MoonclipManager {
             remote_sync: None,
             save_dtype: DType::from_str(save_dtype),
             async_save,
+            keep_base_in_memory,
         };
 
         let storage: Arc<dyn crate::storage::StorageBackend> = if let Some(bucket) = s3_bucket {

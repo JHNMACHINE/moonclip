@@ -53,6 +53,14 @@ pub struct BaseCache {
     pub entries: HashMap<String, TensorEntry>,
     /// Compression algo of the base snapshot.
     pub compression: CompressionAlgo,
+    /// Raw bytes of the base snapshot, when the coordinator kept them after
+    /// writing it. Present only for the snapshot those bytes came from.
+    ///
+    /// Reading and decompressing the base was 36% of the write path's CPU,
+    /// and it decompresses the same bytes this process wrote moments earlier.
+    /// Holding them costs one resident copy of the state and removes that
+    /// work entirely. See `CoordinatorConfig::keep_base_in_memory`.
+    pub raw: Option<Arc<HashMap<String, Vec<u8>>>>,
 }
 
 impl BaseCache {
@@ -103,16 +111,30 @@ impl BaseCache {
         compression::decompress_prefix(&compressed, &self.compression, max_raw).ok()
     }
 
-    /// Decompress a base tensor to raw bytes. Returns None for delta/skipped bases.
-    fn decompress_tensor(&self, entry: &TensorEntry) -> Result<Option<Vec<u8>>> {
+    /// Whether this tensor's base bytes are already in memory, making
+    /// `base_bytes` free and the sampled pre-check pointless.
+    fn has_raw(&self, name: &str) -> bool {
+        self.raw.as_ref().is_some_and(|r| r.contains_key(name))
+    }
+
+    /// Raw bytes of a base tensor. Returns None for delta/skipped bases.
+    ///
+    /// Borrows from the in-memory base when it is there, so the common case
+    /// costs nothing at all — not even a copy.
+    fn base_bytes(&self, entry: &TensorEntry) -> Result<Option<std::borrow::Cow<'_, [u8]>>> {
+        use std::borrow::Cow;
+
         if entry.storage != TensorStorage::Full {
             return Ok(None); // Can't delta-chain against non-full bases
         }
+        if let Some(bytes) = self.raw.as_ref().and_then(|r| r.get(&entry.name)) {
+            return Ok(Some(Cow::Borrowed(bytes.as_slice())));
+        }
         match self.read_compressed(entry)? {
-            Some(compressed) => {
-                let raw = compression::decompress(&compressed, &self.compression)?;
-                Ok(Some(raw))
-            }
+            Some(compressed) => Ok(Some(Cow::Owned(compression::decompress(
+                &compressed,
+                &self.compression,
+            )?))),
             None => Ok(None),
         }
     }
@@ -245,9 +267,17 @@ pub fn process_tensor(
                 // Judge the delta on a decompressed prefix of the base:
                 // reading a small window avoids decompressing the whole
                 // base tensor just to throw the delta away.
-                let sample = profile::time(profile::Phase::SamplePrefix, || {
-                    cache.sample_prefix(base_entry, SAMPLE_RAW)
-                });
+                // The sampled window exists to avoid decompressing a base that
+                // the delta is going to be thrown away against. With the base
+                // already in memory there is nothing to avoid, and the probe
+                // would be pure added work.
+                let sample = if cache.has_raw(&tensor.name) {
+                    None
+                } else {
+                    profile::time(profile::Phase::SamplePrefix, || {
+                        cache.sample_prefix(base_entry, SAMPLE_RAW)
+                    })
+                };
                 let sampled_verdict = match sample {
                     Some(prefix) if prefix.len() >= SAMPLE_MIN => {
                         Some(profile::time(profile::Phase::PaysOff, || {
@@ -265,7 +295,7 @@ pub fn process_tensor(
 
                 if sampled_verdict != Some(false) {
                     let base = profile::time(profile::Phase::BaseDecompress, || {
-                        cache.decompress_tensor(base_entry)
+                        cache.base_bytes(base_entry)
                     })?;
                     if let Some(base_raw) = base {
                         // Without an earlier window, take the verdict now
@@ -635,7 +665,23 @@ mod tests {
             pack_file: None,
             entries: entry_map,
             compression: compression.clone(),
+            raw: None,
         }
+    }
+
+    /// The same base, but with its raw bytes already in memory — what the
+    /// coordinator hands over when it retained the last full snapshot.
+    fn make_base_cache_in_memory(
+        storage: Arc<dyn StorageBackend>,
+        entries: Vec<TensorEntry>,
+        compression: &CompressionAlgo,
+        raw: Vec<(&str, Vec<u8>)>,
+    ) -> BaseCache {
+        let mut cache = make_base_cache(storage, entries, compression);
+        cache.raw = Some(Arc::new(
+            raw.into_iter().map(|(n, d)| (n.to_string(), d)).collect(),
+        ));
+        cache
     }
 
     #[test]
@@ -812,5 +858,346 @@ mod tests {
         assert_eq!(result.entry.storage, TensorStorage::Full);
         assert!(result.write_data.is_some());
         assert!(result.entry.sha256_compressed.is_some());
+    }
+
+    // ── Read path ───────────────────────────────────────────────────
+    //
+    // Everything above tests what a save decides. These test that the
+    // decision can be undone, which is the only thing a checkpoint is for.
+    // A save that cannot be read back is worse than no save at all: the run
+    // paid for it and finds out at resume.
+
+    /// Put processed bytes where the entry will look for them.
+    fn persist(
+        storage: &dyn StorageBackend,
+        mut entry: TensorEntry,
+        data: Option<Vec<u8>>,
+        path: &str,
+    ) -> TensorEntry {
+        if let Some(bytes) = data {
+            storage.put(path, &bytes).unwrap();
+            entry.filename = Some(path.into());
+        }
+        entry
+    }
+
+    /// A resolver over a fixed set of base entries, standing in for what the
+    /// coordinator reads out of the manifest at load time.
+    fn base_resolver(
+        entries: Vec<TensorEntry>,
+        compression: CompressionAlgo,
+    ) -> impl Fn(uuid::Uuid, &str) -> Result<(TensorEntry, CompressionAlgo, Option<Arc<Vec<u8>>>)> + Sync
+    {
+        let map: HashMap<String, TensorEntry> =
+            entries.into_iter().map(|e| (e.name.clone(), e)).collect();
+        move |_id, name| {
+            map.get(name)
+                .cloned()
+                .map(|e| (e, compression.clone(), None))
+                .ok_or_else(|| MoonclipError::NotFound(name.into()))
+        }
+    }
+
+    /// Store `data` as a Full tensor and hand back its entry, the way a first
+    /// save leaves the base snapshot.
+    fn store_base(
+        storage: &Arc<dyn StorageBackend>,
+        name: &str,
+        data: &[u8],
+        dtype: &str,
+        compression: &CompressionAlgo,
+    ) -> TensorEntry {
+        let tensor = td(name, data.to_vec(), dtype);
+        let processed = process_tensor(&tensor, None, compression, 0.95, &DType::None).unwrap();
+        assert_eq!(processed.entry.storage, TensorStorage::Full);
+        persist(
+            storage.as_ref(),
+            processed.entry,
+            processed.write_data,
+            &format!("base/{name}.bin"),
+        )
+    }
+
+    /// Keeping the base in memory is an optimisation, so the only thing that
+    /// matters is that it changes nothing: the same delta, byte for byte, as
+    /// the base read back from disk.
+    #[test]
+    fn an_in_memory_base_produces_the_same_delta_as_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(dir.path()).unwrap());
+        let compression = CompressionAlgo::Zstd { level: 1 };
+
+        let v1 = noise(40_000, 0x1357);
+        let base_entry = store_base(&storage, "w", &v1, "float32", &compression);
+
+        let mut v2 = v1.clone();
+        v2[7] ^= 0x3f;
+        v2[30_000] ^= 0x81;
+        let tensor = td("w", v2, "float32");
+
+        let from_disk = process_tensor(
+            &tensor,
+            Some(&make_base_cache(
+                Arc::clone(&storage),
+                vec![base_entry.clone()],
+                &compression,
+            )),
+            &compression,
+            0.95,
+            &DType::None,
+        )
+        .unwrap();
+
+        let from_memory = process_tensor(
+            &tensor,
+            Some(&make_base_cache_in_memory(
+                Arc::clone(&storage),
+                vec![base_entry],
+                &compression,
+                vec![("w", v1)],
+            )),
+            &compression,
+            0.95,
+            &DType::None,
+        )
+        .unwrap();
+
+        assert_eq!(from_disk.entry.storage, TensorStorage::DeltaXor);
+        assert_eq!(from_memory.entry.storage, from_disk.entry.storage);
+        assert_eq!(from_memory.entry.sha256_raw, from_disk.entry.sha256_raw);
+        assert_eq!(from_memory.entry.shuffled, from_disk.entry.shuffled);
+        assert_eq!(
+            from_memory.write_data, from_disk.write_data,
+            "the retained base must produce an identical delta"
+        );
+    }
+
+    /// Proves the retained bytes are actually what gets used: there is no
+    /// base on disk at all here, so a delta can only come from memory.
+    #[test]
+    fn an_in_memory_base_needs_no_disk_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(dir.path()).unwrap());
+        let compression = CompressionAlgo::Zstd { level: 1 };
+
+        let v1 = noise(40_000, 0x2468);
+        // An entry that describes a file which was never written.
+        let base_entry = TensorEntry {
+            name: "w".into(),
+            shape: vec![40_000],
+            dtype: "float32".into(),
+            original_dtype: None,
+            storage: TensorStorage::Full,
+            alias_of: None,
+            filename: Some("nowhere/w.bin".into()),
+            offset: 0,
+            compressed_size: 1234,
+            raw_size: 40_000,
+            sha256_raw: hash_hex(&v1),
+            sha256_compressed: None,
+            shuffled: false,
+        };
+
+        let mut v2 = v1.clone();
+        v2[900] ^= 0x11;
+        let cache = make_base_cache_in_memory(
+            Arc::clone(&storage),
+            vec![base_entry],
+            &compression,
+            vec![("w", v1)],
+        );
+
+        let processed = process_tensor(
+            &td("w", v2, "float32"),
+            Some(&cache),
+            &compression,
+            0.95,
+            &DType::None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            processed.entry.storage,
+            TensorStorage::DeltaXor,
+            "with no base on disk, a delta can only have come from memory"
+        );
+    }
+
+    #[test]
+    fn a_full_tensor_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(dir.path()).unwrap());
+        let compression = CompressionAlgo::Zstd { level: 1 };
+
+        let data = noise(40_000, 0x11);
+        let entry = store_base(&storage, "w", &data, "float32", &compression);
+
+        let resolve = base_resolver(vec![], compression.clone());
+        let got =
+            load_tensor(&entry, None, storage.as_ref(), &compression, None, &resolve).unwrap();
+        assert_eq!(got, data);
+    }
+
+    /// The guarantee the byte-shuffle format change rests on. If the filter
+    /// were inverted wrongly this would not raise — it would hand back
+    /// plausible noise — so the assertion has to be on the bytes.
+    #[test]
+    fn a_shuffled_delta_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(dir.path()).unwrap());
+        let compression = CompressionAlgo::Zstd { level: 1 };
+        let base_id = uuid::Uuid::new_v4();
+
+        let v1 = noise(40_000, 0xabcd);
+        let base_entry = store_base(&storage, "w", &v1, "float32", &compression);
+
+        let mut v2 = v1.clone();
+        v2[100] ^= 0xff;
+        v2[20_000] ^= 0x0f;
+
+        let cache = make_base_cache(
+            Arc::clone(&storage),
+            vec![base_entry.clone()],
+            &compression,
+        );
+        let tensor = td("w", v2.clone(), "float32");
+        let processed = process_tensor(&tensor, Some(&cache), &compression, 0.95, &DType::None)
+            .unwrap();
+
+        assert_eq!(processed.entry.storage, TensorStorage::DeltaXor);
+        assert!(
+            processed.entry.shuffled,
+            "an fp32 delta must go through the byte shuffle"
+        );
+
+        let entry = persist(
+            storage.as_ref(),
+            processed.entry,
+            processed.write_data,
+            "delta/w.bin",
+        );
+        let resolve = base_resolver(vec![base_entry], compression.clone());
+        let got = load_tensor(
+            &entry,
+            Some(base_id),
+            storage.as_ref(),
+            &compression,
+            None,
+            &resolve,
+        )
+        .unwrap();
+        assert_eq!(got, v2, "the delta must reconstruct the updated tensor");
+    }
+
+    #[test]
+    fn a_skipped_tensor_resolves_through_the_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(dir.path()).unwrap());
+        let compression = CompressionAlgo::Zstd { level: 1 };
+        let base_id = uuid::Uuid::new_v4();
+
+        let data = noise(40_000, 0x55);
+        let base_entry = store_base(&storage, "w", &data, "float32", &compression);
+
+        let cache = make_base_cache(
+            Arc::clone(&storage),
+            vec![base_entry.clone()],
+            &compression,
+        );
+        let tensor = td("w", data.clone(), "float32");
+        let processed = process_tensor(&tensor, Some(&cache), &compression, 0.95, &DType::None)
+            .unwrap();
+        assert_eq!(processed.entry.storage, TensorStorage::Skipped);
+        assert!(processed.write_data.is_none(), "a skip writes no bytes");
+
+        // The snapshot stores nothing for this tensor, so the whole value has
+        // to come from the base.
+        let resolve = base_resolver(vec![base_entry], compression.clone());
+        let got = load_tensor(
+            &processed.entry,
+            Some(base_id),
+            storage.as_ref(),
+            &compression,
+            None,
+            &resolve,
+        )
+        .unwrap();
+        assert_eq!(got, data);
+    }
+
+    /// Corruption has to be reported, not returned. Weights that are subtly
+    /// wrong restart a run that then trains on garbage.
+    #[test]
+    fn corrupted_bytes_are_caught_not_returned() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(dir.path()).unwrap());
+        let compression = CompressionAlgo::Zstd { level: 1 };
+
+        let data = noise(40_000, 0x77);
+        let entry = store_base(&storage, "w", &data, "float32", &compression);
+
+        let path = entry.filename.clone().unwrap();
+        let mut stored = storage.get(&path).unwrap();
+        stored[entry.compressed_size as usize / 2] ^= 0xff;
+        storage.put(&path, &stored).unwrap();
+
+        let resolve = base_resolver(vec![], compression.clone());
+        let result = load_tensor(&entry, None, storage.as_ref(), &compression, None, &resolve);
+        assert!(
+            matches!(result, Err(MoonclipError::IntegrityError { .. })),
+            "expected an integrity error, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn an_alias_cannot_be_loaded_on_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(dir.path()).unwrap());
+        let compression = CompressionAlgo::Zstd { level: 1 };
+
+        let data = noise(40_000, 0x99);
+        let target = store_base(&storage, "token_emb", &data, "float32", &compression);
+        let alias = make_alias_entry(&td("head", data, "float32"), &target);
+
+        let resolve = base_resolver(vec![], compression.clone());
+        let err = load_tensor(&alias, None, storage.as_ref(), &compression, None, &resolve)
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("token_emb"),
+            "the error must name the tensor holding the bytes, got: {message}"
+        );
+    }
+
+    /// Saving in bf16 to halve the checkpoint must still hand training back
+    /// fp32 buffers, or `load_state_dict` fails on dtype.
+    #[test]
+    fn a_cast_tensor_comes_back_in_its_original_dtype() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(dir.path()).unwrap());
+        let compression = CompressionAlgo::Zstd { level: 1 };
+
+        let data = noise(40_000, 0xbb);
+        let tensor = td("w", data.clone(), "float32");
+        let processed =
+            process_tensor(&tensor, None, &compression, 0.95, &DType::BFloat16).unwrap();
+
+        assert_eq!(processed.entry.dtype, "bfloat16");
+        assert_eq!(processed.entry.original_dtype.as_deref(), Some("float32"));
+        assert_eq!(
+            processed.entry.raw_size as usize,
+            data.len() / 2,
+            "bf16 is half of fp32 on disk"
+        );
+
+        let entry = persist(storage.as_ref(), processed.entry, processed.write_data, "w.bin");
+        let resolve = base_resolver(vec![], compression.clone());
+        let got =
+            load_tensor(&entry, None, storage.as_ref(), &compression, None, &resolve).unwrap();
+        assert_eq!(
+            got.len(),
+            data.len(),
+            "load must uncast back to fp32 width, not hand back bf16"
+        );
     }
 }

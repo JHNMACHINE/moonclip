@@ -253,6 +253,7 @@ class CheckpointManager:
         save_dtype: str = "none",
         max_total_snapshots: Optional[int] = None,
         async_save: bool = True,
+        keep_base_in_memory: bool = True,
         **kwargs,
     ):
         from moonclip import MoonclipManager
@@ -294,6 +295,7 @@ class CheckpointManager:
             save_dtype=save_dtype,
             max_total_snapshots=max_total_snapshots,
             async_save=async_save,
+            keep_base_in_memory=keep_base_in_memory,
             **kwargs,
         )
 
