@@ -3,8 +3,9 @@ from typing import Any, Dict, List, Optional, Tuple
 def flatten_state_dict(
     state_dict: dict,
     prefix: str = "",
+    as_tensors: bool = False,
 ) -> Tuple[dict, Any]:
-    """Flatten a PyTorch state_dict into individual tensor bytes."""
+    """Flatten a PyTorch state_dict into individual tensors."""
     ...
 
 class CheckpointManager:

@@ -1,5 +1,5 @@
 use pyo3::prelude::*;
-use pyo3::types::{PyByteArray, PyDict, PyString, PyTuple};
+use pyo3::types::{PyByteArray, PyBytes, PyDict, PyString, PyTuple};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -40,9 +40,9 @@ fn get_element_size(dtype: &str) -> PyResult<usize> {
     }
 }
 
-/// Tensor data captured under the GIL. Large torch tensors are kept as a
-/// raw pointer + length so the actual byte copy happens in parallel with
-/// the GIL released.
+/// Tensor data captured under the GIL. Anything large is kept as a raw
+/// pointer + length so the actual byte copy happens in parallel with the
+/// GIL released, instead of serially inside the collect loop.
 enum PendingBytes {
     Owned(Vec<u8>),
     Borrowed { ptr: usize, len: usize },
@@ -55,6 +55,24 @@ struct PendingTensor {
     bytes: PendingBytes,
 }
 
+/// Borrow a Python buffer without copying it, if that is safe to do.
+///
+/// Only `bytes` qualifies: it is immutable, so nothing can resize or free it
+/// while the GIL is released, and the caller's dict holds it alive for the
+/// whole call. `bytearray` and everything else fall back to a copy taken here
+/// under the GIL — a mutable buffer could be reallocated out from under the
+/// borrowed pointer.
+fn borrow_or_copy(value: &Bound<'_, PyAny>) -> PyResult<PendingBytes> {
+    if let Ok(b) = value.cast::<PyBytes>() {
+        let slice = b.as_bytes();
+        return Ok(PendingBytes::Borrowed {
+            ptr: slice.as_ptr() as usize,
+            len: slice.len(),
+        });
+    }
+    Ok(PendingBytes::Owned(value.extract::<Vec<u8>>()?))
+}
+
 fn collect_tensors(tensors: &Bound<'_, PyDict>) -> PyResult<Vec<PendingTensor>> {
     let mut result = Vec::new();
     for (key, value) in tensors.iter() {
@@ -63,12 +81,12 @@ fn collect_tensors(tensors: &Bound<'_, PyDict>) -> PyResult<Vec<PendingTensor>> 
         if let Ok(tuple) = value.cast::<PyTuple>() {
             let shape: Vec<usize> = tuple.get_item(0)?.extract()?;
             let dtype: String = tuple.get_item(1)?.extract()?;
-            let data: Vec<u8> = tuple.get_item(2)?.extract()?;
+            let bytes = borrow_or_copy(&tuple.get_item(2)?)?;
             result.push(PendingTensor {
                 name,
                 shape,
                 dtype,
-                bytes: PendingBytes::Owned(data),
+                bytes,
             });
         }
         // Nuovo formato: tensore PyTorch direttamente. `value` is already a
@@ -81,6 +99,30 @@ fn collect_tensors(tensors: &Bound<'_, PyDict>) -> PyResult<Vec<PendingTensor>> 
                 .strip_prefix("torch.")
                 .unwrap_or(&dtype_full)
                 .to_string();
+
+            // Both checks guard the raw read below, and neither is paranoia:
+            // `data_ptr()` on a CUDA tensor is a device address, and reading it
+            // as host memory is a segfault at best. A non-contiguous tensor's
+            // elements are not the `numel * element_size` bytes that follow the
+            // pointer, so the read would silently store the wrong data — and
+            // could run past the end of the storage. Refuse both; the caller
+            // gets a message naming the fix.
+            let device = value.getattr("device")?.getattr("type")?.extract::<String>()?;
+            if device != "cpu" {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "tensor '{}' is on device '{}'; move it to CPU first \
+                     (t.detach().cpu()) — Moonclip reads host memory directly",
+                    name, device
+                )));
+            }
+            if !value.call_method0("is_contiguous")?.extract::<bool>()? {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "tensor '{}' is not contiguous; call .contiguous() first — \
+                     Moonclip reads the bytes that follow data_ptr()",
+                    name
+                )));
+            }
+
             let numel: usize = value.call_method0("numel")?.extract()?;
             let data_ptr: usize = value.call_method0("data_ptr")?.extract()?;
             let element_size = get_element_size(&format!("torch.{}", dtype))?;
@@ -106,10 +148,15 @@ fn collect_tensors(tensors: &Bound<'_, PyDict>) -> PyResult<Vec<PendingTensor>> 
 
 /// Copy pending tensor bytes into owned buffers, in parallel.
 ///
-/// SAFETY: borrowed pointers come from CPU-contiguous torch tensors held
-/// alive by the caller's Python dict for the whole duration of the call;
-/// this runs (with the GIL released) strictly within that window and only
-/// reads the raw bytes.
+/// This is the shadow copy, and it is the only full copy of the state that
+/// the save path takes: it exists so the training loop can mutate its tensors
+/// again the moment `save` returns, while the writer works from these buffers.
+///
+/// SAFETY: borrowed pointers come either from CPU-contiguous torch tensors
+/// (checked in `collect_tensors`) or from immutable `bytes` objects. Both are
+/// held alive by the caller's dict for the whole duration of the call, and
+/// this runs — with the GIL released, so the training thread is still blocked
+/// inside the call — strictly within that window, reading and never writing.
 fn materialize_tensors(pending: Vec<PendingTensor>) -> Vec<TensorData> {
     use rayon::prelude::*;
 
@@ -118,6 +165,10 @@ fn materialize_tensors(pending: Vec<PendingTensor>) -> Vec<TensorData> {
         .map(|p| {
             let data = match p.bytes {
                 PendingBytes::Owned(v) => v,
+                // An empty tensor's `data_ptr()` may be null, and
+                // `from_raw_parts` requires a non-null pointer even for a
+                // zero length.
+                PendingBytes::Borrowed { len: 0, .. } => Vec::new(),
                 PendingBytes::Borrowed { ptr, len } => {
                     unsafe { std::slice::from_raw_parts(ptr as *const u8, len) }.to_vec()
                 }

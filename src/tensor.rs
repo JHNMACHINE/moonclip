@@ -7,6 +7,7 @@ use crate::delta;
 use crate::error::{Result, MoonclipError};
 use crate::hash::hash_hex;
 use crate::manifest::{CompressionAlgo, TensorEntry, TensorStorage};
+use crate::profile;
 use crate::storage::StorageBackend;
 
 /// A tensor ready to be saved: name + raw bytes + metadata.
@@ -135,7 +136,9 @@ impl BaseCache {
 pub fn dedup_plan(tensors: &[TensorData]) -> Vec<Option<String>> {
     use rayon::prelude::*;
 
-    let hashes: Vec<String> = tensors.par_iter().map(|t| hash_hex(&t.data)).collect();
+    let hashes: Vec<String> = profile::time(profile::Phase::DedupHash, || {
+        tensors.par_iter().map(|t| hash_hex(&t.data)).collect()
+    });
 
     let mut first_seen: HashMap<(&str, &str), &str> = HashMap::new();
     let mut plan = vec![None; tensors.len()];
@@ -199,7 +202,7 @@ pub fn process_tensor(
             (Cow::Borrowed(&tensor.data), Cow::Borrowed(&tensor.dtype))
         };
 
-    let raw_hash = hash_hex(&working_data);
+    let raw_hash = profile::time(profile::Phase::RawHash, || hash_hex(&working_data));
 
     // Determine original_dtype field (set only if we actually cast)
     let orig_dtype = if *working_dtype != tensor.dtype {
@@ -239,34 +242,46 @@ pub fn process_tensor(
                 // Judge the delta on a decompressed prefix of the base:
                 // reading a small window avoids decompressing the whole
                 // base tensor just to throw the delta away.
-                let sampled_verdict = match cache.sample_prefix(base_entry, SAMPLE_RAW) {
-                    Some(prefix) if prefix.len() >= SAMPLE_MIN => Some(delta::pays_off(
-                        &prefix,
-                        &working_data,
-                        compression,
-                        delta_max_ratio,
-                    )),
+                let sample = profile::time(profile::Phase::SamplePrefix, || {
+                    cache.sample_prefix(base_entry, SAMPLE_RAW)
+                });
+                let sampled_verdict = match sample {
+                    Some(prefix) if prefix.len() >= SAMPLE_MIN => {
+                        Some(profile::time(profile::Phase::PaysOff, || {
+                            delta::pays_off(&prefix, &working_data, compression, delta_max_ratio)
+                        }))
+                    }
                     _ => None, // no usable window → decide after decompressing
                 };
 
                 if sampled_verdict != Some(false) {
-                    if let Some(base_raw) = cache.decompress_tensor(base_entry)? {
+                    let base = profile::time(profile::Phase::BaseDecompress, || {
+                        cache.decompress_tensor(base_entry)
+                    })?;
+                    if let Some(base_raw) = base {
                         // Without an earlier window, take the verdict now
                         // from the decompressed base — no extra I/O here.
                         let worth_it = sampled_verdict.unwrap_or_else(|| {
-                            delta::pays_off(
-                                &base_raw,
-                                &working_data,
-                                compression,
-                                delta_max_ratio,
-                            )
+                            profile::time(profile::Phase::PaysOff, || {
+                                delta::pays_off(
+                                    &base_raw,
+                                    &working_data,
+                                    compression,
+                                    delta_max_ratio,
+                                )
+                            })
                         });
 
-                        if let Some(xor_delta) = worth_it
-                            .then(|| delta::compute_delta(&base_raw, &working_data))
-                            .flatten()
-                        {
-                            let compressed = compression::compress(&xor_delta, compression)?;
+                        let xor = profile::time(profile::Phase::XorDelta, || {
+                            worth_it
+                                .then(|| delta::compute_delta(&base_raw, &working_data))
+                                .flatten()
+                        });
+                        if let Some(xor_delta) = xor {
+                            let compressed =
+                                profile::time(profile::Phase::CompressDelta, || {
+                                    compression::compress(&xor_delta, compression)
+                                })?;
                             let compressed_hash = hash_hex(&compressed);
 
                             return Ok(ProcessedTensor {
@@ -305,7 +320,9 @@ fn make_full_entry(
     raw_hash: &str,
     compression: &CompressionAlgo,
 ) -> Result<ProcessedTensor> {
-    let compressed = compression::compress(working_data, compression)?;
+    let compressed = profile::time(profile::Phase::CompressFull, || {
+        compression::compress(working_data, compression)
+    })?;
     let compressed_hash = hash_hex(&compressed);
 
     Ok(ProcessedTensor {

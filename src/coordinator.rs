@@ -256,6 +256,8 @@ impl Core {
         metadata: HashMap<String, String>,
     ) -> Result<()> {
         let snap_dir = format!("snapshots/{}", snap_id);
+        let save_started = std::time::Instant::now();
+        let raw_bytes: u64 = tensors.iter().map(|t| t.data.len() as u64).sum();
 
         let manifest = self.manifest.lock().unwrap();
         let force_full = manifest.should_force_full(step);
@@ -298,6 +300,12 @@ impl Core {
         if let Some(ref syncer) = self.syncer {
             syncer.notify_save();
         }
+
+        crate::profile::report(
+            &format!("step {step}"),
+            save_started.elapsed(),
+            raw_bytes,
+        );
 
         Ok(())
     }
@@ -651,7 +659,9 @@ impl Core {
                 .filter_map(|pt| pt.write_data.as_deref())
                 .collect();
             let pack_filename = format!("{}/rank_{}.pack", snap_dir, self.config.rank);
-            self.storage.put_parts(&pack_filename, &parts)?;
+            crate::profile::time(crate::profile::Phase::PackWrite, || {
+                self.storage.put_parts(&pack_filename, &parts)
+            })?;
             Some(pack_filename)
         } else {
             None
