@@ -61,10 +61,57 @@ jobs:
             fi
           done
 
-      - name: Publish to Codeberg Packages
-        env:
-          TWINE_REPOSITORY_URL: ${{ forgejo.server_url }}/api/packages/${{ forgejo.repository_owner }}/pypi
-          TWINE_USERNAME: ${{ forgejo.repository_owner }}
-          TWINE_PASSWORD: ${{ secrets.PUBLISH_TOKEN }}
+      # The tag is what someone installs; the version inside the wheel is what
+      # pip believes. A mismatch publishes a release nobody asked for, and it
+      # cannot be taken back — PyPI and crates.io both refuse to reuse a
+      # version number. So this is checked before anything is uploaded.
+      - name: Tag must match the package version
         run: |
+          set -eu
+          VERSION=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          PY_VERSION=$(grep -m1 '^version = ' pyproject.toml | cut -d'"' -f2)
+          TAG="${{ forgejo.ref_name }}"
+          echo "Cargo.toml $VERSION, pyproject.toml $PY_VERSION, tag $TAG"
+          if [ "$VERSION" != "$PY_VERSION" ]; then
+            echo "Cargo.toml and pyproject.toml disagree" >&2
+            exit 1
+          fi
+          if [ "v$VERSION" != "$TAG" ]; then
+            echo "Tag $TAG does not match version $VERSION" >&2
+            exit 1
+          fi
+
+      - name: Check the artifacts
+        run: /opt/python/cp312-cp312/bin/twine check target/wheels/*.whl
+
+      # PyPI and crates.io only. Codeberg Packages used to get a copy of the
+      # same wheels, which bought nothing: identical bytes at an address almost
+      # nobody would point pip at, and a second token to keep alive.
+      - name: Publish to PyPI
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
+        run: |
+          set -eu
+          if [ -z "${TWINE_PASSWORD:-}" ]; then
+            echo "PYPI_TOKEN is not set: a tag was pushed but nothing would" >&2
+            echo "reach PyPI. Add the secret, or remove this step on purpose." >&2
+            exit 1
+          fi
           /opt/python/cp312-cp312/bin/twine upload target/wheels/*.whl
+
+      # The crate, which is the half of this project that has no wheel. The
+      # verification build compiles without `extension-module`, so it does not
+      # need a Python interpreter to link against.
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -eu
+          . "$HOME/.cargo/env"
+          if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
+            echo "CARGO_REGISTRY_TOKEN is not set: the wheels went out but the" >&2
+            echo "crate would not. Add the secret, or remove this step." >&2
+            exit 1
+          fi
+          cargo publish --locked

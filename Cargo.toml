@@ -1,6 +1,6 @@
 [package]
 name = "moonclip"
-version = "0.0.3"
+version = "0.0.4"
 edition = "2021"
 # Set by pyo3 0.29, the highest MSRV among the dependencies. Declared so a
 # toolchain that is too old fails with that message instead of an unrelated
@@ -9,6 +9,26 @@ rust-version = "1.83"
 description = "High-performance checkpoint management for ML training"
 license = "Apache-2.0"
 repository = "https://codeberg.org/JHNMACHINE/moonclip"
+readme = "README.md"
+
+# What crates.io distributes is the Rust library. The Python package, its
+# tests and the Python benchmarks travel in the wheel instead, and shipping
+# them here did more than waste space: `cargo publish` refused to verify the
+# tarball, because running the build inside the packaged copy left
+# `__pycache__` directories behind and cargo reads that as a build script
+# modifying the source tree.
+#
+# `benches/delta_bench.rs` and `tests/s3_minio.rs` are Rust and stay.
+exclude = [
+    "python/**",
+    "bench/**",
+    "bench_baseline/**",
+    "examples/**",
+    "tests/*.py",
+    "tests/*.sh",
+    ".forgejo/**",
+    "**/__pycache__/**",
+]
 
 [lib]
 name = "moonclip"
