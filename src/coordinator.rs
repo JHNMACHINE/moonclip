@@ -1213,26 +1213,61 @@ impl Core {
         }
 
         // ── Pass 2: Cap total snapshot count ─────────────────────────
-        // Remove oldest snapshots (full groups) until total ≤ max_total.
+        //
+        // Oldest *delta* first, one at a time. Removing whole groups here is
+        // what the cap used to do, and it is catastrophic in the configuration
+        // that matters: every delta is computed against the last full, so an
+        // ordinary run is a single group thousands of steps long. Dropping
+        // "the oldest group" to get under the cap then deletes the base and
+        // every delta hanging off it — the entire history, not its oldest
+        // slice. Measured: three snapshots with `max_total_snapshots: 2` left
+        // **zero**, and `keep_last` is exactly this knob.
+        //
+        // A delta is a leaf: nothing is stored against it, so dropping the
+        // oldest costs one restore point and nothing else. The full stays for
+        // as long as a delta still needs it as a base — which means the oldest
+        // surviving step may be a full older than the cap would suggest, and
+        // that is the honest answer rather than an unreadable checkpoint.
         loop {
             let total = manifest.snapshots.iter().filter(|s| s.finalized).count();
             if total <= max_total {
                 break;
             }
 
-            // Find oldest removable full snapshot
-            let oldest_removable = manifest
+            let oldest_delta = manifest
                 .snapshots
                 .iter()
                 .find(|s| {
-                    s.base_snapshot_id.is_none()
+                    s.base_snapshot_id.is_some()
                         && s.finalized
                         && !rollback_ids.contains(&s.id)
                 })
                 .map(|s| s.id);
 
-            match oldest_removable {
-                Some(oldest_id) => self.remove_snapshot_group(manifest, oldest_id)?,
+            if let Some(delta_id) = oldest_delta {
+                self.remove_snapshots(manifest, &[delta_id])?;
+                continue;
+            }
+
+            // Nothing but fulls left, so a group is now a single snapshot and
+            // removing one loses only itself. Never the last one though: a cap
+            // of one means one checkpoint, not none.
+            let removable_fulls: Vec<Uuid> = manifest
+                .snapshots
+                .iter()
+                .filter(|s| {
+                    s.base_snapshot_id.is_none()
+                        && s.finalized
+                        && !rollback_ids.contains(&s.id)
+                })
+                .map(|s| s.id)
+                .collect();
+
+            if max_total >= 1 && removable_fulls.len() <= 1 {
+                break;
+            }
+            match removable_fulls.first() {
+                Some(&oldest_id) => self.remove_snapshot_group(manifest, oldest_id)?,
                 None => break,
             }
         }
@@ -1249,7 +1284,14 @@ impl Core {
             .filter(|s| s.id == full_id || s.base_snapshot_id == Some(full_id))
             .map(|s| s.id)
             .collect();
+        self.remove_snapshots(manifest, &to_remove)
+    }
 
+    /// Delete these snapshots' data and drop them from the manifest.
+    ///
+    /// The caller owns the question of what is safe to remove: a delta can go
+    /// on its own, a full only with everything computed against it.
+    fn remove_snapshots(&self, manifest: &mut Manifest, to_remove: &[Uuid]) -> Result<()> {
         // Delete files from storage
         for snap in manifest
             .snapshots
@@ -2265,6 +2307,94 @@ mod tests {
             dtype: "uint8".into(),
             data,
         }]
+    }
+
+    /// `keep_last: N` must keep the last N, not zero.
+    ///
+    /// The older retention tests all use a short `full_snapshot_every_steps`,
+    /// so they build many small groups and pruning one whole group leaves the
+    /// others. The configuration that ships is the opposite — one full, then
+    /// deltas for thousands of steps, all in a single group — and there the
+    /// total cap used to remove that group and erase the entire history.
+    ///
+    /// Found on a real run: 8 GPUs, `keep_last: 2`, three checkpoints handed
+    /// off, and an empty store at the end.
+    #[test]
+    fn the_total_cap_trims_the_history_instead_of_erasing_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(dir.path()).unwrap());
+        let coord = Coordinator::new(
+            Arc::clone(&storage),
+            CoordinatorConfig {
+                compression: CompressionAlgo::Zstd { level: 1 },
+                retention: RetentionPolicy {
+                    max_full_snapshots: 5,
+                    max_deltas_per_full: 10,
+                    // One full at the start, everything after it a delta
+                    // against it: what a training run actually looks like.
+                    full_snapshot_every_steps: 5000,
+                    max_total_snapshots: Some(2),
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        for step in 0..3u64 {
+            coord.save(step, evolving_state(step), HashMap::new()).unwrap();
+        }
+        coord.flush().unwrap();
+
+        let snaps = coord.list_snapshots();
+        assert!(
+            !snaps.is_empty(),
+            "the total cap erased every checkpoint the run had written"
+        );
+        assert_eq!(snaps.len(), 2, "the cap is two, so two survive");
+
+        // The newest must be there — it is the one a resume would take — and
+        // the base it deltas against has to have survived with it.
+        assert_eq!(snaps.last().unwrap().step, 2, "the newest step was pruned");
+        for info in &snaps {
+            let loaded = coord.load(info.id).unwrap_or_else(|e| {
+                panic!("step {} survived the cap but cannot be read: {e}", info.step)
+            });
+            assert_eq!(loaded.get("w").unwrap()[0], info.step as u8);
+        }
+    }
+
+    /// The cap must still bite once the history is all fulls, and still not
+    /// take the last one.
+    ///
+    /// Starts at step 1: step 0 is a multiple of `rollback_interval_steps` and
+    /// is therefore rollback-protected, which is a different rule and has its
+    /// own test.
+    #[test]
+    fn the_total_cap_still_prunes_a_history_of_fulls() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(dir.path()).unwrap());
+        let coord = Coordinator::new(
+            Arc::clone(&storage),
+            CoordinatorConfig {
+                compression: CompressionAlgo::Zstd { level: 1 },
+                retention: RetentionPolicy {
+                    max_full_snapshots: 10,
+                    max_deltas_per_full: 10,
+                    full_snapshot_every_steps: 1, // every save is a full
+                    max_total_snapshots: Some(2),
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        for step in 1..6u64 {
+            coord.save(step, evolving_state(step), HashMap::new()).unwrap();
+        }
+        coord.flush().unwrap();
+
+        let steps: Vec<u64> = coord.list_snapshots().iter().map(|s| s.step).collect();
+        assert_eq!(steps, vec![4, 5], "the cap should keep the newest two");
     }
 
     #[test]
