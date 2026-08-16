@@ -431,9 +431,14 @@ impl MoonclipManager {
         py.detach(|| self.inner.merge_now());
     }
 
-    /// Force sync to remote storage.
-    fn sync_now(&self, py: Python<'_>) {
-        py.detach(|| self.inner.sync_now());
+    /// Push everything to remote storage and wait for it.
+    ///
+    /// Raises if the data did not reach the remote, rather than logging and
+    /// returning: a run whose checkpoints are not leaving the machine should
+    /// find out while it can still do something about it.
+    fn sync_now(&self, py: Python<'_>) -> PyResult<()> {
+        py.detach(|| self.inner.sync_now())?;
+        Ok(())
     }
 }
 

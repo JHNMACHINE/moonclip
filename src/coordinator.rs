@@ -271,9 +271,13 @@ impl Coordinator {
     }
 
     /// Force sync all local data to remote storage immediately.
-    pub fn sync_now(&self) {
+    /// Push everything to remote storage and wait for it.
+    ///
+    /// Returns the outcome rather than swallowing it: a run that cannot learn
+    /// its checkpoints never left the machine has no way to react.
+    pub fn sync_now(&self) -> Result<()> {
         self.wait_idle();
-        self.core.sync_now();
+        self.core.sync_now()
     }
 }
 
@@ -616,9 +620,10 @@ impl Core {
         }
     }
 
-    fn sync_now(&self) {
-        if let Some(ref syncer) = self.syncer {
-            syncer.sync_now();
+    fn sync_now(&self) -> Result<()> {
+        match self.syncer {
+            Some(ref syncer) => syncer.sync_now(),
+            None => Ok(()),
         }
     }
 

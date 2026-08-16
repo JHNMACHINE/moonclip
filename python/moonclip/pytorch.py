@@ -535,7 +535,12 @@ class CheckpointManager:
         self._mgr.merge_now()
 
     def sync_now(self):
-        """Force sync all local data to remote storage."""
+        """Push all local data to remote storage and wait for it.
+
+        Blocks until the upload finishes, and raises if it did not: a run
+        whose checkpoints are not reaching the remote should find that out
+        while it can still react, not discover it after the instance is gone.
+        """
         self._mgr.sync_now()
 
     def flush(self):
