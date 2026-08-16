@@ -43,6 +43,17 @@ pub trait StorageBackend: Send + Sync {
     /// Delete a file at the given relative path.
     fn delete(&self, rel_path: &str) -> Result<()>;
 
+    /// Remove a directory, once whatever it held has been deleted.
+    ///
+    /// Object stores have no directories — a "folder" there is just a shared
+    /// key prefix that stops existing when the last object under it does — so
+    /// the default is to do nothing, which is the correct behaviour for S3.
+    /// Filesystem backends override it to drop the empty directory that
+    /// `delete` leaves behind.
+    fn remove_dir(&self, _rel_path: &str) -> Result<()> {
+        Ok(())
+    }
+
     /// List all files under a relative prefix.
     fn list(&self, prefix: &str) -> Result<Vec<String>>;
 }
@@ -148,6 +159,18 @@ impl StorageBackend for LocalStorage {
         let path = self.full_path(rel_path);
         if path.exists() {
             std::fs::remove_file(&path)?;
+        }
+        Ok(())
+    }
+
+    fn remove_dir(&self, rel_path: &str) -> Result<()> {
+        let path = self.full_path(rel_path);
+        if path.is_dir() {
+            // `remove_dir`, never `remove_dir_all`: this only succeeds on an
+            // empty directory, so a path derived wrongly can at worst fail. A
+            // recursive delete here would turn a bug in the caller's path
+            // arithmetic into lost checkpoints.
+            let _ = std::fs::remove_dir(&path);
         }
         Ok(())
     }

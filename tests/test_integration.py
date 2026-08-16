@@ -243,12 +243,23 @@ class TestIntegrity:
         snap_id = mgr.save_tensors(step=1, tensors=make_tensors(42))
         mgr.flush()  # wait for the background save before touching files
 
+        # Past the pack header, which is where tensor data starts.
+        #
+        # This used to write at offset 0, back when a pack was nothing but
+        # concatenated tensor blobs. A pack now opens with a 32-byte header
+        # describing its own contents, so corrupting offset 0 damages the
+        # description and leaves every tensor intact — the load then succeeds
+        # and the test proves nothing. The load path reads tensors at the
+        # offsets the manifest records and never looks at the header, so the
+        # bytes that matter here are the ones after it.
+        PACK_HEADER_LEN = 32
+
         corrupted = 0
         for root, dirs, files in os.walk(str(tmp_path / "snapshots")):
             for f in files:
                 if f.endswith(".pack"):
                     with open(os.path.join(root, f), "r+b") as fh:
-                        fh.seek(0)
+                        fh.seek(PACK_HEADER_LEN)
                         fh.write(b"\xFF\xFF\xFF\xFF")
                     corrupted += 1
         assert corrupted > 0

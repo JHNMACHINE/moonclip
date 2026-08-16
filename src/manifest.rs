@@ -50,10 +50,15 @@ pub struct TensorEntry {
     /// Byte size of raw (uncompressed) tensor data.
     pub raw_size: u64,
     /// Hash of the raw tensor bytes (used for skip detection).
-    /// xxHash3-128 in v2+ format, SHA-256 in legacy.
-    pub sha256_raw: String,
+    ///
+    /// xxHash3-128, and has been since v2 — the old `sha256_` name outlived
+    /// the algorithm by long enough to be quoted as fact in review. The alias
+    /// keeps manifests written under the old name readable.
+    #[serde(alias = "sha256_raw")]
+    pub hash_raw: String,
     /// Hash of the compressed data on disk (None if Skipped).
-    pub sha256_compressed: Option<String>,
+    #[serde(alias = "sha256_compressed")]
+    pub hash_compressed: Option<String>,
     /// Whether the stored bytes were byte-shuffled before compression
     /// (see `crate::shuffle`). Only XOR deltas are shuffled.
     ///

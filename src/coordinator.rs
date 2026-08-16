@@ -2,13 +2,14 @@ use std::collections::HashMap;
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use crate::cast::DType;
 use crate::error::{Result, MoonclipError};
 use crate::manifest::*;
 use crate::merger::{DeltaMerger, MergerConfig};
+use crate::pack;
 use crate::remote_sync::{RemoteSyncConfig, RemoteSyncer};
 use crate::storage::StorageBackend;
 use crate::tensor::{self, BaseCache, TensorData};
@@ -74,6 +75,238 @@ impl Default for CoordinatorConfig {
     }
 }
 
+/// The snapshot-level facts a pack needs to describe itself.
+///
+/// Passed down rather than read back from the manifest: at the moment the pack
+/// is written the manifest does not know about this snapshot yet, which is
+/// precisely the window the embedded descriptor closes.
+struct SnapshotContext {
+    step: u64,
+    created_at: DateTime<Utc>,
+    metadata: HashMap<String, String>,
+}
+
+/// Rebuild a snapshot from the descriptions its own packs carry.
+///
+/// Every rank's pack describes the snapshot as well as its own contribution,
+/// so a snapshot can be reassembled without a surviving rank 0 and without any
+/// separate file. Returns None when the packs do not agree, are not of this
+/// format, or do not add up to a complete snapshot — all of which mean there
+/// is nothing safe to readmit.
+fn rebuild_from_packs(
+    storage: &dyn StorageBackend,
+    id: &str,
+    files: &[String],
+) -> Option<Snapshot> {
+    let mut descriptors: Vec<pack::PackDescriptor> = Vec::new();
+
+    for file in files.iter().filter(|f| f.ends_with(".pack")) {
+        let header = storage.get_range(file, 0, pack::HEADER_LEN as usize).ok()?;
+        // No header means a pack written before this format. It still loads
+        // through the manifest; it just cannot be recovered without one.
+        let (offset, length) = pack::decode_header(&header)?;
+        let encoded = storage.get_range(file, offset, length as usize).ok()?;
+        if encoded.len() != length as usize {
+            return None; // truncated write
+        }
+        let descriptor: pack::PackDescriptor = serde_json::from_slice(&encoded).ok()?;
+        if descriptor.snapshot_id.to_string() != id {
+            return None; // a pack claiming to belong somewhere else
+        }
+        descriptors.push(descriptor);
+    }
+
+    let first = descriptors.first()?.clone();
+
+    // Every rank has to be here. A snapshot missing one rank's shard is not a
+    // smaller checkpoint, it is an unusable one.
+    let ranks: HashMap<u32, RankEntry> = descriptors
+        .iter()
+        .map(|d| (d.rank.rank, d.rank.clone()))
+        .collect();
+    if ranks.len() as u32 != first.world_size {
+        return None;
+    }
+
+    Some(Snapshot {
+        id: first.snapshot_id,
+        step: first.step,
+        created_at: first.created_at,
+        ranks,
+        base_snapshot_id: first.base_snapshot_id,
+        metadata: first.metadata,
+        compression: first.compression,
+        finalized: true,
+    })
+}
+
+/// Whether every byte the snapshot claims is present and intact.
+///
+/// Presence is not enough. A pack of the right length can still be a truncated
+/// write padded by the filesystem, or a partial flush — and a snapshot readmitted
+/// on those terms would fail much later, during a resume, which is the worst
+/// moment to discover it. So each tensor's stored hash is checked against the
+/// bytes actually on disk.
+///
+/// Reading the pack to do that is affordable precisely because this only runs
+/// for orphans, which exist only after a crash.
+fn snapshot_data_is_intact(storage: &dyn StorageBackend, snapshot: &Snapshot) -> bool {
+    for rank_entry in snapshot.ranks.values() {
+        for tensor in &rank_entry.tensors {
+            // Skipped tensors and aliases store no bytes of their own; they
+            // resolve through the base or through a sibling.
+            let Some(ref expected) = tensor.hash_compressed else {
+                continue;
+            };
+
+            let read = match (&rank_entry.pack_file, &tensor.filename) {
+                (Some(pack), _) => {
+                    storage.get_range(pack, tensor.offset, tensor.compressed_size as usize)
+                }
+                (None, Some(file)) => storage.get(file),
+                (None, None) => return false,
+            };
+
+            let Ok(bytes) = read else { return false };
+            if bytes.len() != tensor.compressed_size as usize {
+                return false;
+            }
+            if &crate::hash::hash_hex(&bytes) != expected {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Recover snapshot data that no manifest entry refers to, or delete it.
+///
+/// A checkpoint lands in two stages: the bytes go to storage, then the manifest
+/// that names them. A process killed between the two leaves data with nothing
+/// pointing at it. Resume is right to ignore it while it stays that way — a
+/// snapshot the manifest does not list must never be trusted — but leaving it
+/// there forever is not right either: `apply_retention` walks
+/// `manifest.snapshots`, so it cannot see those files and they outlive the run.
+///
+/// Seen in the field, not hypothesised: an FSDP run over eight GPUs killed with
+/// SIGKILL mid-checkpoint left three snapshot directories against one manifest
+/// entry, and resumed four steps further back than it needed to.
+///
+/// So each orphan is judged rather than assumed:
+///
+/// * it describes itself (`snapshot.json`), its data passes its own hashes, it
+///   is finalised, and any base it deltas against is present → **put it back in
+///   the manifest**. It was a complete checkpoint; only the bookkeeping was lost.
+/// * anything else — no description, failed hashes, a missing base → **delete
+///   it**. That is a write that never finished, and there is nothing to save.
+///
+/// **Startup is the only safe moment.** Here this process has submitted no save
+/// and the background saver does not exist yet, so nothing it might touch is in
+/// flight. What remains is a *different* process writing to the same storage
+/// root concurrently — but two coordinators sharing a root already overwrite
+/// each other's manifest, so that arrangement is broken well before this is.
+///
+/// Only directories named by a parsable UUID are considered. Anything else
+/// under `snapshots/` was put there by something other than this code, and
+/// guessing about it is how a cleanup routine deletes data it did not own.
+///
+/// Failures are logged and swallowed: this is housekeeping and must never stop
+/// a training run from starting. Returns true when the manifest changed.
+fn recover_or_reclaim_orphans(storage: &dyn StorageBackend, manifest: &mut Manifest) -> bool {
+    let known: std::collections::HashSet<String> = manifest
+        .snapshots
+        .iter()
+        .map(|s| s.id.to_string())
+        .collect();
+
+    let files = match storage.list("snapshots") {
+        Ok(files) => files,
+        Err(e) => {
+            eprintln!("[Moonclip] Could not list snapshots: {e}");
+            return false;
+        }
+    };
+
+    let mut orphans: HashMap<String, Vec<String>> = HashMap::new();
+    for file in files {
+        let Some(id) = file
+            .strip_prefix("snapshots/")
+            .and_then(|rest| rest.split('/').next())
+        else {
+            continue;
+        };
+        if known.contains(id) || Uuid::parse_str(id).is_err() {
+            continue;
+        }
+        orphans.entry(id.to_string()).or_default().push(file);
+    }
+
+    if orphans.is_empty() {
+        return false;
+    }
+
+    // Read every candidate's description first, then admit them oldest-first:
+    // a delta can only go back if its base is already there, and its base may
+    // itself be one of these orphans.
+    let mut candidates: Vec<Snapshot> = Vec::new();
+    let mut rejects: Vec<String> = Vec::new();
+
+    for (id, files) in &orphans {
+        let described = rebuild_from_packs(storage, id, files);
+        match described {
+            Some(snapshot) if snapshot_data_is_intact(storage, &snapshot) => {
+                candidates.push(snapshot)
+            }
+            _ => rejects.push(id.clone()),
+        }
+    }
+    candidates.sort_by_key(|s| s.step);
+
+    let mut recovered = 0usize;
+    for snapshot in candidates {
+        let base_present = match snapshot.base_snapshot_id {
+            None => true,
+            Some(base) => manifest.snapshots.iter().any(|s| s.id == base),
+        };
+        if !base_present {
+            // A delta whose base is gone reconstructs nothing.
+            rejects.push(snapshot.id.to_string());
+            continue;
+        }
+        manifest.snapshots.push(snapshot);
+        recovered += 1;
+    }
+
+    let mut reclaimed = 0usize;
+    for id in &rejects {
+        for file in orphans.get(id).into_iter().flatten() {
+            if let Err(e) = storage.delete(file) {
+                eprintln!("[Moonclip] Could not delete orphaned {file}: {e}");
+            }
+        }
+        // Best effort: the bytes are already gone, and an empty directory left
+        // behind costs an inode, not a checkpoint.
+        let _ = storage.remove_dir(&format!("snapshots/{id}"));
+        reclaimed += 1;
+    }
+
+    if recovered > 0 {
+        manifest.snapshots.sort_by_key(|s| s.step);
+        eprintln!(
+            "[Moonclip] Recovered {recovered} complete checkpoint(s) a previous \
+             run wrote but was killed before recording"
+        );
+    }
+    if reclaimed > 0 {
+        eprintln!(
+            "[Moonclip] Discarded {reclaimed} incomplete snapshot(s) left by an \
+             interrupted run"
+        );
+    }
+
+    recovered > 0
+}
+
 /// The last full snapshot's raw tensor bytes, kept for the next delta.
 struct RetainedBase {
     /// Which snapshot these bytes are. A base cache is only usable for the
@@ -128,6 +361,21 @@ impl Coordinator {
             },
             Err(e) => return Err(e),
         };
+
+        // Rank 0 only, for the same reason only rank 0 finalises: every rank
+        // shares one storage root, and ranks 1..N write into directories rank 0
+        // created.
+        let mut manifest = manifest;
+        if config.rank == 0 && recover_or_reclaim_orphans(storage.as_ref(), &mut manifest) {
+            // Persist immediately: a recovered checkpoint that only exists in
+            // this process's memory would be lost again to the next crash, and
+            // would be re-recovered on every startup until one happened not to.
+            if let Ok(json) = serde_json::to_vec_pretty(&manifest) {
+                if let Err(e) = storage.put("manifest.json", &json) {
+                    eprintln!("[Moonclip] Could not persist recovered snapshots: {e}");
+                }
+            }
+        }
 
         let manifest = Arc::new(Mutex::new(manifest));
 
@@ -304,12 +552,19 @@ impl Core {
         };
         drop(manifest);
 
-        let rank_entry = self.save_rank_tensors(snap_id, &snap_dir, &base_snap, tensors)?;
+        let created_at = Utc::now();
+        let context = SnapshotContext {
+            step,
+            created_at,
+            metadata: metadata.clone(),
+        };
+        let rank_entry =
+            self.save_rank_tensors(snap_id, &snap_dir, &base_snap, tensors, &context)?;
 
         let snapshot = Snapshot {
             id: snap_id,
             step,
-            created_at: Utc::now(),
+            created_at,
             ranks: {
                 let mut m = HashMap::new();
                 m.insert(self.config.rank, rank_entry);
@@ -394,7 +649,13 @@ impl Core {
         drop(manifest);
 
         let snap_dir = format!("snapshots/{}", snap_id);
-        let rank_entry = self.save_rank_tensors(snap_id, &snap_dir, &base_snap, tensors)?;
+        let context = SnapshotContext {
+            step: snap.step,
+            created_at: snap.created_at,
+            metadata: snap.metadata.clone(),
+        };
+        let rank_entry =
+            self.save_rank_tensors(snap_id, &snap_dir, &base_snap, tensors, &context)?;
 
         // Re-read manifest again (another rank may have saved concurrently)
         self.reload_manifest()?;
@@ -635,6 +896,7 @@ impl Core {
         snap_dir: &str,
         base_snap: &Option<Snapshot>,
         tensors: Vec<TensorData>,
+        context: &SnapshotContext,
     ) -> Result<RankEntry> {
         // ── 1. Build lazy base cache (no upfront disk read) ──────────
         let base_cache = self.build_base_cache(base_snap);
@@ -689,29 +951,24 @@ impl Core {
         }
 
         // ── 3. Assign pack offsets and write all parts in one file ──
-        let mut offset = 0u64;
+        // Offsets start after the header, not at zero: the pack carries its own
+        // description (see `crate::pack`). Every reader takes these offsets
+        // from the manifest rather than assuming the first tensor sits at the
+        // start of the file, so the shift is invisible to them.
+        let mut offset = pack::HEADER_LEN;
         for pt in &mut processed {
             if let Some(ref data) = pt.write_data {
                 pt.entry.offset = offset;
                 offset += data.len() as u64;
             }
         }
+        let blobs_end = offset;
 
-        let pack_file = if offset > 0 {
-            let parts: Vec<&[u8]> = processed
-                .iter()
-                .filter_map(|pt| pt.write_data.as_deref())
-                .collect();
-            let pack_filename = format!("{}/rank_{}.pack", snap_dir, self.config.rank);
-            crate::profile::time(crate::profile::Phase::PackWrite, || {
-                self.storage.put_parts(&pack_filename, &parts)
-            })?;
-            Some(pack_filename)
-        } else {
-            None
-        };
+        // ── 4. Build the rank entry, which the descriptor carries ───
+        let has_data = blobs_end > pack::HEADER_LEN;
+        let pack_file =
+            has_data.then(|| format!("{}/rank_{}.pack", snap_dir, self.config.rank));
 
-        // ── 4. Build rank entry ─────────────────────────────────────
         let mut entries = Vec::new();
         let mut total_compressed = 0u64;
         let mut total_raw = 0u64;
@@ -719,7 +976,12 @@ impl Core {
         let mut delta = 0usize;
         let mut full = 0usize;
 
-        for pt in processed {
+        // By reference, and cloning only the entries: the descriptor has to be
+        // built before the pack is written, and `processed` still owns the
+        // compressed blobs. Consuming it here would mean copying those blobs
+        // to write them — gigabytes, on the path this whole session was spent
+        // making cheaper.
+        for pt in &processed {
             total_compressed += pt.entry.compressed_size;
             total_raw += pt.entry.raw_size;
             match pt.entry.storage {
@@ -728,10 +990,10 @@ impl Core {
                 TensorStorage::DeltaXor => delta += 1,
                 TensorStorage::Full => full += 1,
             }
-            entries.push(pt.entry);
+            entries.push(pt.entry.clone());
         }
 
-        Ok(RankEntry {
+        let rank_entry = RankEntry {
             rank: self.config.rank,
             tensors: entries,
             pack_file,
@@ -740,7 +1002,35 @@ impl Core {
             skipped_count: skipped,
             delta_count: delta,
             full_count: full,
-        })
+        };
+
+        // ── 5. Write header + blobs + descriptor, in one object ─────
+        if let Some(ref pack_filename) = rank_entry.pack_file {
+            let descriptor = pack::PackDescriptor {
+                snapshot_id: snap_id,
+                step: context.step,
+                created_at: context.created_at,
+                base_snapshot_id: base_snap.as_ref().map(|s| s.id),
+                metadata: context.metadata.clone(),
+                compression: self.config.compression.clone(),
+                world_size: self.config.world_size,
+                rank: rank_entry.clone(),
+            };
+            let encoded = serde_json::to_vec(&descriptor)
+                .map_err(|e| MoonclipError::Serialization(e.to_string()))?;
+            let header = pack::encode_header(blobs_end, encoded.len() as u64);
+
+            let mut parts: Vec<&[u8]> = Vec::with_capacity(processed.len() + 2);
+            parts.push(&header);
+            parts.extend(processed.iter().filter_map(|pt| pt.write_data.as_deref()));
+            parts.push(&encoded);
+
+            crate::profile::time(crate::profile::Phase::PackWrite, || {
+                self.storage.put_parts(pack_filename, &parts)
+            })?;
+        }
+
+        Ok(rank_entry)
     }
 
     /// Build a lazy BaseCache referring to the base snapshot.
@@ -978,6 +1268,9 @@ impl Core {
                     }
                 }
             }
+            // No separate description to clean up: it lives inside the pack
+            // that was just deleted.
+            let _ = self.storage.remove_dir(&format!("snapshots/{}", snap.id));
         }
 
         manifest.snapshots.retain(|s| !to_remove.contains(&s.id));
@@ -1496,6 +1789,404 @@ mod tests {
         assert!(
             re.pack_file.as_ref().unwrap().ends_with(".pack"),
             "Expected .pack extension"
+        );
+    }
+
+    // ── Reclaiming orphaned snapshots ───────────────────────────────
+
+    /// Files under a snapshot directory, whatever their depth.
+    fn snapshot_files(storage: &dyn StorageBackend, id: &str) -> Vec<String> {
+        storage
+            .list("snapshots")
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|f| f.starts_with(&format!("snapshots/{id}/")))
+            .collect()
+    }
+
+    /// A snapshot directory holding a pack with no descriptor — either a
+    /// write that died before the header landed, or a pack from before the
+    /// format carried one.
+    fn orphan_on_disk(storage: &dyn StorageBackend, id: Uuid) {
+        storage
+            .put(&format!("snapshots/{id}/rank_0.pack"), &[7u8; 4096])
+            .unwrap();
+    }
+
+    /// Rewrite the manifest without `drop`, leaving its data and sidecar on
+    /// disk — exactly the state a process killed between the two writes leaves.
+    fn forget_snapshot(storage: &dyn StorageBackend, drop: Uuid) {
+        let raw = storage.get("manifest.json").unwrap();
+        let end = raw.iter().rposition(|&b| b != 0).map(|i| i + 1).unwrap_or(0);
+        let mut manifest: Manifest = serde_json::from_slice(&raw[..end]).unwrap();
+        manifest.snapshots.retain(|s| s.id != drop);
+        storage
+            .put("manifest.json", &serde_json::to_vec_pretty(&manifest).unwrap())
+            .unwrap();
+    }
+
+    fn open(storage: &Arc<dyn StorageBackend>) -> Coordinator {
+        Coordinator::new(
+            Arc::clone(storage),
+            CoordinatorConfig {
+                compression: CompressionAlgo::Zstd { level: 1 },
+                retention: RetentionPolicy {
+                    full_snapshot_every_steps: 1,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    }
+
+    /// The case the whole sidecar exists for: a checkpoint that finished
+    /// writing, whose manifest update never happened, comes back.
+    #[test]
+    fn a_complete_checkpoint_missing_from_the_manifest_is_recovered() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(dir.path()).unwrap());
+
+        let coord = open(&storage);
+        coord.save(0, evolving_state(0), HashMap::new()).unwrap();
+        coord.save(1, evolving_state(1), HashMap::new()).unwrap();
+        coord.flush().unwrap();
+        let lost = coord.list_snapshots()[1].id;
+        drop(coord);
+
+        forget_snapshot(storage.as_ref(), lost);
+
+        let restarted = open(&storage);
+        let steps: Vec<u64> = restarted.list_snapshots().iter().map(|s| s.step).collect();
+        assert_eq!(steps, vec![0, 1], "the finished checkpoint was not recovered");
+
+        // Recovered is only worth something if it reads back.
+        let loaded = restarted.load(lost).expect("recovered snapshot must load");
+        assert_eq!(loaded.get("w").unwrap()[0], 1u8);
+    }
+
+    #[test]
+    fn a_recovered_checkpoint_is_written_back_to_the_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(dir.path()).unwrap());
+
+        let coord = open(&storage);
+        coord.save(0, evolving_state(0), HashMap::new()).unwrap();
+        coord.flush().unwrap();
+        let lost = coord.list_snapshots()[0].id;
+        drop(coord);
+
+        forget_snapshot(storage.as_ref(), lost);
+        drop(open(&storage)); // recovers, and should persist
+
+        // A second restart must find it already in the manifest rather than
+        // rediscovering it — otherwise the recovery only ever lived in memory
+        // and the next crash loses it again.
+        let raw = storage.get("manifest.json").unwrap();
+        let end = raw.iter().rposition(|&b| b != 0).map(|i| i + 1).unwrap_or(0);
+        let manifest: Manifest = serde_json::from_slice(&raw[..end]).unwrap();
+        assert_eq!(manifest.snapshots.len(), 1);
+        assert_eq!(manifest.snapshots[0].id, lost);
+    }
+
+    /// Presence is not integrity. A pack of the right length whose bytes are
+    /// wrong must not be readmitted: it would pass startup and fail at resume,
+    /// which is the worst moment to find out.
+    #[test]
+    fn a_checkpoint_with_corrupted_data_is_not_recovered() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(dir.path()).unwrap());
+
+        let coord = open(&storage);
+        coord.save(0, evolving_state(0), HashMap::new()).unwrap();
+        coord.flush().unwrap();
+        let lost = coord.list_snapshots()[0].id;
+        drop(coord);
+
+        forget_snapshot(storage.as_ref(), lost);
+
+        // Flip a byte inside the compressed data, keeping the pack's length.
+        //
+        // Where matters: LocalStorage pads to a page boundary, so most of this
+        // file is zero padding that nothing ever reads. Corrupting there proves
+        // nothing — the check is driven by each tensor's recorded offset and
+        // size, which the sidecar carries.
+        let pack_path = format!("snapshots/{lost}/rank_0.pack");
+        let header = storage
+            .get_range(&pack_path, 0, pack::HEADER_LEN as usize)
+            .unwrap();
+        let (offset, length) = pack::decode_header(&header).expect("our own header");
+        let encoded = storage.get_range(&pack_path, offset, length as usize).unwrap();
+        let described: pack::PackDescriptor = serde_json::from_slice(&encoded).unwrap();
+        let tensor = &described.rank.tensors[0];
+        assert!(tensor.compressed_size > 8, "nothing to corrupt");
+
+        let mut bytes = storage.get(&pack_path).unwrap();
+        bytes[tensor.offset as usize + tensor.compressed_size as usize / 2] ^= 0xff;
+        storage.put(&pack_path, &bytes).unwrap();
+
+        let restarted = open(&storage);
+        assert!(
+            restarted.list_snapshots().is_empty(),
+            "corrupted data was readmitted to the manifest"
+        );
+        assert!(
+            !storage.exists(&pack_path).unwrap_or(false),
+            "the corrupted snapshot should have been discarded"
+        );
+    }
+
+    /// A delta's pack describes itself exactly as a full's does — same code
+    /// path, `base_snapshot_id` set instead of null — so it recovers too, and
+    /// still reconstructs against its base afterwards.
+    #[test]
+    fn a_delta_is_recovered_and_still_applies_to_its_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(dir.path()).unwrap());
+        let config = || CoordinatorConfig {
+            compression: CompressionAlgo::Zstd { level: 1 },
+            // Keep the second save a delta against the first.
+            retention: RetentionPolicy {
+                full_snapshot_every_steps: 1000,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let coord = Coordinator::new(Arc::clone(&storage), config()).unwrap();
+        coord.save(0, evolving_state(0), HashMap::new()).unwrap();
+        coord.save(1, evolving_state(1), HashMap::new()).unwrap();
+        coord.flush().unwrap();
+        let snaps = coord.list_snapshots();
+        assert!(snaps[1].is_delta, "second save should be a delta");
+        let delta = snaps[1].id;
+        drop(coord);
+
+        // Lose only the delta's manifest entry; its base stays recorded.
+        forget_snapshot(storage.as_ref(), delta);
+
+        let restarted = Coordinator::new(Arc::clone(&storage), config()).unwrap();
+        let steps: Vec<u64> = restarted.list_snapshots().iter().map(|s| s.step).collect();
+        assert_eq!(steps, vec![0, 1], "the delta was not recovered");
+
+        // Recovering a delta is only meaningful if the XOR still resolves
+        // against the base it names.
+        let loaded = restarted.load(delta).expect("recovered delta must load");
+        assert_eq!(loaded.get("w").unwrap()[0], 1u8);
+    }
+
+    /// A delta reconstructs nothing without its base.
+    #[test]
+    fn a_delta_whose_base_is_gone_is_not_recovered() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(dir.path()).unwrap());
+
+        let coord = Coordinator::new(
+            Arc::clone(&storage),
+            CoordinatorConfig {
+                compression: CompressionAlgo::Zstd { level: 1 },
+                // Keep the second save a delta against the first.
+                retention: RetentionPolicy {
+                    full_snapshot_every_steps: 1000,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        coord.save(0, evolving_state(0), HashMap::new()).unwrap();
+        coord.save(1, evolving_state(1), HashMap::new()).unwrap();
+        coord.flush().unwrap();
+        let snaps = coord.list_snapshots();
+        let (base, delta) = (snaps[0].id, snaps[1].id);
+        assert!(snaps[1].is_delta, "second save should be a delta");
+        drop(coord);
+
+        // Lose both entries, and the base's data with them.
+        forget_snapshot(storage.as_ref(), base);
+        forget_snapshot(storage.as_ref(), delta);
+        for file in snapshot_files(storage.as_ref(), &base.to_string()) {
+            storage.delete(&file).unwrap();
+        }
+
+        let restarted = open(&storage);
+        assert!(
+            restarted.list_snapshots().is_empty(),
+            "a delta was recovered with no base to apply it to"
+        );
+    }
+
+    #[test]
+    fn a_snapshot_without_a_description_is_reclaimed_at_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(dir.path()).unwrap());
+
+        // A real snapshot, recorded in the manifest by a normal save.
+        let coord = Coordinator::new(
+            Arc::clone(&storage),
+            CoordinatorConfig {
+                compression: CompressionAlgo::Zstd { level: 1 },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        coord.save(0, evolving_state(0), HashMap::new()).unwrap();
+        coord.flush().unwrap();
+        let kept = coord.list_snapshots()[0].id;
+        drop(coord);
+
+        let orphan = Uuid::new_v4();
+        orphan_on_disk(storage.as_ref(), orphan);
+        assert!(!snapshot_files(storage.as_ref(), &orphan.to_string()).is_empty());
+
+        // Starting a coordinator is what reclaims: the run that left the
+        // orphan is gone, and this is the moment nothing can be in flight.
+        let restarted = Coordinator::new(
+            Arc::clone(&storage),
+            CoordinatorConfig {
+                compression: CompressionAlgo::Zstd { level: 1 },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert!(
+            snapshot_files(storage.as_ref(), &orphan.to_string()).is_empty(),
+            "the orphaned snapshot's data is still on disk"
+        );
+        assert!(
+            !storage
+                .exists(&format!("snapshots/{orphan}"))
+                .unwrap_or(false),
+            "the empty directory was left behind"
+        );
+        assert!(
+            !snapshot_files(storage.as_ref(), &kept.to_string()).is_empty(),
+            "a snapshot the manifest lists must survive"
+        );
+        assert_eq!(restarted.list_snapshots().len(), 1);
+        assert!(restarted.load(kept).is_ok(), "the kept snapshot must still load");
+    }
+
+    /// The dangerous mistake would be reclaiming by directory listing alone and
+    /// deleting a snapshot that is perfectly good.
+    #[test]
+    fn a_listed_snapshot_is_never_reclaimed() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(dir.path()).unwrap());
+        let config = || CoordinatorConfig {
+            compression: CompressionAlgo::Zstd { level: 1 },
+            retention: RetentionPolicy {
+                full_snapshot_every_steps: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let coord = Coordinator::new(Arc::clone(&storage), config()).unwrap();
+        for step in 0..3u64 {
+            coord.save(step, evolving_state(step), HashMap::new()).unwrap();
+        }
+        coord.flush().unwrap();
+        let before: Vec<Uuid> = coord.list_snapshots().iter().map(|s| s.id).collect();
+        drop(coord);
+
+        let restarted = Coordinator::new(Arc::clone(&storage), config()).unwrap();
+        let after: Vec<Uuid> = restarted.list_snapshots().iter().map(|s| s.id).collect();
+        assert_eq!(before, after, "restarting must not remove any snapshot");
+
+        for id in &after {
+            let loaded = restarted.load(*id).unwrap_or_else(|e| {
+                panic!("snapshot {id} was listed after a restart but cannot be read: {e}")
+            });
+            assert!(loaded.contains_key("w"));
+        }
+    }
+
+    /// The mirror case: the manifest names a snapshot whose files are gone.
+    /// Reclamation must not read that as a reason to do anything drastic, and
+    /// above all must not panic — this runs inside the constructor, so a panic
+    /// here means no coordinator at all.
+    #[test]
+    fn a_manifest_entry_with_no_files_does_not_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(dir.path()).unwrap());
+        let config = || CoordinatorConfig {
+            compression: CompressionAlgo::Zstd { level: 1 },
+            ..Default::default()
+        };
+
+        let coord = Coordinator::new(Arc::clone(&storage), config()).unwrap();
+        coord.save(0, evolving_state(0), HashMap::new()).unwrap();
+        coord.flush().unwrap();
+        let id = coord.list_snapshots()[0].id;
+        drop(coord);
+
+        // Delete the data but leave the manifest entry, as a half-finished
+        // cleanup or a truncated volume would.
+        for file in snapshot_files(storage.as_ref(), &id.to_string()) {
+            storage.delete(&file).unwrap();
+        }
+
+        let restarted = Coordinator::new(Arc::clone(&storage), config()).unwrap();
+        assert_eq!(
+            restarted.list_snapshots().len(),
+            1,
+            "the entry is still listed; reclamation does not edit the manifest"
+        );
+        // Reading it fails, which is honest — but it fails as an error.
+        assert!(restarted.load(id).is_err());
+    }
+
+    /// Anything under `snapshots/` that is not a snapshot was put there by
+    /// something else, and a cleanup routine that guesses is how unrelated data
+    /// gets deleted.
+    #[test]
+    fn files_that_are_not_snapshots_are_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(dir.path()).unwrap());
+
+        storage.put("snapshots/notes.txt", b"someone put this here").unwrap();
+        storage.put("snapshots/scratch/data.bin", b"and this").unwrap();
+
+        let _coord = Coordinator::new(
+            Arc::clone(&storage),
+            CoordinatorConfig {
+                compression: CompressionAlgo::Zstd { level: 1 },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert!(storage.exists("snapshots/notes.txt").unwrap());
+        assert!(storage.exists("snapshots/scratch/data.bin").unwrap());
+    }
+
+    /// Ranks 1..N write into directories rank 0 created; if they each reclaimed
+    /// on the way up, one rank's startup would delete another's snapshot.
+    #[test]
+    fn only_rank_zero_reclaims() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(dir.path()).unwrap());
+
+        let orphan = Uuid::new_v4();
+        orphan_on_disk(storage.as_ref(), orphan);
+
+        let _rank_one = Coordinator::new(
+            Arc::clone(&storage),
+            CoordinatorConfig {
+                world_size: 2,
+                rank: 1,
+                compression: CompressionAlgo::Zstd { level: 1 },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert!(
+            !snapshot_files(storage.as_ref(), &orphan.to_string()).is_empty(),
+            "a non-zero rank reclaimed, and could have deleted a snapshot \
+             another rank was still writing into"
         );
     }
 

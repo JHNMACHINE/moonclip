@@ -283,8 +283,8 @@ fn do_full_merge(
                 offset: 0,
                 compressed_size: compressed.len() as u64,
                 raw_size: current_data.len() as u64,
-                sha256_raw: raw_hash,
-                sha256_compressed: Some(compressed_hash),
+                hash_raw: raw_hash,
+                hash_compressed: Some(compressed_hash),
                 shuffled: false,
                 original_dtype: None,
             });
@@ -533,8 +533,8 @@ mod tests {
                 offset,
                 compressed_size: compressed.len() as u64,
                 raw_size: raw.len() as u64,
-                sha256_raw: hash_hex(raw),
-                sha256_compressed: Some(hash_hex(&compressed)),
+                hash_raw: hash_hex(raw),
+                hash_compressed: Some(hash_hex(&compressed)),
                 shuffled: false,
             });
             offset += compressed.len() as u64;

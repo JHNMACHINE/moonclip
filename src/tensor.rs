@@ -197,8 +197,8 @@ pub fn make_alias_entry(tensor: &TensorData, target: &TensorEntry) -> TensorEntr
         offset: 0,
         compressed_size: 0,
         raw_size: target.raw_size,
-        sha256_raw: target.sha256_raw.clone(),
-        sha256_compressed: None,
+        hash_raw: target.hash_raw.clone(),
+        hash_compressed: None,
         shuffled: false,
     }
 }
@@ -238,7 +238,7 @@ pub fn process_tensor(
     // Check if we can skip (identical to base)
     if let Some(cache) = base_cache {
         if let Some(base_entry) = cache.entries.get(&tensor.name) {
-            if base_entry.sha256_raw == raw_hash {
+            if base_entry.hash_raw == raw_hash {
                 return Ok(ProcessedTensor {
                     entry: TensorEntry {
                         name: tensor.name.clone(),
@@ -251,8 +251,8 @@ pub fn process_tensor(
                         offset: 0,
                         compressed_size: 0,
                         raw_size: working_data.len() as u64,
-                        sha256_raw: raw_hash,
-                        sha256_compressed: None,
+                        hash_raw: raw_hash,
+                        hash_compressed: None,
                         shuffled: false,
                     },
                     write_data: None,
@@ -351,8 +351,8 @@ pub fn process_tensor(
                                     offset: 0,      // Set by coordinator after packing
                                     compressed_size: compressed.len() as u64,
                                     raw_size: working_data.len() as u64,
-                                    sha256_raw: raw_hash,
-                                    sha256_compressed: Some(compressed_hash),
+                                    hash_raw: raw_hash,
+                                    hash_compressed: Some(compressed_hash),
                                     shuffled,
                                 },
                                 write_data: Some(compressed),
@@ -393,8 +393,8 @@ fn make_full_entry(
             offset: 0,      // Set by coordinator after packing
             compressed_size: compressed.len() as u64,
             raw_size: working_data.len() as u64,
-            sha256_raw: raw_hash.to_string(),
-            sha256_compressed: Some(compressed_hash),
+            hash_raw: raw_hash.to_string(),
+            hash_compressed: Some(compressed_hash),
             shuffled: false,
         },
         write_data: Some(compressed),
@@ -502,7 +502,7 @@ fn load_tensor_raw(
             let compressed = extract_compressed(entry, storage, pack_data)?;
 
             // Verify compressed integrity (cheap with xxHash3)
-            if let Some(ref expected) = entry.sha256_compressed {
+            if let Some(ref expected) = entry.hash_compressed {
                 let actual = hash_hex(&compressed);
                 if &actual != expected {
                     return Err(MoonclipError::IntegrityError {
@@ -543,9 +543,9 @@ fn load_tensor_raw(
 
             // Verify reconstructed tensor integrity
             let actual = hash_hex(&raw);
-            if actual != entry.sha256_raw {
+            if actual != entry.hash_raw {
                 return Err(MoonclipError::IntegrityError {
-                    expected: entry.sha256_raw.clone(),
+                    expected: entry.hash_raw.clone(),
                     actual,
                 });
             }
@@ -707,8 +707,8 @@ mod tests {
             offset: 0,
             compressed_size: compressed.len() as u64,
             raw_size: 8192,
-            sha256_raw: raw_hash.clone(),
-            sha256_compressed: None,
+            hash_raw: raw_hash.clone(),
+            hash_compressed: None,
             shuffled: false,
             original_dtype: None,
         };
@@ -757,8 +757,8 @@ mod tests {
             offset: 0,
             compressed_size: compressed_v1.len() as u64,
             raw_size: 50_000,
-            sha256_raw: hash_hex(&data_v1),
-            sha256_compressed: None,
+            hash_raw: hash_hex(&data_v1),
+            hash_compressed: None,
             shuffled: false,
             original_dtype: None,
         };
@@ -812,8 +812,8 @@ mod tests {
             offset: 0,
             compressed_size: compressed_v1.len() as u64,
             raw_size: 200_000,
-            sha256_raw: hash_hex(&data_v1),
-            sha256_compressed: None,
+            hash_raw: hash_hex(&data_v1),
+            hash_compressed: None,
             shuffled: false,
             original_dtype: None,
         };
@@ -857,7 +857,7 @@ mod tests {
 
         assert_eq!(result.entry.storage, TensorStorage::Full);
         assert!(result.write_data.is_some());
-        assert!(result.entry.sha256_compressed.is_some());
+        assert!(result.entry.hash_compressed.is_some());
     }
 
     // ── Read path ───────────────────────────────────────────────────
@@ -964,7 +964,7 @@ mod tests {
 
         assert_eq!(from_disk.entry.storage, TensorStorage::DeltaXor);
         assert_eq!(from_memory.entry.storage, from_disk.entry.storage);
-        assert_eq!(from_memory.entry.sha256_raw, from_disk.entry.sha256_raw);
+        assert_eq!(from_memory.entry.hash_raw, from_disk.entry.hash_raw);
         assert_eq!(from_memory.entry.shuffled, from_disk.entry.shuffled);
         assert_eq!(
             from_memory.write_data, from_disk.write_data,
@@ -993,8 +993,8 @@ mod tests {
             offset: 0,
             compressed_size: 1234,
             raw_size: 40_000,
-            sha256_raw: hash_hex(&v1),
-            sha256_compressed: None,
+            hash_raw: hash_hex(&v1),
+            hash_compressed: None,
             shuffled: false,
         };
 
