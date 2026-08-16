@@ -25,6 +25,43 @@ jobs:
       - name: Rust tests
         run: cargo test
 
+  # The matrix job below installs no torch, so everything behind
+  # `importorskip("torch")` is skipped there: the engine is covered on six
+  # interpreters, the PyTorch adapter on none. That adapter is what downstream
+  # users actually call, and it is where the multi-rank save flow lives, so it
+  # gets one job of its own with a real torch in it.
+  torch-adapter:
+    runs-on: codeberg-small
+    container:
+      image: python:3.12-bookworm
+    steps:
+      - name: Install git and Rust
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq git build-essential
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain 1.90.0 --profile minimal
+
+      - name: Checkout
+        run: |
+          git clone --depth 1 ${{ forgejo.server_url }}/${{ forgejo.repository }}.git .
+          git checkout ${{ forgejo.sha }} || true
+
+      - name: Build and test with PyTorch
+        run: |
+          . "$HOME/.cargo/env"
+          python -m venv /opt/venv
+          export VIRTUAL_ENV=/opt/venv
+          export PATH="/opt/venv/bin:$PATH"
+          pip install --quiet maturin pytest
+          # CPU wheels: these tests are about correctness, not throughput, and
+          # the CUDA build is gigabytes of download for nothing.
+          pip install --quiet --index-url https://download.pytorch.org/whl/cpu torch
+          maturin develop
+          # test_multirank spawns one process per rank and talks over gloo on
+          # loopback, so the runner needs no GPU and no special networking.
+          pytest tests/ -v
+
   python:
     runs-on: codeberg-small
     strategy:
