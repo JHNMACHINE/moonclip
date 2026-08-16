@@ -15,14 +15,52 @@ jobs:
       - name: Install deps
         run: |
           apt-get update -qq
-          apt-get install -y -qq git
+          apt-get install -y -qq git curl
 
       - name: Checkout
         run: |
           git clone --depth 1 ${{ forgejo.server_url }}/${{ forgejo.repository }}.git .
           git checkout ${{ forgejo.sha }} || true
 
+      # MinIO runs as a plain background process rather than a `services:`
+      # container. A service block cannot pass the `server /data` argument the
+      # official image needs, and working around that means depending on a
+      # third-party image or on how a particular runner implements services.
+      # The binary is self-contained, so this needs neither.
+      #
+      # The bucket is made by creating the directory before startup: MinIO
+      # serves each top-level directory under its data root as a bucket, which
+      # avoids pulling in `mc` just to create one. Same trick as
+      # tests/minio_up.sh.
+      - name: Start MinIO
+        run: |
+          curl -sSLo /usr/local/bin/minio \
+            https://dl.min.io/server/minio/release/linux-amd64/minio
+          chmod +x /usr/local/bin/minio
+          mkdir -p /tmp/minio-data/moonclip-test
+          MINIO_ROOT_USER=minioadmin MINIO_ROOT_PASSWORD=minioadmin \
+            minio server /tmp/minio-data --address :9000 >/tmp/minio.log 2>&1 &
+          for _ in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:9000/minio/health/live >/dev/null; then
+              echo "MinIO is up"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "MinIO did not become healthy:" >&2
+          cat /tmp/minio.log >&2
+          exit 1
+
+      # Without these variables tests/s3_minio.rs skips itself, so a failure
+      # here means the S3 backend broke — not that the environment is missing.
+      # That distinction is the point of running it in CI at all: the SigV4
+      # signing was verified by hand exactly once before this existed.
       - name: Rust tests
+        env:
+          MOONCLIP_S3_ENDPOINT: http://127.0.0.1:9000
+          MOONCLIP_S3_BUCKET: moonclip-test
+          MOONCLIP_S3_ACCESS_KEY: minioadmin
+          MOONCLIP_S3_SECRET_KEY: minioadmin
         run: cargo test
 
   # The matrix job below installs no torch, so everything behind

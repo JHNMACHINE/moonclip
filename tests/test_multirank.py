@@ -76,9 +76,22 @@ def test_every_rank_saves_and_reloads_its_shard(tmp_path, world_size):
     checkpoint_dir = tmp_path / "checkpoints"
     results = run_ranks(world_size, checkpoint_dir)
 
-    for rank, code, output in results:
-        assert code == 0, f"rank {rank} failed (exit {code}):\n{output}"
-        assert f"rank {rank}/{world_size} ok" in output, output
+    # Report every rank, not just the first that failed.
+    #
+    # A collective binds these processes together: when one rank dies the
+    # others fail too, with "Connection closed by peer" and nothing about why.
+    # Asserting rank by rank surfaces whichever rank the loop reaches first,
+    # which is usually rank 0 — that is, the victim rather than the cause. A CI
+    # failure then shows a gloo error and no reason for it, and the run has to
+    # be repeated to learn anything.
+    failures = [
+        f"── rank {rank} (exit {code}) ──\n{output}"
+        for rank, code, output in results
+        if code != 0 or f"rank {rank}/{world_size} ok" not in output
+    ]
+    assert not failures, (
+        f"{len(failures)} of {world_size} ranks failed:\n\n" + "\n".join(failures)
+    )
 
     # Rank 0 finalises, so the snapshots are visible from a plain reader too.
     assert checkpoint_dir.is_dir()

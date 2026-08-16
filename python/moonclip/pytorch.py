@@ -11,6 +11,7 @@ Usage:
 
 from __future__ import annotations
 
+import ctypes
 import os
 import pickle
 from typing import Any, Dict, Optional, Tuple
@@ -22,19 +23,27 @@ from moonclip._env import _detect_distributed_env
 
 def _tensor_to_bytes(t: "torch.Tensor") -> bytes:
     """
-    Convert a tensor to raw bytes efficiently.
-    Handles all dtypes including bfloat16 (which numpy doesn't support).
+    Convert a tensor to raw bytes.
+
+    Reads the tensor's own buffer rather than going through NumPy. The NumPy
+    route needed a special case for bfloat16 (which NumPy has no dtype for) and
+    another for everything else it refuses, and it made NumPy a hard
+    requirement of the byte path — while never appearing in this package's
+    dependencies. A torch build without NumPy raises "Numpy is not available"
+    from `.numpy()`, which is a strange way to fail to save a checkpoint.
+
+    Reading `data_ptr()` has neither problem: raw bytes are raw bytes, so every
+    dtype works the same way, including bfloat16 and complex64.
     """
     t = t.detach().cpu().contiguous()
-    if t.dtype == torch.bfloat16:
-        # numpy doesn't support bf16 — reinterpret as int16 (same size)
-        return t.view(torch.int16).numpy().tobytes()
-    else:
-        try:
-            return t.numpy().tobytes()
-        except TypeError:
-            # Fallback for any other unsupported dtype
-            return t.view(torch.uint8).numpy().tobytes()
+    nbytes = t.numel() * t.element_size()
+    if nbytes == 0:
+        # `data_ptr()` may be null for an empty tensor, and string_at would
+        # read from address zero.
+        return b""
+    # Safe: `t` is alive for the duration of the call, contiguous, and on the
+    # host, so exactly `nbytes` readable bytes follow the pointer.
+    return ctypes.string_at(t.data_ptr(), nbytes)
 
 
 # Dtypes the Rust extension can ingest directly from a tensor's data_ptr.
