@@ -155,6 +155,47 @@ class TestCheckpointManager:
         assert torch.allclose(model[10].weight.data, model2[10].weight.data)
 
 
+class TestDeltaRoundTrip:
+    """A delta snapshot has to restore the exact weights, byte for byte.
+
+    Deltas are stored byte-shuffled and XOR-ed against the base, so a
+    checkpoint restored from one passes through two transforms that are
+    invisible until they are wrong — and when they are wrong they do not
+    raise, they hand back plausible-looking noise.
+    """
+
+    def test_weights_survive_a_delta_snapshot_exactly(self, tmp_path):
+        mgr = CheckpointManager(storage_root=str(tmp_path), full_every_steps=100000)
+        model = torch.nn.Sequential(
+            torch.nn.Linear(256, 256), torch.nn.ReLU(), torch.nn.Linear(256, 64)
+        )
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+
+        mgr.save(step=0, model=model, optimizer=optimizer)
+
+        # Real steps: gradient descent leaves most of each float's bits alone,
+        # which is the case the delta path and the shuffle are built for.
+        for _ in range(3):
+            loss = model(torch.randn(8, 256)).square().mean()
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+        expected = {k: v.clone() for k, v in model.state_dict().items()}
+        snap_id = mgr.save(step=1, model=model, optimizer=optimizer)
+
+        assert mgr.list_snapshots()[1]["is_delta"] is True
+        assert mgr.list_snapshots()[1]["delta_tensors"] > 0, "no delta, nothing tested"
+
+        restored = torch.nn.Sequential(
+            torch.nn.Linear(256, 256), torch.nn.ReLU(), torch.nn.Linear(256, 64)
+        )
+        mgr.load(snap_id, model=restored)
+
+        for key, want in expected.items():
+            assert torch.equal(restored.state_dict()[key], want), f"{key} differs"
+
+
 class TestFlattenAsTensors:
     """`flatten_state_dict(as_tensors=True)` hands tensors to Rust directly.
 

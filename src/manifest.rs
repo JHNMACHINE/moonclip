@@ -54,6 +54,13 @@ pub struct TensorEntry {
     pub sha256_raw: String,
     /// Hash of the compressed data on disk (None if Skipped).
     pub sha256_compressed: Option<String>,
+    /// Whether the stored bytes were byte-shuffled before compression
+    /// (see `crate::shuffle`). Only XOR deltas are shuffled.
+    ///
+    /// Defaults to false so snapshots written before the filter existed still
+    /// deserialize, and read back as what they are: unshuffled.
+    #[serde(default)]
+    pub shuffled: bool,
 }
 
 // ─── Rank-level metadata ────────────────────────────────────────────

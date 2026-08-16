@@ -32,6 +32,8 @@ pub enum Phase {
     BaseDecompress,
     /// XOR-ing base against target.
     XorDelta,
+    /// Transposing the delta into byte planes before compressing it.
+    Shuffle,
     /// Compressing the XOR delta.
     CompressDelta,
     /// Compressing a tensor stored in full.
@@ -40,13 +42,14 @@ pub enum Phase {
     PackWrite,
 }
 
-const NAMES: [&str; 9] = [
+const NAMES: [&str; 10] = [
     "dedup hash",
     "raw hash",
     "sample prefix",
     "pays_off probe",
     "base decompress",
     "xor delta",
+    "shuffle",
     "compress delta",
     "compress full",
     "pack write",
@@ -100,10 +103,7 @@ pub fn report(label: &str, wall: Duration, bytes: u64) {
         bytes as f64 / wall.as_secs_f64() / 1e9,
     );
 
-    let mut total = 0u64;
-    for i in 0..NAMES.len() {
-        total += NANOS[i].load(Ordering::Relaxed);
-    }
+    let total: u64 = NANOS.iter().map(|n| n.load(Ordering::Relaxed)).sum();
 
     for i in 0..NAMES.len() {
         let nanos = NANOS[i].swap(0, Ordering::Relaxed);

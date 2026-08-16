@@ -47,26 +47,6 @@ pub trait StorageBackend: Send + Sync {
     fn list(&self, prefix: &str) -> Result<Vec<String>>;
 }
 
-// ─── Page-aligned padding ───────────────────────────────────────────
-
-/// Pad data to a multiple of `page_size` bytes.
-///
-/// Appends zero bytes so the total length is a multiple of `page_size`.
-/// This prevents SSD write amplification from partial page writes.
-///
-/// The original data length is preserved in the manifest (`compressed_size`),
-/// so on read we truncate back to the original size.
-pub fn pad_to_page(data: &[u8], page_size: usize) -> Vec<u8> {
-    if page_size == 0 || data.len() % page_size == 0 {
-        return data.to_vec();
-    }
-    let padded_len = data.len().div_ceil(page_size) * page_size;
-    let mut padded = Vec::with_capacity(padded_len);
-    padded.extend_from_slice(data);
-    padded.resize(padded_len, 0u8);
-    padded
-}
-
 // ─── Local filesystem ───────────────────────────────────────────────
 
 pub struct LocalStorage {
@@ -286,11 +266,4 @@ mod tests {
         assert!(store.get_range("missing.bin", 0, 10).is_err());
     }
 
-    #[test]
-    fn pad_to_page_fn() {
-        assert_eq!(pad_to_page(&[1, 2, 3], 4096).len(), 4096);
-        assert_eq!(pad_to_page(&vec![0u8; 4096], 4096).len(), 4096);
-        assert_eq!(pad_to_page(&vec![0u8; 4097], 4096).len(), 8192);
-        assert_eq!(pad_to_page(&[1, 2, 3], 0).len(), 3); // 0 = no padding
-    }
 }

@@ -1,4 +1,3 @@
-pub mod background;
 pub mod cast;
 pub mod compression;
 pub mod coordinator;
@@ -12,5 +11,6 @@ pub mod profile;
 pub mod python;
 pub mod remote_sync;
 pub mod s3;
+pub mod shuffle;
 pub mod storage;
 pub mod tensor;

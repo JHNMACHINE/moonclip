@@ -85,6 +85,7 @@ pub fn pays_off(
     target: &[u8],
     compression: &CompressionAlgo,
     max_ratio: f64,
+    itemsize: usize,
 ) -> bool {
     let n = base.len().min(target.len()).min(DECISION_SAMPLE);
     if n < DECISION_MIN {
@@ -96,6 +97,15 @@ pub fn pays_off(
         .zip(&target[..n])
         .map(|(a, b)| a ^ b)
         .collect();
+
+    // Judge the delta in the form it will actually be stored in. The byte
+    // shuffle takes ~19% off a real XOR delta, so measuring the unshuffled
+    // one rejects deltas that would in fact have paid off.
+    let xor = if itemsize > 1 {
+        crate::shuffle::shuffle(&xor, itemsize)
+    } else {
+        xor
+    };
 
     match (
         compression::compress(&xor, compression),
@@ -251,7 +261,7 @@ mod tests {
         let mut target = base.clone();
         target[0] ^= 1;
         target[50_000] ^= 2;
-        assert!(pays_off(&base, &target, &ZSTD3, 0.95));
+        assert!(pays_off(&base, &target, &ZSTD3, 0.95, 1));
     }
 
     #[test]
@@ -261,7 +271,7 @@ mod tests {
         // indirection at load time.
         let base = noise(100_000, 0x1234_5678);
         let target = noise(100_000, 0x8765_4321);
-        assert!(!pays_off(&base, &target, &ZSTD3, 0.95));
+        assert!(!pays_off(&base, &target, &ZSTD3, 0.95, 1));
     }
 
     /// Regression: fp32 weights nudged by an optimizer step change roughly
@@ -289,7 +299,7 @@ mod tests {
             "precondition: the old criterion must reject this, got density {density}"
         );
         assert!(
-            pays_off(&base, &target, &ZSTD3, 0.95),
+            pays_off(&base, &target, &ZSTD3, 0.95, 4),
             "XOR delta of nudged fp32 weights must beat a full save"
         );
     }
@@ -298,7 +308,7 @@ mod tests {
     fn pays_off_defaults_true_on_short_sample() {
         let base = vec![0u8; DECISION_MIN - 1];
         let target = vec![255u8; DECISION_MIN - 1];
-        assert!(pays_off(&base, &target, &ZSTD3, 0.95));
+        assert!(pays_off(&base, &target, &ZSTD3, 0.95, 1));
     }
 
     #[test]
@@ -308,8 +318,8 @@ mod tests {
         let base = noise(100_000, 0x5555);
         let mut target = base.clone();
         target[0] ^= 1;
-        assert!(pays_off(&base, &target, &ZSTD3, 0.95));
-        assert!(!pays_off(&base, &target, &ZSTD3, 0.0));
+        assert!(pays_off(&base, &target, &ZSTD3, 0.95, 1));
+        assert!(!pays_off(&base, &target, &ZSTD3, 0.0, 1));
     }
 
     #[test]
