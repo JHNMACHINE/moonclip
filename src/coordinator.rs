@@ -1975,6 +1975,60 @@ mod tests {
         assert_eq!(loaded.get("w").unwrap()[0], 1u8);
     }
 
+    /// A merge collapses the base and every delta after it into one snapshot,
+    /// then deletes the originals. From that moment it is the only copy of the
+    /// run's history — so it is the snapshot that must survive a manifest
+    /// update that never landed, and the one whose loss costs everything.
+    #[test]
+    fn a_merged_snapshot_is_recovered_like_any_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(dir.path()).unwrap());
+        let config = || CoordinatorConfig {
+            compression: CompressionAlgo::Zstd { level: 1 },
+            // Keep the second save a delta, so the merge has a chain to fold.
+            retention: RetentionPolicy {
+                full_snapshot_every_steps: 1000,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let coord = Coordinator::new(Arc::clone(&storage), config()).unwrap();
+        coord.save(0, evolving_state(0), HashMap::new()).unwrap();
+        coord.save(1, evolving_state(1), HashMap::new()).unwrap();
+        coord.flush().unwrap();
+        assert!(coord.list_snapshots()[1].is_delta, "second save should be a delta");
+        drop(coord);
+
+        // Merged directly rather than through `merge_now`: the merger runs on
+        // its own thread with no completion to wait on, and this test is about
+        // what the merge writes, not when.
+        let raw = storage.get("manifest.json").unwrap();
+        let end = raw.iter().rposition(|&b| b != 0).map(|i| i + 1).unwrap_or(0);
+        let manifest: Manifest = serde_json::from_slice(&raw[..end]).unwrap();
+        let manifest = Arc::new(Mutex::new(manifest));
+        crate::merger::do_full_merge(&storage, &manifest, &CompressionAlgo::Zstd { level: 1 })
+            .unwrap();
+        let merged = {
+            let m = manifest.lock().unwrap();
+            assert_eq!(m.snapshots.len(), 1, "base and delta collapse into one");
+            m.snapshots[0].id
+        };
+
+        forget_snapshot(storage.as_ref(), merged);
+
+        let restarted = Coordinator::new(Arc::clone(&storage), config()).unwrap();
+        let snaps = restarted.list_snapshots();
+        assert_eq!(snaps.len(), 1, "the merged snapshot was not recovered");
+        assert_eq!(snaps[0].id, merged);
+        assert!(!snaps[0].is_delta, "a merge yields a full");
+
+        // Recovered is only worth something if it reads back as the state the
+        // merge computed — the last step's weights, not the base's.
+        let loaded = restarted.load(merged).expect("recovered merge must load");
+        assert_eq!(loaded.get("w").unwrap()[0], 1u8);
+    }
+
     /// A delta reconstructs nothing without its base.
     #[test]
     fn a_delta_whose_base_is_gone_is_not_recovered() {

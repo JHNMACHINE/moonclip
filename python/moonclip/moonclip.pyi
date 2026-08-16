@@ -50,8 +50,14 @@ class MoonclipManager:
                 Above it, save the tensor in full.
             world_size: Total number of ranks in multi-rank training.
             rank: Rank of this manager instance.
-            merge_stride: Stride for delta merging (0 = disable).
-            merge_max_chain: Max length of delta chain before merging.
+            merge_stride: After this many consecutive delta snapshots, fold them
+                into the newest one and delete the rest (0 = disable). Every
+                delta is written against the last full snapshot, so the newest
+                already describes the whole state and the fold reads no bytes —
+                but the folded steps stop being restorable. Read it as how
+                coarse the checkpoint history may become.
+            merge_max_chain: How many deltas may accumulate before they are
+                merged back into a new full snapshot.
             rollback_interval_steps: Steps between rollback snapshots.
             max_rollback_snapshots: Number of rollback snapshots to retain.
             s3_bucket: Optional S3 bucket for batched remote sync.

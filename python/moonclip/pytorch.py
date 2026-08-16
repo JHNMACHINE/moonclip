@@ -14,11 +14,44 @@ from __future__ import annotations
 import ctypes
 import os
 import pickle
+import sys
 from typing import Any, Dict, Optional, Tuple
 
 import torch
 
 from moonclip._env import _detect_distributed_env
+
+
+def _stream_can_encode(text: str) -> bool:
+    """Whether `text` survives the trip to stdout as written."""
+    encoding = getattr(sys.stdout, "encoding", None)
+    if not encoding:
+        return False
+    try:
+        text.encode(encoding)
+    except (UnicodeEncodeError, LookupError):
+        return False
+    return True
+
+
+def _emit(text: str) -> None:
+    """Print, without letting the console's encoding take the run down.
+
+    Every message here is reporting, printed from inside a training loop. On a
+    Windows console at cp1252 `print` itself raises `UnicodeEncodeError` for a
+    character the codepage has no room for — so a progress line kills a run
+    that was checkpointing perfectly well. It has two ways in: the box-drawing
+    rule this module used to print unconditionally, and any path or tensor name
+    outside the codepage, which no amount of care in this file can rule out.
+
+    So the unrepresentable characters are replaced and the line still goes out.
+    Losing a glyph is not a failure; losing the run to a status line is.
+    """
+    try:
+        print(text)
+    except UnicodeEncodeError:
+        encoding = getattr(sys.stdout, "encoding", None) or "ascii"
+        print(text.encode(encoding, "replace").decode(encoding, "replace"))
 
 
 def _tensor_to_bytes(t: "torch.Tensor") -> bytes:
@@ -801,7 +834,7 @@ class CheckpointManager:
         """Print a human-readable summary of checkpoint statistics."""
         s = self.stats()
         if s["total_snapshots"] == 0:
-            print("[Moonclip] No checkpoints yet")
+            _emit("[Moonclip] No checkpoints yet")
             return
 
         def _fmt(b):
@@ -813,26 +846,31 @@ class CheckpointManager:
                 return f"{b / (1 << 10):.1f} KB"
             return f"{b} B"
 
-        print(f"\n{'─' * 60}")
-        print("  Moonclip Checkpoint Stats")
-        print(f"{'─' * 60}")
-        print(
+        # Drawn with whatever this console can actually render, rather than
+        # assuming UTF-8: `_emit` would replace the rule character by character
+        # and print sixty question marks, which is worse than a plain dash.
+        rule = ("─" if _stream_can_encode("─") else "-") * 60
+
+        _emit(f"\n{rule}")
+        _emit("  Moonclip Checkpoint Stats")
+        _emit(rule)
+        _emit(
             f"  Snapshots:  {s['total_snapshots']}  ({s['full_snapshots']} full, {s['delta_snapshots']} delta)"
         )
-        print(
+        _emit(
             f"  Tensors:    {s['total_tensors_saved']}  ({s['full_tensors']} full, {s['delta_tensors']} delta, {s['skipped_tensors']} skipped)"
         )
-        print(f"  Raw size:   {_fmt(s['total_raw_bytes'])}")
-        print(
+        _emit(f"  Raw size:   {_fmt(s['total_raw_bytes'])}")
+        _emit(
             f"  On disk:    {_fmt(s['total_compressed_bytes'])}  (compression: {s['compression_ratio']:.1%})"
         )
-        print(
+        _emit(
             f"  Naive cost: {_fmt(s['estimated_naive_bytes'])}  (if every save were full, uncompressed)"
         )
-        print(
+        _emit(
             f"  Saved:      {_fmt(s['total_saved_bytes'])}  ({s['savings_percent']:.1f}% vs naive)"
         )
-        print(f"{'─' * 60}\n")
+        _emit(f"{rule}\n")
 
     # ─── Convenience save methods ────────────────────────────────────
 
@@ -892,7 +930,7 @@ class CheckpointManager:
             scaler=scaler,
             metadata=meta,
         )
-        print(f"[Moonclip] New best {metric_name}={metric:.6f} at step {step}")
+        _emit(f"[Moonclip] New best {metric_name}={metric:.6f} at step {step}")
         return snap_id
 
     def save_final(
@@ -926,7 +964,7 @@ class CheckpointManager:
         )
         self.merge_now()
         self.sync_now()
-        print(f"[Moonclip] Final checkpoint saved at step {step}")
+        _emit(f"[Moonclip] Final checkpoint saved at step {step}")
         return snap_id
 
     def save_to_pt(
@@ -964,7 +1002,7 @@ class CheckpointManager:
 
         torch.save(state, path)
         size_mb = os.path.getsize(path) / (1024 * 1024)
-        print(f"[Moonclip] Exported to {path} ({size_mb:.1f} MB)")
+        _emit(f"[Moonclip] Exported to {path} ({size_mb:.1f} MB)")
         return path
 
     def save_to_safetensors(
@@ -1006,7 +1044,7 @@ class CheckpointManager:
 
         save_file(tensors, path, metadata=metadata)
         size_mb = os.path.getsize(path) / (1024 * 1024)
-        print(
+        _emit(
             f"[Moonclip] Exported to {path} ({size_mb:.1f} MB, {len(tensors)} tensors)"
         )
         return path

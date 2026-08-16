@@ -286,3 +286,55 @@ class TestRawTensorGuards:
         assert torch.equal(
             torch.frombuffer(loaded["real"], dtype=torch.float32), torch.ones(4)
         )
+
+
+class TestReportingNeverKillsTheRun:
+    """Reporting runs inside the training loop. A status line that raises takes
+    the whole run down — and on a Windows console it did: `print_stats` drew a
+    rule out of U+2500, which cp1252 cannot encode."""
+
+    @staticmethod
+    def _cp1252_stdout(monkeypatch):
+        """Replace stdout with a strict cp1252 stream, as a Windows console is."""
+        import io
+
+        stream = io.TextIOWrapper(
+            io.BytesIO(), encoding="cp1252", errors="strict", newline=""
+        )
+        monkeypatch.setattr(sys, "stdout", stream)
+        return stream
+
+    @staticmethod
+    def _text(stream):
+        stream.flush()
+        return stream.buffer.getvalue().decode("cp1252")
+
+    def test_print_stats_survives_a_cp1252_console(self, tmp_path, monkeypatch):
+        mgr = CheckpointManager(storage_root=str(tmp_path))
+        mgr.save(step=0, model=torch.nn.Linear(8, 4))
+
+        stream = self._cp1252_stdout(monkeypatch)
+        mgr.print_stats()  # must not raise
+
+        out = self._text(stream)
+        assert "Moonclip Checkpoint Stats" in out
+        assert "─" not in out, "the box-drawing rule must not reach a cp1252 console"
+
+    def test_print_stats_with_no_checkpoints_survives_too(self, tmp_path, monkeypatch):
+        mgr = CheckpointManager(storage_root=str(tmp_path))
+        stream = self._cp1252_stdout(monkeypatch)
+        mgr.print_stats()
+        assert "No checkpoints yet" in self._text(stream)
+
+    def test_an_unencodable_path_does_not_raise(self, tmp_path, monkeypatch):
+        """The rule is ours to choose; a path is not. `save_to_pt` prints the
+        destination, and nothing stops it holding a character the console has
+        no room for."""
+        from moonclip.pytorch import _emit
+
+        stream = self._cp1252_stdout(monkeypatch)
+        _emit("[Moonclip] Exported to /tmp/中文/model.pt (1.0 MB)")
+
+        out = self._text(stream)
+        assert "[Moonclip] Exported to" in out
+        assert "model.pt" in out
