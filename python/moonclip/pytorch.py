@@ -46,6 +46,104 @@ def _tensor_to_bytes(t: "torch.Tensor") -> bytes:
     return ctypes.string_at(t.data_ptr(), nbytes)
 
 
+class _PinnedStaging:
+    """Page-locked host buffers for the device-to-host copy, reused per save.
+
+    A copy into ordinary (pageable) host memory cannot go straight over PCIe:
+    CUDA stages it through an internal pinned buffer, and the transfer cannot
+    be issued asynchronously. Measured on an RTX 5060 Ti (PCIe 4.0 x8), 3.8 GiB
+    of weights:
+
+        pageable    2735 ms    1.5 GB/s
+        pinned       290 ms   14.1 GB/s     9.4x
+
+    14.1 GB/s is about 90% of what that link can carry, so the pinned path is
+    limited by the bus rather than by software.
+
+    The buffers are kept between saves because pinning is a kernel operation
+    and an expensive one: page-locking those same 3.8 GiB took 2521 ms, which
+    is nine times the copy it makes possible. Allocated per save it would be a
+    large net loss; allocated once it is paid at the first checkpoint and never
+    again.
+
+    **The returned tensors are the buffers**, not copies of them, so the next
+    save overwrites what the previous one handed out. That is safe for the way
+    Moonclip uses them — `save_raw` copies into Rust before it returns — and it
+    is why this is not a public API. Do not hold on to what `to_host` returns.
+
+    Page-locked memory cannot be swapped, so this reserves host RAM the machine
+    cannot reclaim: one copy of whatever gets checkpointed. Pass
+    ``pin_device_copies=False`` to a CheckpointManager to trade the speed back.
+    """
+
+    __slots__ = ("_buffers", "_used", "enabled")
+
+    def __init__(self, enabled: bool = True):
+        self._buffers: Dict[str, "torch.Tensor"] = {}
+        self._used = False
+        self.enabled = enabled
+
+    def to_host(self, key: str, t: "torch.Tensor") -> "torch.Tensor":
+        """Copy `t` to host memory, through a reused pinned buffer."""
+        if not t.is_cuda or not self.enabled:
+            return t.detach().cpu().contiguous()
+
+        source = t.detach()
+        if not source.is_contiguous():
+            source = source.contiguous()
+
+        buffer = self._buffers.get(key)
+        if (
+            buffer is None
+            or buffer.shape != source.shape
+            or buffer.dtype != source.dtype
+        ):
+            buffer = torch.empty(
+                source.shape, dtype=source.dtype, pin_memory=True
+            )
+            self._buffers[key] = buffer
+
+        buffer.copy_(source, non_blocking=True)
+        self._used = True
+        return buffer
+
+    def finish(self) -> None:
+        """Wait for the copies issued since the last call.
+
+        `non_blocking` copies are queued, not done. Handing a buffer to the
+        writer before the transfer lands would store whatever the buffer held
+        previously — the last checkpoint's weights, which look entirely
+        plausible and are wrong.
+        """
+        if self._used:
+            torch.cuda.synchronize()
+            self._used = False
+
+
+_DEFAULT_STAGING: Optional["_PinnedStaging"] = None
+
+
+def _default_staging() -> "_PinnedStaging":
+    """Staging shared by callers that do not bring their own.
+
+    `flatten_state_dict` is called directly by Ravex and by anyone following
+    the background-executor recipe in its docstring, none of whom should have
+    to know that pinned memory exists to get a 9x device copy. A process
+    trains one model at a time, so one set of buffers keyed by tensor name is
+    the right shape for this.
+
+    Set MOONCLIP_NO_PINNED_STAGING=1 to disable it: page-locked memory cannot
+    be swapped, and on a box where host RAM is the binding constraint that
+    matters more than the copy.
+    """
+    global _DEFAULT_STAGING
+    if _DEFAULT_STAGING is None:
+        _DEFAULT_STAGING = _PinnedStaging(
+            enabled=os.environ.get("MOONCLIP_NO_PINNED_STAGING", "") not in ("1", "true")
+        )
+    return _DEFAULT_STAGING
+
+
 # Dtypes the Rust extension can ingest directly from a tensor's data_ptr.
 _DIRECT_DTYPES = {
     torch.float32,
@@ -79,6 +177,42 @@ if hasattr(torch, "uint16"):
     _DTYPE_MAP["uint16"] = torch.uint16
 
 
+#: A snapshot id is a UUID in its canonical form, always this many characters.
+_SNAP_ID_LEN = 36
+
+
+def _broadcast_snapshot_id(dist, snap_id: str, rank: int) -> str:
+    """Share rank 0's snapshot id with every rank.
+
+    `dist.broadcast_object_list` would be the obvious call and is the wrong
+    one: it pickles through ``tensor.numpy()``, so it needs NumPy — which
+    neither this package nor torch declares as a requirement, and which a
+    CPU-only torch install frequently does not have. On such an install every
+    multi-rank save died inside PyTorch with "Numpy is not available", and the
+    ranks that were only waiting on the collective reported a bare
+    "Connection closed by peer" instead.
+
+    A UUID is a fixed 36 characters, so a plain byte broadcast carries it with
+    no serialisation at all — no NumPy, no pickle, and one collective instead
+    of the two that broadcasting an object of unknown size needs.
+    """
+    # NCCL only moves CUDA tensors; gloo is happy with host memory.
+    device = (
+        torch.device("cuda", torch.cuda.current_device())
+        if dist.get_backend() == "nccl"
+        else torch.device("cpu")
+    )
+    buffer = torch.zeros(_SNAP_ID_LEN, dtype=torch.uint8, device=device)
+    if rank == 0:
+        encoded = snap_id.encode("ascii")[:_SNAP_ID_LEN]
+        buffer[: len(encoded)] = torch.frombuffer(
+            bytearray(encoded), dtype=torch.uint8
+        ).to(device)
+
+    dist.broadcast(buffer, src=0)
+    return bytes(buffer.tolist()).rstrip(b"\x00").decode("ascii")
+
+
 def _tensor_from_raw(shape, dtype_str: str, raw) -> "torch.Tensor":
     """Rebuild a tensor from raw bytes + shape + dtype string."""
     dtype = _DTYPE_MAP.get(dtype_str, torch.float32)
@@ -108,7 +242,13 @@ def _reconstruct_from_tensors(meta: Any, tensors_in: dict) -> Any:
         return meta
 
 
-def _flatten_state(value: Any, key_prefix: str, counter: list, out_tensors: dict) -> Any:
+def _flatten_state(
+    value: Any,
+    key_prefix: str,
+    counter: list,
+    out_tensors: dict,
+    staging: Optional["_PinnedStaging"] = None,
+) -> Any:
     """
     Recursively replace tensors in a state-dict structure with placeholder
     dicts, adding each tensor to `out_tensors` under a unique key.
@@ -119,8 +259,8 @@ def _flatten_state(value: Any, key_prefix: str, counter: list, out_tensors: dict
     parallel per tensor and nothing large goes through pickle.
     """
     if torch.is_tensor(value) and value.dtype in _DIRECT_DTYPES:
-        t = value.detach().cpu().contiguous()
         key = f"{key_prefix}/t{counter[0]}"
+        t = (staging or _default_staging()).to_host(key, value)
         counter[0] += 1
         out_tensors[key] = t
         return {
@@ -130,18 +270,26 @@ def _flatten_state(value: Any, key_prefix: str, counter: list, out_tensors: dict
         }
     if isinstance(value, dict):
         return {
-            k: _flatten_state(v, key_prefix, counter, out_tensors)
+            k: _flatten_state(v, key_prefix, counter, out_tensors, staging)
             for k, v in value.items()
         }
     if isinstance(value, list):
-        return [_flatten_state(v, key_prefix, counter, out_tensors) for v in value]
+        return [
+            _flatten_state(v, key_prefix, counter, out_tensors, staging) for v in value
+        ]
     if isinstance(value, tuple):
-        return tuple(_flatten_state(v, key_prefix, counter, out_tensors) for v in value)
+        return tuple(
+            _flatten_state(v, key_prefix, counter, out_tensors, staging) for v in value
+        )
     return value
 
 
 def _flatten_and_extract_tensors(
-    val: Any, prefix: str, tensors_out: dict, as_tensors: bool = False
+    val: Any,
+    prefix: str,
+    tensors_out: dict,
+    as_tensors: bool = False,
+    staging: Optional["_PinnedStaging"] = None,
 ) -> Any:
     """
     Recursively walks val (which can be dict, list, tuple, tensor, etc.).
@@ -155,7 +303,7 @@ def _flatten_and_extract_tensors(
     cannot address stay on the byte path.
     """
     if torch.is_tensor(val):
-        t = val.detach().cpu().contiguous()
+        t = (staging or _default_staging()).to_host(prefix, val)
         shape = list(t.shape)
         dtype = str(t.dtype).replace("torch.", "")
         if as_tensors and t.dtype in _DIRECT_DTYPES:
@@ -169,17 +317,17 @@ def _flatten_and_extract_tensors(
         }
     elif isinstance(val, dict):
         return {
-            k: _flatten_and_extract_tensors(v, f"{prefix}/{k}", tensors_out, as_tensors)
+            k: _flatten_and_extract_tensors(v, f"{prefix}/{k}", tensors_out, as_tensors, staging)
             for k, v in val.items()
         }
     elif isinstance(val, list):
         return [
-            _flatten_and_extract_tensors(v, f"{prefix}/{idx}", tensors_out, as_tensors)
+            _flatten_and_extract_tensors(v, f"{prefix}/{idx}", tensors_out, as_tensors, staging)
             for idx, v in enumerate(val)
         ]
     elif isinstance(val, tuple):
         return tuple(
-            _flatten_and_extract_tensors(v, f"{prefix}/{idx}", tensors_out, as_tensors)
+            _flatten_and_extract_tensors(v, f"{prefix}/{idx}", tensors_out, as_tensors, staging)
             for idx, v in enumerate(val)
         )
     else:
@@ -190,6 +338,7 @@ def flatten_state_dict(
     state_dict: dict,
     prefix: str = "",
     as_tensors: bool = False,
+    staging: Optional["_PinnedStaging"] = None,
 ) -> Tuple[dict, Any]:
     """
     Flatten a PyTorch state_dict into individual tensors.
@@ -233,8 +382,14 @@ def flatten_state_dict(
         # Submit to background:
         executor.submit(mgr.save_raw, step=1000, tensors=tensors)
     """
+    staging = staging or _default_staging()
     tensors_out: dict = {}
-    metadata = _flatten_and_extract_tensors(state_dict, prefix, tensors_out, as_tensors)
+    metadata = _flatten_and_extract_tensors(
+        state_dict, prefix, tensors_out, as_tensors, staging
+    )
+    # The device copies were queued, not completed. Nothing may read these
+    # buffers until they land.
+    staging.finish()
     tensors_out[f"{prefix}._metadata"] = ([], "uint8", pickle.dumps(metadata))
     return tensors_out, metadata
 
@@ -263,6 +418,7 @@ class CheckpointManager:
         max_total_snapshots: Optional[int] = None,
         async_save: bool = True,
         keep_base_in_memory: bool = True,
+        pin_device_copies: bool = True,
         **kwargs,
     ):
         from moonclip import MoonclipManager
@@ -289,6 +445,10 @@ class CheckpointManager:
         self.rank = rank
         self.save_dtype = save_dtype
         self._best_metric: Optional[float] = None
+        # Its own buffers rather than the module default: two managers
+        # checkpointing different models would otherwise collide on tensor
+        # names and reallocate on every save.
+        self._staging = _PinnedStaging(enabled=pin_device_copies)
 
         self._mgr = MoonclipManager(
             storage_root=storage_root,
@@ -337,8 +497,8 @@ class CheckpointManager:
             template = {}
             for name, param in model.state_dict().items():
                 if torch.is_tensor(param) and param.dtype in _DIRECT_DTYPES:
-                    t = param.detach().cpu().contiguous()
                     key = f"model/{name}"
+                    t = self._staging.to_host(key, param)
                     all_tensors[key] = t
                     template[name] = {
                         "__tensor__": key,
@@ -361,7 +521,7 @@ class CheckpointManager:
             """
             sd = obj.state_dict() if hasattr(obj, "state_dict") else obj
             counter = [0]
-            template = _flatten_state(sd, prefix, counter, all_tensors)
+            template = _flatten_state(sd, prefix, counter, all_tensors, self._staging)
             all_tensors[f"{prefix}._metadata"] = ([], "uint8", pickle.dumps(template))
 
         if optimizer is not None:
@@ -375,6 +535,10 @@ class CheckpointManager:
             for name, obj in extra.items():
                 _add_state(f"extra/{name}", obj)
 
+        # Every device copy above was queued, not completed. Nothing may read
+        # those buffers until they land.
+        self._staging.finish()
+
         if self.world_size > 1:
             import torch.distributed as dist
 
@@ -387,10 +551,7 @@ class CheckpointManager:
             if self.rank == 0:
                 snap_id = self._mgr.create_snapshot(step=step, metadata=metadata or {})
 
-            # Broadcast snapshot ID from rank 0 to all other ranks
-            objects = [snap_id]
-            dist.broadcast_object_list(objects, src=0)
-            snap_id = objects[0]
+            snap_id = _broadcast_snapshot_id(dist, snap_id, self.rank)
 
             # Save this rank's tensors sequentially to avoid manifest.json race condition
             for r in range(self.world_size):
@@ -441,9 +602,7 @@ class CheckpointManager:
             snap_id = ""
             if self.rank == 0:
                 snap_id, _ = self._mgr.load_latest()
-            objects = [snap_id]
-            dist.broadcast_object_list(objects, src=0)
-            snap_id = objects[0]
+            snap_id = _broadcast_snapshot_id(dist, snap_id, self.rank)
 
             raw = self._mgr.load(snap_id)
             state_dicts = self._apply_loaded(raw, model, optimizer, scheduler, scaler)
