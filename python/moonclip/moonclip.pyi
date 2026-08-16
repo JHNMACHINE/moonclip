@@ -35,6 +35,7 @@ class MoonclipManager:
         save_dtype: str = "none",
         max_total_snapshots: Optional[int] = None,
         async_save: bool = True,
+        keep_base_in_memory: bool = True,
     ) -> None:
         """
         Initialize the MoonclipManager.
@@ -77,6 +78,10 @@ class MoonclipManager:
                 copied; hashing, compression and the disk write overlap with
                 training. Errors surface on the next save/load/flush call.
                 Loads and listing always wait for pending saves first.
+            keep_base_in_memory: Keep the last full snapshot's raw bytes, so the
+                next delta does not read and decompress a base this process
+                just wrote. Costs one retained copy of the saved state in host
+                memory — turn it off where memory is the binding constraint.
         """
         ...
 
