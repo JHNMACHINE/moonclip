@@ -169,6 +169,7 @@ fn a_local_checkpoint_reaches_the_bucket() {
         Arc::clone(&local),
         Arc::clone(&remote),
         RemoteSyncConfig::default(),
+        Default::default(),
     );
     syncer.sync_now().expect("sync to a live bucket must succeed");
     syncer.shutdown();

@@ -121,6 +121,63 @@ jobs:
             cargo publish --dry-run --locked
           fi
 
+  # The source distribution, once — not per interpreter.
+  #
+  # Without it, `pip install moonclip` on macOS, Windows or aarch64 answers
+  # "no matching distribution found", which reads as "this package does not
+  # exist" rather than "there is no wheel for your platform". With it, pip
+  # falls back to building from source: that needs a Rust toolchain, and the
+  # error when one is missing at least names the thing to install. The README
+  # says wheels are Linux x86_64 only; this is what makes the sentence
+  # actionable.
+  #
+  # Ordered before the wheels for the same reason the crate is: if the release
+  # stops here, no wheel has gone out and the version number is still free.
+  sdist:
+    needs: crate
+    runs-on: codeberg-medium
+    container:
+      image: quay.io/pypa/manylinux_2_28_x86_64
+    steps:
+      - name: Checkout
+        run: |
+          set -eu
+          git clone ${{ forgejo.server_url }}/${{ forgejo.repository }}.git .
+          git checkout ${{ forgejo.sha }}
+
+      - name: Tag must match the package version
+        if: ${{ forgejo.event_name == 'push' }}
+        run: |
+          set -eu
+          VERSION=$(grep -m1 '^version = ' pyproject.toml | cut -d'"' -f2)
+          if [ "v$VERSION" != "${{ forgejo.ref_name }}" ]; then
+            echo "Tag ${{ forgejo.ref_name }} does not match version $VERSION" >&2
+            exit 1
+          fi
+
+      - name: Build the sdist
+        run: |
+          set -eu
+          /opt/python/cp312-cp312/bin/pip install --quiet maturin twine
+          export PATH="/opt/python/cp312-cp312/bin:$PATH"
+          maturin sdist --out dist
+          ls -la dist/
+          twine check dist/*.tar.gz
+          # It has to build without the working tree around it, which is the
+          # whole point of shipping one.
+          tmp=$(mktemp -d)
+          tar xzf dist/*.tar.gz -C "$tmp"
+          ls "$tmp"/*/pyproject.toml "$tmp"/*/Cargo.toml "$tmp"/*/src/lib.rs
+
+      - name: Upload to PyPI
+        if: ${{ forgejo.event_name == 'push' }}
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.MOONCLIP_PYPI_TOKEN }}
+        run: |
+          set -eu
+          /opt/python/cp312-cp312/bin/twine upload --skip-existing dist/*.tar.gz
+
   # One wheel per interpreter, one job each. Native wheels rather than a single
   # abi3 one: the stable ABI would cost PyO3's fast paths, which is the wrong
   # trade for this library.

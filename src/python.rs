@@ -33,6 +33,11 @@ fn get_element_size(dtype: &str) -> PyResult<usize> {
         "torch.int16" | "torch.uint16" => Ok(2),
         "torch.int8" | "torch.uint8" => Ok(1),
         "torch.bool" => Ok(1),
+        // The byte path stores these fine — it reads the tensor's own buffer
+        // — so refusing them only on the direct path would be an arbitrary
+        // difference between two routes to the same bytes.
+        "torch.complex64" => Ok(8),
+        "torch.complex128" => Ok(16),
         _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
             "unsupported dtype {}",
             dtype
@@ -157,6 +162,19 @@ fn collect_tensors(tensors: &Bound<'_, PyDict>) -> PyResult<Vec<PendingTensor>> 
 /// held alive by the caller's dict for the whole duration of the call, and
 /// this runs — with the GIL released, so the training thread is still blocked
 /// inside the call — strictly within that window, reading and never writing.
+///
+/// **That argument covers the calling thread and no other.** With the GIL
+/// released, a second Python thread can run, and one holding a reference to
+/// the same tensor can `resize_()` or `set_()` it — which reallocates the
+/// storage and leaves these pointers dangling — or assign into it, which
+/// races the read and stores a mixture of two states. Neither is detectable
+/// from here: `data_ptr()` was valid when it was taken.
+///
+/// So it is a contract rather than a guarantee, and it is written where users
+/// can find it: `MoonclipManager.save_tensors` in `moonclip.pyi` says the
+/// tensors must not be mutated for the duration of the call, and points at the
+/// `(shape, dtype, bytes)` path for anyone whose EMA updater, pruning callback
+/// or evaluation loop touches the model from another thread.
 fn materialize_tensors(pending: Vec<PendingTensor>) -> Vec<TensorData> {
     use rayon::prelude::*;
 
@@ -219,7 +237,6 @@ impl MoonclipManager {
         keep_base_in_memory = true,
     ))]
     fn new(
-        py: Python<'_>,
         storage_root: &str,
         compression_level: i32,
         max_full_snapshots: usize,
@@ -245,33 +262,6 @@ impl MoonclipManager {
         async_save: bool,
         keep_base_in_memory: bool,
     ) -> PyResult<Self> {
-        // The merger folds a chain of deltas into one, and `do_full_merge`
-        // builds the result by walking the *base* snapshot's tensor list. A
-        // tensor that first appears in a later delta is therefore not in the
-        // list and does not survive the fold; a tensor deleted after the base
-        // comes back. Nothing reports it — the merged snapshot loads, it is
-        // simply missing parameters.
-        //
-        // The fix is scheduled and it changes the merge, not the format, so
-        // this is a warning rather than a hard error: someone whose model
-        // graph is fixed for the whole run — which is most of them — is not
-        // affected, and taking the feature away from them would be the larger
-        // harm. Default is off (`merge_stride = 0`), so this only reaches
-        // people who asked for it.
-        if merge_stride > 0 {
-            PyErr::warn(
-                py,
-                &py.get_type::<pyo3::exceptions::PyUserWarning>(),
-                c"merge_stride > 0 enables delta merging, which currently rebuilds a \
-                  merged snapshot from the base snapshot's tensor list. Tensors added \
-                  after the base are dropped from the merged snapshot and tensors \
-                  removed after it reappear, without an error. Safe only if the set of \
-                  tensor names does not change during the run; otherwise leave \
-                  merge_stride at 0 until this is fixed.",
-                1,
-            )?;
-        }
-
         let compression = if compression_level == 0 {
             CompressionAlgo::None
         } else {
@@ -305,7 +295,7 @@ impl MoonclipManager {
             },
             remote_storage: None,
             remote_sync: None,
-            save_dtype: DType::from_str(save_dtype),
+            save_dtype: DType::parse(save_dtype)?,
             async_save,
             keep_base_in_memory,
         };
@@ -351,6 +341,13 @@ impl MoonclipManager {
     }
 
     /// Save a checkpoint (single-rank mode).
+    ///
+    /// Values may be `(shape, dtype, bytes)` tuples or `torch.Tensor` objects.
+    /// A tensor is read through `data_ptr()` with the GIL released, so its
+    /// storage must not be mutated, resized or freed for the duration of this
+    /// call — the calling thread is blocked inside it, so only another Python
+    /// thread can do that. See the stub in `moonclip.pyi` for the contract as
+    /// users see it.
     #[pyo3(signature = (step, tensors, metadata = None))]
     fn save_tensors(
         &self,
@@ -462,8 +459,9 @@ impl MoonclipManager {
     }
 
     /// Force merge all pending deltas.
-    fn merge_now(&self, py: Python<'_>) {
-        py.detach(|| self.inner.merge_now());
+    fn merge_now(&self, py: Python<'_>) -> PyResult<()> {
+        py.detach(|| self.inner.merge_now())?;
+        Ok(())
     }
 
     /// Push everything to remote storage and wait for it.

@@ -1,9 +1,41 @@
 use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use crate::error::{Result, MoonclipError};
 use crate::storage::StorageBackend;
+
+/// Keys that have been deleted locally and are still on the remote.
+///
+/// Retention and the merger delete their files as soon as nothing can reach
+/// them, and until 0.0.6 that stopped at the local disk: the bucket kept every
+/// pack the run ever wrote, so `keep_last: 3` bounded the SSD and nothing at
+/// all bounded the object store. A long run's remote cost grew with its
+/// length, which is exactly what retention exists to prevent.
+///
+/// Deletions are queued rather than sent immediately, for the same reason
+/// uploads are batched: they happen on the save path, and a round trip to S3
+/// there is paid by the training loop. The syncer drains this on its next
+/// pass.
+///
+/// **Only keys this process deleted.** The obvious alternative — list the
+/// remote, delete whatever is not local — is a foot-gun with the safety off:
+/// point a fresh machine with an empty checkpoint directory at an existing
+/// bucket and it erases the backup it was meant to restore from.
+#[derive(Default)]
+pub struct PendingDeletes {
+    keys: Mutex<Vec<String>>,
+}
+
+impl PendingDeletes {
+    pub fn push(&self, key: impl Into<String>) {
+        self.keys.lock().unwrap().push(key.into());
+    }
+
+    fn drain(&self) -> Vec<String> {
+        std::mem::take(&mut *self.keys.lock().unwrap())
+    }
+}
 
 /// Configuration for batched remote sync.
 #[derive(Debug, Clone)]
@@ -57,6 +89,7 @@ impl RemoteSyncer {
         local: Arc<dyn StorageBackend>,
         remote: Arc<dyn StorageBackend>,
         config: RemoteSyncConfig,
+        deletes: Arc<PendingDeletes>,
     ) -> Self {
         let (tx, rx) = mpsc::channel();
         let sync_every = config.sync_every_n_saves;
@@ -70,12 +103,17 @@ impl RemoteSyncer {
                             if let Err(e) = sync_prefix(&local, &remote, &prefix) {
                                 eprintln!("[Moonclip sync] Error syncing '{}': {}", prefix, e);
                             }
+                            apply_deletes(&remote, &deletes);
                         }
                         SyncCommand::SyncAll(reply) => {
                             let outcome = match sync_prefix(&local, &remote, "") {
                                 Ok(()) => None,
                                 Err(e) => Some(e.to_string()),
                             };
+                            // After the upload, never before: a key queued for
+                            // deletion is already gone locally, so the upload
+                            // above cannot have put it back.
+                            apply_deletes(&remote, &deletes);
                             let _ = reply.send(outcome);
                         }
                         SyncCommand::Shutdown => break,
@@ -170,6 +208,33 @@ impl Drop for RemoteSyncer {
     }
 }
 
+/// Delete, on the remote, what has already been deleted locally.
+///
+/// Failures are logged and dropped rather than returned. A delete that does
+/// not land leaves an object nobody references — it costs storage, and the
+/// next pass will not retry it, which is the honest trade: a sync that
+/// *failed to upload* is a checkpoint at risk and must be reported, while a
+/// sync that failed to tidy up is a bill. Reporting them the same way would
+/// teach callers to ignore both.
+fn apply_deletes(remote: &Arc<dyn StorageBackend>, deletes: &Arc<PendingDeletes>) {
+    let keys = deletes.drain();
+    if keys.is_empty() {
+        return;
+    }
+    let mut failed = 0usize;
+    for key in &keys {
+        if remote.delete(key).is_err() {
+            failed += 1;
+        }
+    }
+    if failed > 0 {
+        eprintln!(
+            "[Moonclip sync] {failed} of {} deleted checkpoints could not be              removed from the remote; they are unreferenced but still billed",
+            keys.len()
+        );
+    }
+}
+
 /// Sync all files under `prefix` from local to remote.
 ///
 /// A file already present on the remote is skipped on **name alone** — size
@@ -229,6 +294,12 @@ mod tests {
     use super::*;
     use crate::storage::LocalStorage;
 
+    /// Nothing has been deleted locally, so the syncer has nothing to remove
+    /// from the remote.
+    fn nothing_deleted() -> Arc<PendingDeletes> {
+        Arc::new(PendingDeletes::default())
+    }
+
     #[test]
     fn sync_between_local_dirs() {
         let src_dir = tempfile::tempdir().unwrap();
@@ -270,6 +341,7 @@ mod tests {
             Arc::clone(&src),
             Arc::clone(&dst),
             RemoteSyncConfig { sync_every_n_saves: 3 },
+        nothing_deleted(),
         );
 
         // First 2 saves: no sync
@@ -311,6 +383,7 @@ mod tests {
             RemoteSyncConfig {
                 sync_every_n_saves: 0,
             },
+        nothing_deleted(),
         );
 
         // notify_save runs on the training thread, so a panic here is not a
@@ -376,6 +449,7 @@ mod tests {
             Arc::clone(&src),
             Arc::new(BrokenRemote),
             RemoteSyncConfig::default(),
+            nothing_deleted(),
         );
 
         let result = syncer.sync_now();
@@ -392,12 +466,96 @@ mod tests {
         src.put("snapshots/a/t1.bin", b"data").unwrap();
 
         let mut syncer =
-            RemoteSyncer::new(Arc::clone(&src), Arc::clone(&dst), RemoteSyncConfig::default());
+            RemoteSyncer::new(
+                Arc::clone(&src),
+                Arc::clone(&dst),
+                RemoteSyncConfig::default(),
+                nothing_deleted(),
+            );
 
         syncer.sync_now().unwrap();
         // sync_now waits, so the data is there by the time it returns —
         // no sleep, and no flake.
         assert_eq!(dst.get("snapshots/a/t1.bin").unwrap(), b"data");
+        syncer.shutdown();
+    }
+
+    /// Retention bounds the local disk. Before 0.0.6 it bounded nothing on the
+    /// remote: every pack a run ever wrote stayed in the bucket, so the object
+    /// store's cost grew with the length of the run while `keep_last` quietly
+    /// held the SSD flat.
+    #[test]
+    fn a_locally_deleted_checkpoint_is_removed_from_the_remote() {
+        let (_s, _d, src, dst) = two_stores();
+        let deletes = Arc::new(PendingDeletes::default());
+
+        src.put("snapshots/old/rank_0.pack", b"superseded").unwrap();
+        src.put("snapshots/new/rank_0.pack", b"current").unwrap();
+
+        let mut syncer = RemoteSyncer::new(
+            Arc::clone(&src),
+            Arc::clone(&dst),
+            RemoteSyncConfig::default(),
+            Arc::clone(&deletes),
+        );
+        syncer.sync_now().unwrap();
+        assert!(dst.exists("snapshots/old/rank_0.pack").unwrap());
+
+        // What retention does: gone locally, queued for the remote.
+        src.delete("snapshots/old/rank_0.pack").unwrap();
+        deletes.push("snapshots/old/rank_0.pack");
+
+        syncer.sync_now().unwrap();
+        assert!(
+            !dst.exists("snapshots/old/rank_0.pack").unwrap(),
+            "the bucket kept a checkpoint retention had already dropped"
+        );
+        assert!(
+            dst.exists("snapshots/new/rank_0.pack").unwrap(),
+            "the live checkpoint went with it"
+        );
+        syncer.shutdown();
+    }
+
+    /// A remote that cannot delete must not fail the sync: the upload is what
+    /// protects the run, and the leftover object is a bill rather than a risk.
+    #[test]
+    fn a_remote_that_refuses_deletes_still_reports_a_good_sync() {
+        struct WriteOnly;
+        impl StorageBackend for WriteOnly {
+            fn put(&self, _rel_path: &str, _data: &[u8]) -> Result<()> {
+                Ok(())
+            }
+            fn get(&self, rel_path: &str) -> Result<Vec<u8>> {
+                Err(MoonclipError::NotFound(rel_path.into()))
+            }
+            fn exists(&self, _rel_path: &str) -> Result<bool> {
+                Ok(false)
+            }
+            fn delete(&self, rel_path: &str) -> Result<()> {
+                Err(MoonclipError::Storage(format!("no delete: {rel_path}")))
+            }
+            fn list(&self, _prefix: &str) -> Result<Vec<String>> {
+                Ok(Vec::new())
+            }
+        }
+
+        let src_dir = tempfile::tempdir().unwrap();
+        let src: Arc<dyn StorageBackend> =
+            Arc::new(LocalStorage::new_unaligned(src_dir.path()).unwrap());
+        src.put("snapshots/a/rank_0.pack", b"data").unwrap();
+
+        let deletes = Arc::new(PendingDeletes::default());
+        deletes.push("snapshots/gone/rank_0.pack");
+
+        let mut syncer = RemoteSyncer::new(
+            Arc::clone(&src),
+            Arc::new(WriteOnly),
+            RemoteSyncConfig::default(),
+            Arc::clone(&deletes),
+        );
+
+        syncer.sync_now().unwrap();
         syncer.shutdown();
     }
 

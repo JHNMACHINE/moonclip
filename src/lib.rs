@@ -4,6 +4,7 @@ pub mod coordinator;
 pub mod delta;
 pub mod error;
 pub mod hash;
+pub(crate) mod inflight;
 pub mod manifest;
 pub mod merger;
 pub mod pack;

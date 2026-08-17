@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "moonclip"
-version = "0.0.5"
+version = "0.0.6"
 description = "High-performance ML checkpoint management — per-tensor delta tracking, Rust-native compression, rank-aware distributed saves"
 requires-python = ">=3.9"
 license = {text = "Apache-2.0"}
@@ -16,7 +16,7 @@ keywords = ["checkpointing", "machine-learning", "deep-learning", "pytorch", "di
 classifiers = [
     # 4, not 5. The version number is 0.0.x, the format version of the pack is
     # still allowed to move, and PyPI shows this string on the project page —
-    # "Production/Stable" next to 0.0.5 is a claim the release cannot support.
+    # "Production/Stable" next to a 0.0.x is a claim the release cannot support.
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",

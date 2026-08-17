@@ -401,11 +401,13 @@ fn make_full_entry(
     })
 }
 
+/// What a base-entry lookup answers with: the entry, the compression of the
+/// snapshot it came from, and that snapshot's pack bytes when a caller has
+/// already read them.
+pub type BaseEntry = (TensorEntry, CompressionAlgo, Option<Arc<Vec<u8>>>);
+
 /// Resolver for base-snapshot tensor entries during load.
-/// Returns (entry, compression of the base snapshot, optional shared pack bytes).
-pub type BaseEntryResolver<'a> = dyn Fn(uuid::Uuid, &str) -> Result<(TensorEntry, CompressionAlgo, Option<Arc<Vec<u8>>>)>
-    + Sync
-    + 'a;
+pub type BaseEntryResolver<'a> = dyn Fn(uuid::Uuid, &str) -> Result<BaseEntry> + Sync + 'a;
 
 /// Load a tensor's raw bytes, resolving delta chains if needed.
 /// If the tensor was saved with a cast (e.g. fp32→bf16), it is
@@ -461,6 +463,45 @@ fn extract_compressed(
     Ok(data)
 }
 
+/// Find a tensor in the base snapshot, following the alias if the base stored
+/// one under that name.
+///
+/// Deduplication keeps the first of a set of identical tensors and records the
+/// rest as `Alias` entries pointing at it — and which one comes first is
+/// decided by the order the state dict was iterated in. That order is not
+/// stable across saves: wrapping a model differently, or an optimizer that
+/// rebuilds its groups, is enough to swap them. When it swaps, the tensor that
+/// was the alias is now the one carrying bytes, it is unchanged since the base
+/// so the save writes it `Skipped`, and resolving that skip lands on the
+/// base's alias entry — which holds no bytes and cannot be read on its own.
+///
+/// Following the reference here is what the loader already does within a
+/// single snapshot; the base is no different. Without it a perfectly good
+/// checkpoint of a model with tied weights is simply unreadable.
+fn resolve_base_entry(
+    base_id: uuid::Uuid,
+    name: &str,
+    find_base_entry: &BaseEntryResolver<'_>,
+) -> Result<BaseEntry> {
+    let mut current = name.to_string();
+    // One hop is the rule: an alias points at a tensor that holds bytes. The
+    // bound is for a manifest that is corrupt or written by something else —
+    // a cycle here would hang a load rather than fail it.
+    for _ in 0..8 {
+        let (entry, compression, pack) = find_base_entry(base_id, &current)?;
+        if entry.storage != TensorStorage::Alias {
+            return Ok((entry, compression, pack));
+        }
+        current = entry.alias_of.clone().ok_or_else(|| {
+            MoonclipError::NotFound(format!("Alias '{current}' in the base has no target"))
+        })?;
+    }
+
+    Err(MoonclipError::Delta(format!(
+        "Alias chain starting at '{name}' in base snapshot {base_id} does not end"
+    )))
+}
+
 /// Load raw bytes without uncasting.
 fn load_tensor_raw(
     entry: &TensorEntry,
@@ -488,7 +529,8 @@ fn load_tensor_raw(
                     entry.name
                 ))
             })?;
-            let (base_entry, base_compression, base_pack) = find_base_entry(base_id, &entry.name)?;
+            let (base_entry, base_compression, base_pack) =
+                resolve_base_entry(base_id, &entry.name, find_base_entry)?;
             load_tensor_raw(
                 &base_entry,
                 None,
@@ -528,7 +570,8 @@ fn load_tensor_raw(
                     entry.name
                 ))
             })?;
-            let (base_entry, base_compression, base_pack) = find_base_entry(base_id, &entry.name)?;
+            let (base_entry, base_compression, base_pack) =
+                resolve_base_entry(base_id, &entry.name, find_base_entry)?;
             let base_raw = load_tensor_raw(
                 &base_entry,
                 None,
