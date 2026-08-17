@@ -535,7 +535,7 @@ class TestMerging:
         assert loaded["keep"] == keep
 
     def test_the_constructor_is_silent(self, tmp_path):
-        """0.0.5 warned here, because the fold lost tensors. 0.0.6 does not."""
+        """This warned while the fold still lost tensors. It no longer does."""
         with warnings.catch_warnings():
             warnings.simplefilter("error")
             MoonclipManager(storage_root=str(tmp_path), merge_stride=3)

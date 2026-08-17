@@ -2,12 +2,17 @@
 
 ## 0.0.6 — unreleased
 
-Everything an external review of the 0.0.4 artifacts found, plus the two things
+Everything an external review of the 0.0.4 artifacts found, plus the four things
 that turned up while fixing them. Each entry below has a regression test that
-fails on 0.0.5.
+fails on 0.0.4.
 
-Nothing here changes the pack format: a 0.0.5 checkpoint reads unchanged, and
-one written by 0.0.6 is readable by 0.0.5 — with the same bugs.
+**There is no 0.0.5.** It was prepared, merged and never published: the review
+that produced the rest of this list arrived first, and shipping the small half
+on its own would have meant a release whose headline fix was a warning about a
+bug that is now fixed. Its entries are folded in below.
+
+Nothing here changes the pack format. A 0.0.4 checkpoint reads unchanged, and
+one written by 0.0.6 is readable by 0.0.4 — with the same bugs.
 
 ### Fixed — data loss
 
@@ -72,6 +77,21 @@ one written by 0.0.6 is readable by 0.0.5 — with the same bugs.
 
 ### Fixed — quietly wrong
 
+- **The fp32→bf16 cast could turn a NaN into +Inf.** bf16 keeps the top 7
+  mantissa bits, so a NaN whose payload sits below bit 16 — `0x7F800001`, which
+  is what comparisons against a corrupted tensor tend to produce — reached the
+  truncation with a zero mantissa under an all-ones exponent, and that is
+  infinity. The quiet NaN `0x7FC00000` was never affected, which is why no test
+  caught it. NaN is mapped to a NaN explicitly now, sign and the surviving
+  payload bits kept. It only ever affected `save_dtype="bf16"`, and what it
+  cost was the evidence: a diverged run saved looking finite.
+- **`max_rollback_snapshots` was never read.** Defined, defaulted, documented
+  and passed in from Python, and no code consulted it — so every snapshot that
+  ever landed on `rollback_interval_steps` kept its exemption from retention
+  forever and the store grew without bound. Only the newest N are protected
+  now; past that they become ordinary snapshots again and retention prunes them
+  in its own order. `0` disables rollback protection, as it already did for the
+  interval.
 - **`save_final()` uploaded before the merge finished.** `merge_now()` queued a
   merge on another thread and returned; `sync_now()` waited only for the save
   thread, so the final merged snapshot — the one every earlier checkpoint had
@@ -113,6 +133,16 @@ one written by 0.0.6 is readable by 0.0.5 — with the same bugs.
   object and slices it — the entire checkpoint over the network, once per
   tensor. It sends a `Range` header now.
 
+### Fixed — packaging
+
+- **`requirements.txt` was UTF-16LE**, so `pip install -r requirements.txt`
+  failed to parse it. UTF-8 now.
+- **Wheels carried `__pycache__`.** Every 0.0.4 wheel shipped cp314 bytecode
+  from a working tree where the tests had already run: harmless, and six wheels
+  for six interpreters holding one interpreter's `.pyc` files.
+- **The `Development Status` classifier claimed `5 - Production/Stable`** on a
+  0.0.x release. It is `4 - Beta`.
+
 ### Added
 
 - **A source distribution on PyPI.** Wheels are still Linux x86_64 only, so
@@ -129,50 +159,8 @@ one written by 0.0.6 is readable by 0.0.5 — with the same bugs.
 - `DeltaMerger::new` is crate-internal: a merger has to share the coordinator's
   in-flight registry or it deletes snapshots out from under readers, and there
   is no way to hand one in from outside.
-- The runtime warning 0.0.5 emitted for `merge_stride > 0` is gone, along with
-  the defect it was warning about.
 - `is_castable_float` includes float64 again — this time because the cast
   exists.
-
-## 0.0.5 — unreleased
-
-Correctness and packaging. Most of this comes from an external review of the
-0.0.4 artifacts; the entries below are the parts that were reproduced.
-
-### Fixed
-
-- **The fp32→bf16 cast could turn a NaN into +Inf.** bf16 keeps the top 7
-  mantissa bits, so a NaN whose payload sits below bit 16 — `0x7F800001`, which
-  is what comparisons against a corrupted tensor tend to produce — reached the
-  truncation with a zero mantissa under an all-ones exponent, and that is
-  infinity. The quiet NaN `0x7FC00000` was never affected, which is why no test
-  caught it. NaN is now mapped to a NaN explicitly, sign and the surviving
-  payload bits kept. Only affected checkpoints saved with `save_dtype="bf16"`.
-  A diverged run could be saved looking finite.
-- **`max_rollback_snapshots` was never read.** It was defined, defaulted,
-  documented and passed in from Python, and no code consulted it: every
-  snapshot that ever landed on `rollback_interval_steps` kept its exemption from
-  retention forever, and the store grew without bound. Only the newest N are
-  protected now; past that they become ordinary snapshots again and retention
-  prunes them in its own order. `0` disables rollback protection, as it already
-  did for the interval.
-- **`requirements.txt` was UTF-16LE**, so `pip install -r requirements.txt`
-  failed to parse it. UTF-8 now.
-
-### Changed
-
-- **`merge_stride > 0` now warns.** `do_full_merge` rebuilds a merged snapshot
-  from the *base* snapshot's tensor list, so a tensor first written by a later
-  delta is dropped and a tensor removed after the base comes back — silently,
-  in both directions. The fix is scheduled for 0.0.6; until then the constructor
-  says so. Merging is off by default (`merge_stride = 0`) and this reaches only
-  the people who turned it on. Safe if the set of tensor names is fixed for the
-  whole run, which covers ordinary training.
-- **Development status classifier is `4 - Beta`**, not `5 - Production/Stable`.
-  On a 0.0.x release the old one was a claim the package could not support.
-- **Wheels no longer carry `__pycache__`.** Every 0.0.4 wheel shipped cp314
-  bytecode, from a working tree where the tests had already run. Harmless, but
-  six wheels for six interpreters holding one interpreter's `.pyc` files.
 
 ## 0.0.4 — 2026-08-17
 

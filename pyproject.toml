@@ -16,7 +16,7 @@ keywords = ["checkpointing", "machine-learning", "deep-learning", "pytorch", "di
 classifiers = [
     # 4, not 5. The version number is 0.0.x, the format version of the pack is
     # still allowed to move, and PyPI shows this string on the project page —
-    # "Production/Stable" next to 0.0.5 is a claim the release cannot support.
+    # "Production/Stable" next to a 0.0.x is a claim the release cannot support.
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
