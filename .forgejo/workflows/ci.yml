@@ -17,10 +17,16 @@ jobs:
           apt-get update -qq
           apt-get install -y -qq git curl
 
+      # Not shallow, and the checkout is allowed to fail the job. `--depth 1`
+      # fetches only the default branch's tip, so a pull request's own commit is
+      # not in the clone: the checkout died with "unable to read tree", `|| true`
+      # swallowed it, and the job tested main instead. Every PR check was a
+      # green tick for code nobody had built.
       - name: Checkout
         run: |
-          git clone --depth 1 ${{ forgejo.server_url }}/${{ forgejo.repository }}.git .
-          git checkout ${{ forgejo.sha }} || true
+          set -eu
+          git clone ${{ forgejo.server_url }}/${{ forgejo.repository }}.git .
+          git checkout ${{ forgejo.sha }}
 
       # MinIO runs as a plain background process rather than a `services:`
       # container. A service block cannot pass the `server /data` argument the
@@ -80,10 +86,16 @@ jobs:
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
             | sh -s -- -y --default-toolchain 1.90.0 --profile minimal
 
+      # Not shallow, and the checkout is allowed to fail the job. `--depth 1`
+      # fetches only the default branch's tip, so a pull request's own commit is
+      # not in the clone: the checkout died with "unable to read tree", `|| true`
+      # swallowed it, and the job tested main instead. Every PR check was a
+      # green tick for code nobody had built.
       - name: Checkout
         run: |
-          git clone --depth 1 ${{ forgejo.server_url }}/${{ forgejo.repository }}.git .
-          git checkout ${{ forgejo.sha }} || true
+          set -eu
+          git clone ${{ forgejo.server_url }}/${{ forgejo.repository }}.git .
+          git checkout ${{ forgejo.sha }}
 
       - name: Build and test with PyTorch
         run: |
@@ -125,10 +137,16 @@ jobs:
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
             | sh -s -- -y --default-toolchain 1.90.0 --profile minimal
 
+      # Not shallow, and the checkout is allowed to fail the job. `--depth 1`
+      # fetches only the default branch's tip, so a pull request's own commit is
+      # not in the clone: the checkout died with "unable to read tree", `|| true`
+      # swallowed it, and the job tested main instead. Every PR check was a
+      # green tick for code nobody had built.
       - name: Checkout
         run: |
-          git clone --depth 1 ${{ forgejo.server_url }}/${{ forgejo.repository }}.git .
-          git checkout ${{ forgejo.sha }} || true
+          set -eu
+          git clone ${{ forgejo.server_url }}/${{ forgejo.repository }}.git .
+          git checkout ${{ forgejo.sha }}
 
       - name: Build and test on Python ${{ matrix.python }}
         run: |
