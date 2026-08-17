@@ -4,34 +4,60 @@ on:
   push:
     tags:
       - 'v*'
+  # A manual run is a rehearsal: everything except the two uploads, with the
+  # crate going through `--dry-run` instead. It exists because a workflow that
+  # only triggers on tags can otherwise be tested only by spending version
+  # numbers — releasing 0.0.4 cost several delete-recreate-push cycles waiting on
+  # a busy runner. Publishing still requires a tag; no input turns a manual run
+  # into a real release.
+  workflow_dispatch:
 
+# One job per artifact, and the split is not cosmetic. Codeberg's hosted runners
+# enforce a per-job time and memory budget, and the memory quota counts
+# filesystem writes — so `target/` counts too. A single job building six release
+# wheels was killed mid-build on `codeberg-small` (2 cores, 2 GB, a few minutes)
+# with the container torn out from under it: `context deadline exceeded` on the
+# podman socket. Six smaller jobs each fit inside `codeberg-medium`'s ten minutes
+# on their own.
+#
+# The cost is that the dependency tree compiles once per interpreter instead of
+# once in total. That is what per-job quotas buy, and queue time is cheaper than
+# a release that cannot finish at all.
 jobs:
-  build-and-publish:
-    runs-on: codeberg-small
+  # The crate first, deliberately. Neither artifact depends on the other — the
+  # wheel carries the compiled extension and never fetches the crate — so the
+  # order decides which half you are left holding if the release stops halfway.
+  # `cargo publish` has more ways to fail (name, token scope, verification build,
+  # metadata), so it goes where a failure still costs nothing: with no wheel
+  # uploaded, the version number is free on both indexes and the same tag can be
+  # pushed again.
+  crate:
+    runs-on: codeberg-medium
     container:
-      # The PyPA manylinux image ships every supported CPython under
-      # /opt/python/cp3XX-cp3XX/bin/, each with pip. That removes the need for
-      # a Python version manager entirely, and — unlike building on plain
-      # bookworm — the wheels come out tagged manylinux_2_28 instead of
-      # linux_x86_64, which is the difference between installable and not.
-      image: quay.io/pypa/manylinux_2_28_x86_64
+      # Cargo already inside, so no rustup step. The verification build compiles
+      # without `extension-module`, so it needs no Python interpreter to link
+      # against.
+      image: rust:1.90-bookworm
     steps:
-      - name: Install Rust
+      - name: Install git
         run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --default-toolchain 1.90.0 --profile minimal
+          apt-get update -qq
+          apt-get install -y -qq git
 
-      # Full history on purpose: the check below has to prove the tagged commit
-      # is on main, and a shallow clone cannot answer that question.
+      # Not shallow: the check below has to prove the tagged commit is on main,
+      # and a truncated history cannot answer that.
       - name: Checkout
         run: |
-          git clone --branch ${{ forgejo.ref_name }} ${{ forgejo.server_url }}/${{ forgejo.repository }}.git .
+          set -eu
+          git clone ${{ forgejo.server_url }}/${{ forgejo.repository }}.git .
+          git checkout ${{ forgejo.sha }}
 
-      # A tag can be pushed from any commit in the repository, including one on
-      # a branch that was never reviewed or merged. Publishing is the one action
-      # here that cannot be undone — PyPI and crates.io both refuse to reuse a
-      # version number — so the tag has to name a commit that reached main.
+      # A tag can be pushed from any commit, including one on a branch nobody
+      # reviewed. Note what this does *not* check: provenance, not freshness. A
+      # tag pointing at an older commit *of* main passes — which is how 0.0.4
+      # nearly went out without its own README.
       - name: Tag must be on main
+        if: ${{ forgejo.event_name == 'push' }}
         run: |
           set -eu
           if ! git merge-base --is-ancestor HEAD origin/main; then
@@ -42,9 +68,10 @@ jobs:
           fi
           echo "$(git rev-parse --short HEAD) is on main"
 
-      # Moved ahead of the build: it costs a `grep` and rules out the mistake
-      # that cannot be undone. Building six wheels first only delays the news.
+      # Costs a grep, and rules out the one mistake that cannot be taken back.
+      # Ahead of every build for that reason.
       - name: Tag must match the package version
+        if: ${{ forgejo.event_name == 'push' }}
         run: |
           set -eu
           VERSION=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
@@ -60,10 +87,10 @@ jobs:
             exit 1
           fi
 
-      # Both secrets, before either upload. Discovering the second one is
-      # missing *after* the first index has accepted its artifact is how a
-      # version number gets half-published, and neither registry lets you retry
-      # it: the release would have to become 0.0.5 for one half only.
+      # Both tokens, before either upload — including the one this job does not
+      # use. Finding out the PyPI secret is missing after crates.io has accepted
+      # the crate leaves the release half done, and neither index lets a version
+      # number be retried.
       - name: Both publish tokens must be present
         env:
           PYPI_TOKEN: ${{ secrets.MOONCLIP_PYPI_TOKEN }}
@@ -81,87 +108,91 @@ jobs:
           fi
           echo "both tokens present"
 
-      # The deepest validation available without publishing: it builds the
-      # package tarball and compiles it, so an `exclude` that drops a file the
-      # crate needs fails here rather than after the wheels are already public.
-      # Two minutes to buy that.
-      - name: Dry-run the crate
-        run: |
-          set -eu
-          . "$HOME/.cargo/env"
-          cargo publish --dry-run --locked
-
-      # One native wheel per interpreter rather than a single abi3 wheel: the
-      # stable ABI would cost PyO3's fast paths, which is the wrong trade for
-      # this library. Built in one job so the shared dependencies compile once.
-      - name: Build wheels
-        run: |
-          set -eu
-          . "$HOME/.cargo/env"
-          VERSIONS="cp39 cp310 cp311 cp312 cp313 cp314"
-
-          INTERPRETERS=""
-          for v in $VERSIONS; do
-            py="/opt/python/$v-$v/bin/python"
-            test -x "$py" || { echo "Interpreter missing: $py" >&2; exit 1; }
-            INTERPRETERS="$INTERPRETERS $py"
-          done
-
-          /opt/python/cp312-cp312/bin/pip install --quiet maturin twine
-          PATH="/opt/python/cp312-cp312/bin:$PATH"
-          export PATH
-
-          echo "Building for:$INTERPRETERS"
-          maturin build --release --interpreter $INTERPRETERS
-
-          echo "=== Built wheels ==="
-          ls -la target/wheels/
-
-          # Assert one wheel per version by ABI tag. A plain count would pass
-          # if every wheel targeted the same interpreter, which is exactly the
-          # failure this build has to rule out.
-          for v in $VERSIONS; do
-            if ! ls target/wheels/ | grep -q "$v"; then
-              echo "No wheel built for $v" >&2
-              exit 1
-            fi
-          done
-
-      - name: Check the artifacts
-        run: /opt/python/cp312-cp312/bin/twine check target/wheels/*.whl
-
-      # ── from here on, nothing is reversible ──────────────────────────────
-      #
-      # PyPI and crates.io only. Codeberg Packages used to get a copy of the same
-      # wheels, which bought nothing: identical bytes at an address almost nobody
-      # would point pip at, and a second token to keep alive.
-      #
-      # The crate goes first, and the order is a decision rather than an
-      # accident. Neither artifact depends on the other — the wheel carries the
-      # compiled extension and never fetches the crate — so what the order buys
-      # is which half you are left holding if the job dies in between. `cargo
-      # publish` is the step with more ways to fail (name, token scope,
-      # verification build, metadata), so it goes where a failure still costs
-      # nothing: with the wheels not yet uploaded, the version number is free on
-      # both indexes and the same tag can be pushed again.
       - name: Publish to crates.io
         env:
           # Left name: what cargo itself reads. Right name: the Codeberg secret.
           CARGO_REGISTRY_TOKEN: ${{ secrets.MOONCLIP_CARGO_TOKEN }}
         run: |
           set -eu
-          . "$HOME/.cargo/env"
-          cargo publish --locked
+          if [ "${{ forgejo.event_name }}" = "push" ]; then
+            cargo publish --locked
+          else
+            echo "rehearsal: packaging and compiling the crate, not uploading it"
+            cargo publish --dry-run --locked
+          fi
 
-      # If this fails, the crate is out and the wheels are not: `pip install
-      # moonclip` finds nothing and `ravex[moonclip]` stays unsatisfiable, while
-      # 0.0.x is spent on crates.io. Recovery is a new patch version for the
-      # wheels — which is why every check that could have prevented it ran
-      # before either upload.
-      - name: Publish to PyPI
+  # One wheel per interpreter, one job each. Native wheels rather than a single
+  # abi3 one: the stable ABI would cost PyO3's fast paths, which is the wrong
+  # trade for this library.
+  wheels:
+    needs: crate
+    runs-on: codeberg-medium
+    container:
+      # The PyPA manylinux image ships every supported CPython under
+      # /opt/python/cp3XX-cp3XX/bin/, each with pip — and, unlike plain bookworm,
+      # produces wheels tagged manylinux_2_28 instead of linux_x86_64, which is
+      # the difference between installable and not.
+      image: quay.io/pypa/manylinux_2_28_x86_64
+    strategy:
+      # One interpreter failing must not cancel the others. A missing wheel can
+      # be added to an existing PyPI version afterwards; a cancelled matrix
+      # leaves a half-published release with no way to finish it.
+      fail-fast: false
+      matrix:
+        python: [cp39, cp310, cp311, cp312, cp313, cp314]
+    steps:
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain 1.90.0 --profile minimal
+
+      - name: Checkout
+        run: |
+          set -eu
+          git clone ${{ forgejo.server_url }}/${{ forgejo.repository }}.git .
+          git checkout ${{ forgejo.sha }}
+
+      # Cheap, and repeated here on purpose: these jobs can be re-run
+      # individually, and a wheel whose metadata disagrees with the tag is
+      # exactly what the check in the crate job exists to prevent.
+      - name: Tag must match the package version
+        if: ${{ forgejo.event_name == 'push' }}
+        run: |
+          set -eu
+          VERSION=$(grep -m1 '^version = ' pyproject.toml | cut -d'"' -f2)
+          if [ "v$VERSION" != "${{ forgejo.ref_name }}" ]; then
+            echo "Tag ${{ forgejo.ref_name }} does not match version $VERSION" >&2
+            exit 1
+          fi
+
+      - name: Build the ${{ matrix.python }} wheel
+        run: |
+          set -eu
+          . "$HOME/.cargo/env"
+          PY="/opt/python/${{ matrix.python }}-${{ matrix.python }}/bin/python"
+          test -x "$PY" || { echo "interpreter missing: $PY" >&2; exit 1; }
+
+          /opt/python/cp312-cp312/bin/pip install --quiet maturin twine
+          export PATH="/opt/python/cp312-cp312/bin:$PATH"
+
+          maturin build --release --locked --out dist --interpreter "$PY"
+
+          echo "=== built ==="
+          ls -la dist/
+          # The ABI tag has to be this interpreter's. A plain count would pass
+          # even if every job had built the same wheel.
+          ls dist/ | grep -q "${{ matrix.python }}" || {
+            echo "no ${{ matrix.python }} wheel in dist/" >&2; exit 1; }
+          twine check dist/*.whl
+
+      - name: Upload to PyPI
+        if: ${{ forgejo.event_name == 'push' }}
         env:
           TWINE_USERNAME: __token__
           TWINE_PASSWORD: ${{ secrets.MOONCLIP_PYPI_TOKEN }}
         run: |
           set -eu
-          /opt/python/cp312-cp312/bin/twine upload target/wheels/*.whl
+          # One file per job. PyPI accepts files added to an existing version, so
+          # six jobs filling in one release is a supported flow — and if one
+          # fails, its wheel can be added later without spending a new version.
+          /opt/python/cp312-cp312/bin/twine upload dist/*.whl
