@@ -195,4 +195,15 @@ jobs:
           # One file per job. PyPI accepts files added to an existing version, so
           # six jobs filling in one release is a supported flow — and if one
           # fails, its wheel can be added later without spending a new version.
-          /opt/python/cp312-cp312/bin/twine upload dist/*.whl
+          #
+          # `--skip-existing` makes re-running a job harmless: without it, a
+          # second attempt at a wheel PyPI already holds is a 400 that reads
+          # "Bad Request" and nothing more (twine only spells it out under
+          # `--verbose`). Ravex's first pipeline run died exactly that way.
+          #
+          # What it costs: re-publishing the same version with *different*
+          # content becomes silence instead of an error. PyPI never overwrites a
+          # filename anyway, so the content cannot actually change — what is lost
+          # is only the loud complaint, and idempotent re-runs are worth more
+          # than that in a six-job matrix.
+          /opt/python/cp312-cp312/bin/twine upload --skip-existing dist/*.whl
