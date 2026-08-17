@@ -21,9 +21,26 @@ jobs:
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
             | sh -s -- -y --default-toolchain 1.90.0 --profile minimal
 
+      # Full history on purpose: the check below has to prove the tagged commit
+      # is on main, and a shallow clone cannot answer that question.
       - name: Checkout
         run: |
-          git clone --depth 1 --branch ${{ forgejo.ref_name }} ${{ forgejo.server_url }}/${{ forgejo.repository }}.git .
+          git clone --branch ${{ forgejo.ref_name }} ${{ forgejo.server_url }}/${{ forgejo.repository }}.git .
+
+      # A tag can be pushed from any commit in the repository, including one on
+      # a branch that was never reviewed or merged. Publishing is the one action
+      # here that cannot be undone — PyPI and crates.io both refuse to reuse a
+      # version number — so the tag has to name a commit that reached main.
+      - name: Tag must be on main
+        run: |
+          set -eu
+          if ! git merge-base --is-ancestor HEAD origin/main; then
+            echo "Tag ${{ forgejo.ref_name }} points at $(git rev-parse --short HEAD)," >&2
+            echo "which is not reachable from main. Merge the branch first, then" >&2
+            echo "tag the merge commit. Nothing has been published." >&2
+            exit 1
+          fi
+          echo "$(git rev-parse --short HEAD) is on main"
 
       # One native wheel per interpreter rather than a single abi3 wheel: the
       # stable ABI would cost PyO3's fast paths, which is the wrong trade for
@@ -90,11 +107,11 @@ jobs:
       - name: Publish to PyPI
         env:
           TWINE_USERNAME: __token__
-          TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
+          TWINE_PASSWORD: ${{ secrets.MOONCLIP_PYPI_TOKEN }}
         run: |
           set -eu
           if [ -z "${TWINE_PASSWORD:-}" ]; then
-            echo "PYPI_TOKEN is not set: a tag was pushed but nothing would" >&2
+            echo "MOONCLIP_PYPI_TOKEN is not set: a tag was pushed but nothing" >&2
             echo "reach PyPI. Add the secret, or remove this step on purpose." >&2
             exit 1
           fi
@@ -105,12 +122,13 @@ jobs:
       # need a Python interpreter to link against.
       - name: Publish to crates.io
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          # Left name: what cargo itself reads. Right name: the Codeberg secret.
+          CARGO_REGISTRY_TOKEN: ${{ secrets.MOONCLIP_CARGO_TOKEN }}
         run: |
           set -eu
           . "$HOME/.cargo/env"
           if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
-            echo "CARGO_REGISTRY_TOKEN is not set: the wheels went out but the" >&2
+            echo "MOONCLIP_CARGO_TOKEN is not set: the wheels went out but the" >&2
             echo "crate would not. Add the secret, or remove this step." >&2
             exit 1
           fi

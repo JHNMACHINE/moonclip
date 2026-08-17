@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
+use std::time::Instant;
 
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
@@ -532,6 +533,11 @@ impl Coordinator {
 impl Core {
     /// Full single-rank save pipeline (runs on the caller thread or the
     /// background save thread).
+    ///
+    /// The pipeline is a handful of parallel passes over several gigabytes, and
+    /// they run in Moonclip's own rayon pool rather than the global one — see
+    /// [`crate::pool`]. Installing it here rather than at the callers covers
+    /// both entry points, this being the one place both go through.
     fn save_sync(
         &self,
         snap_id: Uuid,
@@ -539,8 +545,18 @@ impl Core {
         tensors: Vec<TensorData>,
         metadata: HashMap<String, String>,
     ) -> Result<()> {
+        crate::pool::install(move || self.save_sync_in_pool(snap_id, step, tensors, metadata))
+    }
+
+    fn save_sync_in_pool(
+        &self,
+        snap_id: Uuid,
+        step: u64,
+        tensors: Vec<TensorData>,
+        metadata: HashMap<String, String>,
+    ) -> Result<()> {
         let snap_dir = format!("snapshots/{}", snap_id);
-        let save_started = std::time::Instant::now();
+        let save_started = Instant::now();
         let raw_bytes: u64 = tensors.iter().map(|t| t.data.len() as u64).sum();
 
         let manifest = self.manifest.lock().unwrap();
@@ -633,6 +649,10 @@ impl Core {
     }
 
     fn save_rank(&self, snap_id: Uuid, tensors: Vec<TensorData>) -> Result<()> {
+        crate::pool::install(move || self.save_rank_in_pool(snap_id, tensors))
+    }
+
+    fn save_rank_in_pool(&self, snap_id: Uuid, tensors: Vec<TensorData>) -> Result<()> {
         // Re-read manifest from storage for multi-rank correctness
         // (another rank may have created the snapshot)
         self.reload_manifest()?;
@@ -704,6 +724,10 @@ impl Core {
     }
 
     fn load(&self, snap_id: Uuid) -> Result<HashMap<String, Vec<u8>>> {
+        crate::pool::install(move || self.load_in_pool(snap_id))
+    }
+
+    fn load_in_pool(&self, snap_id: Uuid) -> Result<HashMap<String, Vec<u8>>> {
         use rayon::prelude::*;
 
         let manifest = self.manifest.lock().unwrap();
@@ -1436,10 +1460,15 @@ impl AsyncSaver {
             .ok_or_else(|| MoonclipError::Storage("Background saver is shut down".into()))?;
 
         let (lock, cvar) = &*self.shared;
+        let queued = Instant::now();
         let mut state = lock.lock().unwrap();
         while state.busy {
             state = cvar.wait(state).unwrap();
         }
+        // How long that wait was is the difference between "the copy is slow"
+        // and "the writer never catches up", and the caller cannot tell them
+        // apart from the outside. Reported under MOONCLIP_PROFILE.
+        let waited = queued.elapsed();
         // Surface a failure from the previous save before starting another,
         // matching what the old `self.flush()?` on entry did.
         if let Some(e) = state.error.take() {
@@ -1447,6 +1476,7 @@ impl AsyncSaver {
         }
         state.busy = true;
         drop(state);
+        crate::profile::note_queue_wait(waited);
 
         if tx.send(job).is_err() {
             lock.lock().unwrap().busy = false;

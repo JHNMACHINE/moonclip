@@ -333,9 +333,14 @@ impl MoonclipManager {
     ) -> PyResult<String> {
         let pending = collect_tensors(&tensors)?;
         let meta = extract_metadata(metadata)?;
+        // The shadow copy is Moonclip's work, so it belongs in Moonclip's pool
+        // (see `crate::pool`) — the save pipeline installs it again downstream,
+        // but this copy happens on the calling thread, before any of that.
         let id = py.detach(|| {
-            let tensor_data = materialize_tensors(pending);
-            self.inner.save(step, tensor_data, meta)
+            crate::pool::install(move || {
+                let tensor_data = materialize_tensors(pending);
+                self.inner.save(step, tensor_data, meta)
+            })
         })?;
         Ok(id.to_string())
     }
@@ -354,8 +359,10 @@ impl MoonclipManager {
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
         let pending = collect_tensors(&tensors)?;
         py.detach(|| {
-            let tensor_data = materialize_tensors(pending);
-            self.inner.save_rank(uuid, tensor_data)
+            crate::pool::install(move || {
+                let tensor_data = materialize_tensors(pending);
+                self.inner.save_rank(uuid, tensor_data)
+            })
         })?;
         Ok(())
     }

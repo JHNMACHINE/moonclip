@@ -61,18 +61,21 @@ impl DeltaMerger {
             .name("moonclip-bg-merger".into())
             .spawn(move || {
                 for cmd in rx {
+                    // Per command, not around the loop: `install` blocks a pool
+                    // worker for as long as the closure runs, and this thread
+                    // spends nearly all its life waiting on `rx`.
                     match cmd {
                         MergeCommand::CheckAndMerge => {
-                            if let Err(e) =
+                            if let Err(e) = crate::pool::install(|| {
                                 do_stride_merge(&config, &storage, &manifest, &compression)
-                            {
+                            }) {
                                 eprintln!("[Moonclip merger] stride merge error: {e}");
                             }
                         }
                         MergeCommand::ForceFullMerge => {
-                            if let Err(e) =
+                            if let Err(e) = crate::pool::install(|| {
                                 do_full_merge(&storage, &manifest, &compression)
-                            {
+                            }) {
                                 eprintln!("[Moonclip merger] full merge error: {e}");
                             }
                         }

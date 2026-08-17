@@ -7,6 +7,7 @@ pub mod hash;
 pub mod manifest;
 pub mod merger;
 pub mod pack;
+pub mod pool;
 pub mod profile;
 #[cfg(feature = "python")]
 pub mod python;

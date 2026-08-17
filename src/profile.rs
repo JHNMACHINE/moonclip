@@ -82,6 +82,29 @@ pub fn time<T>(phase: Phase, f: impl FnOnce() -> T) -> T {
     out
 }
 
+/// Report how long a save waited for the previous one to drain.
+///
+/// Deliberately not a phase. The phases above are CPU time spent inside the
+/// save pipeline; this is wall time the *caller's* thread spent stopped before
+/// the pipeline began, and adding it to that column would make neither number
+/// mean anything.
+///
+/// It is worth its own line because from outside Moonclip this wait is
+/// indistinguishable from a slow copy: `save` allows one write in flight, so a
+/// writer that has not drained shows up as the next `save` taking longer.
+/// Per-rank checkpointing on a shared node is exactly the shape that invites it
+/// — N processes writing at once, each still holding the training loop.
+pub fn note_queue_wait(waited: Duration) {
+    if !enabled() || waited < Duration::from_millis(1) {
+        return;
+    }
+    eprintln!(
+        "[moonclip profile] save waited {:.0} ms for the previous one to drain \
+         (caller blocked, before any work started)",
+        waited.as_secs_f64() * 1000.0
+    );
+}
+
 /// Print the breakdown accumulated since the last report, and reset it.
 pub fn report(label: &str, wall: Duration, bytes: u64) {
     if !enabled() {
