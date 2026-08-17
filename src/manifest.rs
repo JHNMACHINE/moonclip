@@ -253,24 +253,40 @@ impl Manifest {
     }
 
     /// Get IDs of snapshots marked as rollback-safe.
+    ///
+    /// At most `max_rollback_snapshots` of them, newest first: protection is a
+    /// standing exemption from retention, so without a cap every snapshot that
+    /// ever landed on the interval stays forever and the store grows without
+    /// bound. Past the cap the oldest simply stop being exempt — they are not
+    /// deleted here, they go back to being ordinary snapshots that retention
+    /// prunes in its own order. Which is what the two knobs mean together:
+    /// `rollback_interval_steps` says which snapshots deserve protection,
+    /// `max_rollback_snapshots` says how far back it reaches.
     pub fn rollback_snapshot_ids(&self) -> Vec<Uuid> {
         // Zero disables rollback protection, the same meaning zero carries
         // for `merge_stride`, `compression_level` and `sync_every_n_saves`.
         // Reaching the modulo with it panics, and this runs inside retention,
         // which runs inside every save.
-        if self.lineage.rollback_interval_steps == 0 {
+        if self.lineage.rollback_interval_steps == 0 || self.lineage.max_rollback_snapshots == 0 {
             return Vec::new();
         }
 
-        self.snapshots
+        // `snapshots` is ordered by step, so walking it backwards takes the
+        // newest — the ones a rollback would actually reach for.
+        let mut ids: Vec<Uuid> = self
+            .snapshots
             .iter()
+            .rev()
             .filter(|s| {
                 s.base_snapshot_id.is_none()
                     && s.finalized
                     && s.step % self.lineage.rollback_interval_steps == 0
             })
+            .take(self.lineage.max_rollback_snapshots)
             .map(|s| s.id)
-            .collect()
+            .collect();
+        ids.reverse();
+        ids
     }
 }
 
@@ -351,6 +367,44 @@ mod tests {
         m.snapshots.push(make_full_snapshot(50));
         m.snapshots.push(make_full_snapshot(100));
         assert_eq!(m.rollback_snapshot_ids().len(), 2); // 0 and 100
+    }
+
+    /// Protection is capped, newest first. Without the cap the exemption list
+    /// grows with the run and retention has nothing left it is allowed to
+    /// delete.
+    #[test]
+    fn rollback_ids_are_capped_at_the_newest_n() {
+        let mut m = Manifest {
+            lineage: LineageConfig { rollback_interval_steps: 100, max_rollback_snapshots: 2 },
+            ..Default::default()
+        };
+        for step in [0u64, 100, 200, 300] {
+            m.snapshots.push(make_full_snapshot(step));
+        }
+
+        let protected = m.rollback_snapshot_ids();
+        assert_eq!(protected.len(), 2);
+
+        let steps: Vec<u64> = m
+            .snapshots
+            .iter()
+            .filter(|s| protected.contains(&s.id))
+            .map(|s| s.step)
+            .collect();
+        assert_eq!(steps, vec![200, 300], "the newest two are the protected ones");
+    }
+
+    /// Zero means no protection, the same as it does for the interval — and it
+    /// is the reading someone reaches for to turn the feature off.
+    #[test]
+    fn a_max_of_zero_protects_nothing() {
+        let mut m = Manifest {
+            lineage: LineageConfig { rollback_interval_steps: 100, max_rollback_snapshots: 0 },
+            ..Default::default()
+        };
+        m.snapshots.push(make_full_snapshot(0));
+        m.snapshots.push(make_full_snapshot(100));
+        assert!(m.rollback_snapshot_ids().is_empty());
     }
 
     #[test]

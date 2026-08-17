@@ -219,6 +219,7 @@ impl MoonclipManager {
         keep_base_in_memory = true,
     ))]
     fn new(
+        py: Python<'_>,
         storage_root: &str,
         compression_level: i32,
         max_full_snapshots: usize,
@@ -244,6 +245,33 @@ impl MoonclipManager {
         async_save: bool,
         keep_base_in_memory: bool,
     ) -> PyResult<Self> {
+        // The merger folds a chain of deltas into one, and `do_full_merge`
+        // builds the result by walking the *base* snapshot's tensor list. A
+        // tensor that first appears in a later delta is therefore not in the
+        // list and does not survive the fold; a tensor deleted after the base
+        // comes back. Nothing reports it — the merged snapshot loads, it is
+        // simply missing parameters.
+        //
+        // The fix is scheduled and it changes the merge, not the format, so
+        // this is a warning rather than a hard error: someone whose model
+        // graph is fixed for the whole run — which is most of them — is not
+        // affected, and taking the feature away from them would be the larger
+        // harm. Default is off (`merge_stride = 0`), so this only reaches
+        // people who asked for it.
+        if merge_stride > 0 {
+            PyErr::warn(
+                py,
+                &py.get_type::<pyo3::exceptions::PyUserWarning>(),
+                c"merge_stride > 0 enables delta merging, which currently rebuilds a \
+                  merged snapshot from the base snapshot's tensor list. Tensors added \
+                  after the base are dropped from the merged snapshot and tensors \
+                  removed after it reappear, without an error. Safe only if the set of \
+                  tensor names does not change during the run; otherwise leave \
+                  merge_stride at 0 until this is fixed.",
+                1,
+            )?;
+        }
+
         let compression = if compression_level == 0 {
             CompressionAlgo::None
         } else {

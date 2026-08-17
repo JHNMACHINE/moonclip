@@ -523,9 +523,9 @@ class CheckpointManager:
         """
         all_tensors = {}
 
-        # Modello: tensori passati direttamente a Rust (zero pickle), con un
-        # piccolo template "model._metadata" che conserva shape/dtype per la
-        # ricostruzione al load.
+        # Model: tensors go straight to Rust (no pickle), alongside a small
+        # "model._metadata" template that keeps shape and dtype for the
+        # reconstruction on load.
         if model is not None:
             template = {}
             for name, param in model.state_dict().items():
@@ -563,7 +563,7 @@ class CheckpointManager:
             _add_state("scheduler", scheduler)
         if scaler is not None:
             _add_state("scaler", scaler)
-        # extra items (se sono tensori) possono essere passati direttamente
+        # extra items go through the same path: tensors reach Rust directly
         if extra:
             for name, obj in extra.items():
                 _add_state(f"extra/{name}", obj)

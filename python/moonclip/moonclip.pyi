@@ -24,6 +24,7 @@ class MoonclipManager:
         merge_max_chain: int = 10,
         rollback_interval_steps: int = 10000,
         max_rollback_snapshots: int = 3,
+        max_total_snapshots: Optional[int] = None,
         s3_bucket: Optional[str] = None,
         s3_region: str = "us-east-1",
         s3_prefix: str = "",
@@ -33,7 +34,6 @@ class MoonclipManager:
         s3_path_style: bool = False,
         sync_every_n_saves: int = 100,
         save_dtype: str = "none",
-        max_total_snapshots: Optional[int] = None,
         async_save: bool = True,
         keep_base_in_memory: bool = True,
     ) -> None:
@@ -57,10 +57,23 @@ class MoonclipManager:
                 already describes the whole state and the fold reads no bytes —
                 but the folded steps stop being restorable. Read it as how
                 coarse the checkpoint history may become.
+                Any value above 0 warns: the fold currently rebuilds the merged
+                snapshot from the base snapshot's tensor list, so tensors added
+                after the base are dropped and tensors removed after it come
+                back. Safe only while the set of tensor names is fixed.
             merge_max_chain: How many deltas may accumulate before they are
                 merged back into a new full snapshot.
-            rollback_interval_steps: Steps between rollback snapshots.
-            max_rollback_snapshots: Number of rollback snapshots to retain.
+            rollback_interval_steps: Steps between rollback snapshots. A full
+                snapshot landing on a multiple of this is exempt from retention
+                (0 = no rollback snapshots).
+            max_rollback_snapshots: How many of those exemptions to keep, newest
+                first. Older rollback snapshots become ordinary snapshots again
+                and are pruned by retention like any other; without this cap the
+                exempt set would grow for the length of the run. 0 disables
+                rollback protection entirely.
+            max_total_snapshots: Hard cap on accessible snapshots, full and
+                delta together. Defaults to
+                max_full_snapshots * (1 + max_deltas_per_full).
             s3_bucket: Optional S3 bucket for batched remote sync.
             s3_region: S3 region.
             s3_prefix: Optional S3 prefix directory.
