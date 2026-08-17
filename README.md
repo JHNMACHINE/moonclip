@@ -2,7 +2,9 @@
 
 **Stop losing checkpoints. Start training fearlessly.**
 
-Moonclip is a high-performance checkpoint engine for ML training, written in Rust with Python bindings. It tracks per-tensor deltas, skips unchanged weights entirely, and compresses the rest — saving checkpoints in **0.4s instead of minutes**, with **40%+ less storage**.
+Moonclip is a checkpoint engine for ML training, written in Rust with Python bindings. It tracks per-tensor deltas, skips unchanged weights entirely, and compresses the rest, so a save blocks the training loop for **tens of milliseconds** and the checkpoint on disk is **about half the size**.
+
+Against `torch.save` on dense pre-training — the least favourable case, where Adam changes every parameter at every step and there is nothing to skip — that is 1.6-3.0× faster and 1.9× smaller. The gap widens on fine-tuning, LoRA and adapters, where most tensors are identical between two checkpoints.
 
 A moonclip is the ring that holds a full circle of rounds so a revolver reloads in one motion, instead of one chamber at a time. That is the idea here: your whole training state goes down and comes back in a single movement, not tensor by tensor.
 
@@ -67,13 +69,22 @@ Resume integrity verified: max weight diff 0.0 after save → load.
 
 ## Installation
 
-**Requirements:** [Rust toolchain](https://rustup.rs/) + Python ≥ 3.9
+```bash
+pip install moonclip
+```
+
+Wheels are built for **Linux x86_64 (manylinux_2_28), CPython 3.9-3.14** — the
+platform training actually runs on. No Rust toolchain needed there; the
+extension is compiled. What changed between versions is in
+[CHANGELOG.md](https://codeberg.org/JHNMACHINE/moonclip/src/branch/main/CHANGELOG.md).
+
+On any other platform (Windows, macOS, aarch64) `pip` finds no wheel and stops.
+Build it yourself instead, which needs a [Rust toolchain](https://rustup.rs/):
 
 ```bash
-# From git (recommended)
 pip install git+https://codeberg.org/JHNMACHINE/moonclip.git
 
-# On cloud instances (Vast.ai, RunPod, Lambda, etc.)
+# On a cloud instance without Rust (Vast.ai, RunPod, Lambda, …)
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 source $HOME/.cargo/env
 pip install git+https://codeberg.org/JHNMACHINE/moonclip.git
@@ -119,6 +130,25 @@ mgr = CheckpointManager("./checkpoints")
 start_step = mgr.resume(model=model, optimizer=optimizer)
 ```
 
+## Tuning
+
+Two environment variables, neither required:
+
+| | |
+|---|---|
+| `MOONCLIP_THREADS` | Size of Moonclip's thread pool. Default: `cores / LOCAL_WORLD_SIZE`. |
+| `MOONCLIP_PROFILE=1` | Per-phase breakdown of the save path on stderr, plus a line whenever a save had to wait for the previous one to drain. |
+
+The parallel work runs in a pool of Moonclip's own, not rayon's global one, so it
+neither claims every core on the machine nor competes with your application's
+`par_iter`. On a node running several ranks the default splits the cores between
+them — `LOCAL_WORLD_SIZE` is what `torchrun` sets — so eight ranks on 128 cores
+take 16 threads each rather than 128 apiece.
+
+Set `MOONCLIP_THREADS` when that guess is wrong for your box: the machine is
+Moonclip's alone (give it every core), or the ranks do not all checkpoint at the
+same time.
+
 ## Architecture
 
 ```
@@ -127,13 +157,16 @@ src/
 ├── coordinator.rs   # Rank-aware snapshot lifecycle
 ├── tensor.rs        # Per-tensor delta tracking and storage
 ├── manifest.rs      # Manifest v2: per-rank, per-tensor, lineage
-├── compression.rs   # Zstd compression
+├── compression.rs   # Zstd compression (parallel frames)
 ├── delta.rs         # XOR delta computation (rayon parallel)
+├── shuffle.rs       # Byte-plane transpose before compressing a delta
+├── pack.rs          # One pack file per rank, with a recovery descriptor
 ├── merger.rs        # Background delta merging
 ├── remote_sync.rs   # Batched S3 sync
 ├── s3.rs            # S3-compatible storage (AWS SigV4)
 ├── storage.rs       # StorageBackend trait + LocalStorage (4KB aligned)
-├── background.rs    # Background thread infrastructure
+├── pool.rs          # The private rayon pool (see Tuning)
+├── profile.rs       # Opt-in phase timing (MOONCLIP_PROFILE)
 ├── hash.rs          # xxHash3-128 integrity
 ├── python.rs        # PyO3 bindings
 └── error.rs         # Error types
