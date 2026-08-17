@@ -205,6 +205,13 @@ _DTYPE_MAP = {
     "int8": torch.int8,
     "uint8": torch.uint8,
     "bool": torch.bool,
+    # The byte path reads a tensor's own buffer, so it saves these without
+    # noticing they are complex — and until 0.0.6 nothing here could rebuild
+    # them, which turned a saved complex tensor into a load-time failure (or,
+    # worse, into float32 through the old fallback). Rare in weights, ordinary
+    # in an FFT-based model's buffers.
+    "complex64": torch.complex64,
+    "complex128": torch.complex128,
 }
 if hasattr(torch, "uint16"):
     _DTYPE_MAP["uint16"] = torch.uint16
@@ -247,8 +254,22 @@ def _broadcast_snapshot_id(dist, snap_id: str, rank: int) -> str:
 
 
 def _tensor_from_raw(shape, dtype_str: str, raw) -> "torch.Tensor":
-    """Rebuild a tensor from raw bytes + shape + dtype string."""
-    dtype = _DTYPE_MAP.get(dtype_str, torch.float32)
+    """Rebuild a tensor from raw bytes + shape + dtype string.
+
+    An unknown dtype raises. It used to fall back to float32, which is the
+    worst possible answer: the bytes are reinterpreted under a dtype that is
+    not theirs, and `frombuffer` is happy to do it whenever the element sizes
+    divide. The tensor that comes back has the right shape, plausible-looking
+    numbers, and no relationship to what was saved — a checkpoint that loads
+    and is wrong is harder to notice than one that refuses to load.
+    """
+    dtype = _DTYPE_MAP.get(dtype_str)
+    if dtype is None:
+        raise ValueError(
+            f"checkpoint holds a tensor of dtype '{dtype_str}', which this "
+            f"version of Moonclip cannot rebuild. Known dtypes: "
+            f"{', '.join(sorted(_DTYPE_MAP))}."
+        )
     if len(raw) == 0:
         return torch.empty(shape, dtype=dtype)
     buf = raw if isinstance(raw, bytearray) else bytearray(raw)
@@ -586,13 +607,19 @@ class CheckpointManager:
 
             snap_id = _broadcast_snapshot_id(dist, snap_id, self.rank)
 
-            # Save this rank's tensors sequentially to avoid manifest.json race condition
-            for r in range(self.world_size):
-                if self.rank == r:
-                    self._mgr.save_rank(snap_id, all_tensors)
-                dist.barrier()
+            # All at once. Until 0.0.6 this loop ran the ranks one at a time,
+            # each waiting on a barrier for its turn, because every rank
+            # rewrote the shared manifest.json and concurrent writers lost each
+            # other's entries. A rank now writes only its own pack — the
+            # snapshot is assembled from those in finalize — so the shards go
+            # in parallel, which is what the README always claimed.
+            self._mgr.save_rank(snap_id, all_tensors)
 
-            # Rank 0 finalizes
+            # One barrier, and it is load-bearing: rank 0 assembles the
+            # snapshot from the packs on disk, so every rank has to have
+            # finished writing before it looks.
+            dist.barrier()
+
             if self.rank == 0:
                 self._mgr.finalize_snapshot(snap_id)
 
@@ -749,7 +776,9 @@ class CheckpointManager:
 
         Saves run on a background thread by default (async_save=True), so
         save() returns as soon as the tensor data has been copied. Call
-        flush() when you need the checkpoint durably on disk (e.g. right
+        flush() when you need the checkpoint durably on disk — the data is
+        fsynced before the file is renamed into place, so it survives a power
+        cut, unless MOONCLIP_FSYNC=0 (e.g. right
         before exiting). Loads and list_snapshots() flush automatically.
         """
         self._mgr.flush()

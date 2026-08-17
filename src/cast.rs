@@ -13,13 +13,22 @@ pub enum DType {
 }
 
 impl DType {
-    pub fn from_str(s: &str) -> Self {
+    /// Parse a `save_dtype` string.
+    ///
+    /// An unrecognised one is an error, not `None`. Mapping it to "do not
+    /// cast" meant `save_dtype="bfloat"` — or `"BF16 "`, or any other typo —
+    /// silently produced full-precision checkpoints twice the expected size,
+    /// and the only symptom was a disk bill. The value comes from a user's
+    /// config file and is worth exactly one comparison to check.
+    pub fn parse(s: &str) -> Result<Self> {
         match s.to_lowercase().as_str() {
-            "bf16" | "bfloat16" => DType::BFloat16,
-            "fp16" | "float16" => DType::Float16,
-            "fp32" | "float32" => DType::Float32,
-            "none" | "" => DType::None,
-            _ => DType::None,
+            "bf16" | "bfloat16" => Ok(DType::BFloat16),
+            "fp16" | "float16" => Ok(DType::Float16),
+            "fp32" | "float32" => Ok(DType::Float32),
+            "none" | "" => Ok(DType::None),
+            other => Err(MoonclipError::Config(format!(
+                "unknown save_dtype '{other}'. Use one of: none, bf16, fp16, fp32"
+            ))),
         }
     }
 
@@ -44,11 +53,16 @@ impl DType {
 }
 
 /// Determine if a tensor dtype string represents a float type that can be cast.
+///
+/// Every dtype named here really is converted by [`cast_tensor`], to any of the
+/// targets. That was not true until 0.0.6: this list claimed float64 while
+/// `cast_tensor` had no arm for it, and float16 and bfloat16 were only ever
+/// converted to and from float32 — so `save_dtype="bf16"` on a model holding
+/// fp16 or fp64 buffers stored them untouched, at the size the setting was
+/// chosen to avoid, and said nothing. Everything routes through fp32 now,
+/// which is what makes the set closed.
 pub fn is_castable_float(dtype: &str) -> bool {
-    matches!(
-        dtype,
-        "float32" | "float16" | "bfloat16" | "float64"
-    )
+    matches!(dtype, "float32" | "float16" | "bfloat16" | "float64")
 }
 
 // ─── fp32 → bf16 ────────────────────────────────────────────────────
@@ -215,7 +229,76 @@ pub fn fp16_to_fp32(data: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+// ─── fp64 ↔ fp32 ────────────────────────────────────────────────────
+
+/// Cast fp64 bytes to fp32 bytes.
+///
+/// Values too large for fp32 become infinities, which is what the hardware
+/// does and what `tensor.float()` does. Nothing here is lossless; the caller
+/// asked for a narrower checkpoint.
+pub fn fp64_to_fp32(data: &[u8]) -> Result<Vec<u8>> {
+    if data.len() % 8 != 0 {
+        return Err(MoonclipError::Config(format!(
+            "fp64 data length {} is not a multiple of 8",
+            data.len()
+        )));
+    }
+    Ok(data
+        .par_chunks(8)
+        .flat_map_iter(|c| {
+            let v = f64::from_le_bytes(c.try_into().expect("8 bytes"));
+            (v as f32).to_le_bytes()
+        })
+        .collect())
+}
+
+/// Cast fp32 bytes back to fp64 bytes.
+pub fn fp32_to_fp64(data: &[u8]) -> Result<Vec<u8>> {
+    if data.len() % 4 != 0 {
+        return Err(MoonclipError::Config(format!(
+            "fp32 data length {} is not a multiple of 4",
+            data.len()
+        )));
+    }
+    Ok(data
+        .par_chunks(4)
+        .flat_map_iter(|c| {
+            let v = f32::from_le_bytes(c.try_into().expect("4 bytes"));
+            (v as f64).to_le_bytes()
+        })
+        .collect())
+}
+
 // ─── Generic dispatch ───────────────────────────────────────────────
+
+/// Bring any supported float dtype up to fp32, which every conversion goes
+/// through. Widening first costs one pass and removes the combinatorics: five
+/// float dtypes would otherwise need twenty direct paths, and the ones nobody
+/// wrote were exactly where the silent no-ops lived.
+fn widen_to_fp32(data: &[u8], src: &str) -> Result<Vec<u8>> {
+    match src {
+        "float32" => Ok(data.to_vec()),
+        "bfloat16" => bf16_to_fp32(data),
+        "float16" => fp16_to_fp32(data),
+        "float64" => fp64_to_fp32(data),
+        other => Err(MoonclipError::Config(format!(
+            "'{other}' is not a float dtype this build can cast"
+        ))),
+    }
+}
+
+/// The other half: fp32 down to the stored dtype.
+fn narrow_from_fp32(data: &[u8], dst: &str) -> Result<Vec<u8>> {
+    match dst {
+        "float32" => Ok(data.to_vec()),
+        "bfloat16" => fp32_to_bf16(data),
+        "float16" => fp32_to_fp16(data),
+        "float64" => fp32_to_fp64(data),
+        other => Err(MoonclipError::Config(format!(
+            "'{other}' is not a float dtype this build can cast"
+        ))),
+    }
+}
 
 /// Cast tensor bytes from `src_dtype` to `target_dtype`.
 /// Returns (casted_bytes, new_dtype_string).
@@ -229,18 +312,20 @@ pub fn cast_tensor(
         return Ok((data.to_vec(), src_dtype.to_string()));
     }
 
-    match (src_dtype, target) {
-        ("float32", DType::BFloat16) => Ok((fp32_to_bf16(data)?, "bfloat16".into())),
-        ("float32", DType::Float16) => Ok((fp32_to_fp16(data)?, "float16".into())),
-        ("bfloat16", DType::Float32) => Ok((bf16_to_fp32(data)?, "float32".into())),
-        ("float16", DType::Float32) => Ok((fp16_to_fp32(data)?, "float32".into())),
-        // Same dtype → no-op
-        ("float32", DType::Float32)
-        | ("bfloat16", DType::BFloat16)
-        | ("float16", DType::Float16) => Ok((data.to_vec(), src_dtype.to_string())),
-        // Non-float or unsupported → no cast
-        _ => Ok((data.to_vec(), src_dtype.to_string())),
+    let target_name = target.to_str();
+    if src_dtype == target_name || !is_castable_float(src_dtype) {
+        // Non-float data is stored as it is: an int tensor has no business
+        // being reinterpreted because a float setting was chosen.
+        return Ok((data.to_vec(), src_dtype.to_string()));
     }
+
+    // The common pair keeps its dedicated single pass.
+    if src_dtype == "float32" {
+        return Ok((narrow_from_fp32(data, target_name)?, target_name.to_string()));
+    }
+
+    let wide = widen_to_fp32(data, src_dtype)?;
+    Ok((narrow_from_fp32(&wide, target_name)?, target_name.to_string()))
 }
 
 /// Cast tensor bytes back from `stored_dtype` to `original_dtype`.
@@ -252,14 +337,20 @@ pub fn uncast_tensor(
     if stored_dtype == original_dtype {
         return Ok(data.to_vec());
     }
-
-    match (stored_dtype, original_dtype) {
-        ("bfloat16", "float32") => bf16_to_fp32(data),
-        ("float16", "float32") => fp16_to_fp32(data),
-        ("float32", "bfloat16") => fp32_to_bf16(data),
-        ("float32", "float16") => fp32_to_fp16(data),
-        _ => Ok(data.to_vec()),
+    if !is_castable_float(stored_dtype) || !is_castable_float(original_dtype) {
+        // Nothing was cast on the way in, so there is nothing to undo.
+        return Ok(data.to_vec());
     }
+
+    if stored_dtype == "float32" {
+        return narrow_from_fp32(data, original_dtype);
+    }
+    if original_dtype == "float32" {
+        return widen_to_fp32(data, stored_dtype);
+    }
+
+    let wide = widen_to_fp32(data, stored_dtype)?;
+    narrow_from_fp32(&wide, original_dtype)
 }
 
 // ─── Internal bit manipulation ──────────────────────────────────────
@@ -520,6 +611,87 @@ mod tests {
         let (back, dtype2) = cast_tensor(&casted, "bfloat16", &DType::Float32).unwrap();
         assert_eq!(dtype2, "float32");
         assert_eq!(back.len(), 4);
+    }
+
+    /// A typo in `save_dtype` used to mean "do not cast": full-precision
+    /// checkpoints, twice the configured size, and nothing said so.
+    #[test]
+    fn an_unknown_save_dtype_is_refused() {
+        assert!(DType::parse("bfloat").is_err());
+        assert!(DType::parse("float8").is_err());
+        assert_eq!(DType::parse("bf16").unwrap(), DType::BFloat16);
+        assert_eq!(DType::parse("BF16").unwrap(), DType::BFloat16);
+        assert_eq!(DType::parse("").unwrap(), DType::None);
+        assert_eq!(DType::parse("none").unwrap(), DType::None);
+    }
+
+    /// `is_castable_float` decides whether the save path asks for a cast, and
+    /// `cast_tensor` decides whether one happens. They have to agree, or a
+    /// tensor is stored in a dtype nobody chose.
+    #[test]
+    fn everything_declared_castable_is_actually_cast() {
+        for dtype in ["float32", "float16", "bfloat16", "float64"] {
+            let element = match dtype {
+                "float32" => 4,
+                "float64" => 8,
+                _ => 2,
+            };
+            let data = vec![0u8; element * 4];
+            let (out, stored) = cast_tensor(&data, dtype, &DType::BFloat16).unwrap();
+
+            if is_castable_float(dtype) {
+                assert_eq!(stored, "bfloat16", "{dtype} was declared castable");
+                assert_eq!(out.len(), 8, "{dtype} kept its original width");
+            } else {
+                assert_eq!(stored, dtype, "{dtype} is not declared castable");
+            }
+        }
+    }
+
+    /// Every float dtype reaches every other one, and comes back. The pairs
+    /// that used to be missing — anything with float64 at either end, and
+    /// fp16 ↔ bf16 — were silent no-ops rather than errors.
+    #[test]
+    fn every_float_pair_round_trips() {
+        let original: Vec<f32> = vec![1.0, -2.5, 0.0, 1024.0];
+
+        for src in ["float32", "float64", "float16", "bfloat16"] {
+            // Start from fp32 and produce the source dtype's bytes.
+            let fp32: Vec<u8> = original.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let src_bytes = narrow_from_fp32(&fp32, src).unwrap();
+
+            for target in [DType::BFloat16, DType::Float16, DType::Float32] {
+                let (stored, stored_dtype) =
+                    cast_tensor(&src_bytes, src, &target).unwrap();
+                assert_eq!(
+                    stored_dtype,
+                    target.to_str(),
+                    "{src} → {} did not happen",
+                    target.to_str()
+                );
+
+                let back = uncast_tensor(&stored, &stored_dtype, src).unwrap();
+                assert_eq!(
+                    back.len(),
+                    src_bytes.len(),
+                    "{src} → {} → {src} changed the width",
+                    target.to_str()
+                );
+
+                // bf16 keeps 8 mantissa bits, so 1024.0 and the rest survive
+                // exactly; this is about the path existing, not precision.
+                let widened = widen_to_fp32(&back, src).unwrap();
+                let values: Vec<f32> = widened
+                    .chunks(4)
+                    .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                    .collect();
+                assert_eq!(
+                    values, original,
+                    "{src} → {} → {src} changed the values",
+                    target.to_str()
+                );
+            }
+        }
     }
 
     #[test]

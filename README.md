@@ -48,7 +48,8 @@ checkpoint), 10 saves, CPU (`bench/benchmark_checkpoints.py`):
 Saves are asynchronous by default: `save()` returns as soon as the tensor
 data has been copied, while hashing, delta detection, zstd compression and
 the disk write run on a background thread and overlap with training. Call
-`flush()` when you need the checkpoint durably on disk; loads and
+`flush()` when you need the checkpoint on disk — as of 0.0.6 that means
+`fsync`ed, not merely written; loads and
 `list_snapshots()` wait for pending saves automatically. Pass
 `async_save=False` for fully synchronous saves.
 
@@ -132,12 +133,13 @@ start_step = mgr.resume(model=model, optimizer=optimizer)
 
 ## Tuning
 
-Two environment variables, neither required:
+Three environment variables, none required:
 
 | | |
 |---|---|
 | `MOONCLIP_THREADS` | Size of Moonclip's thread pool. Default: `cores / LOCAL_WORLD_SIZE`. |
 | `MOONCLIP_PROFILE=1` | Per-phase breakdown of the save path on stderr, plus a line whenever a save had to wait for the previous one to drain. |
+| `MOONCLIP_FSYNC=0` | Skip the `fsync` before a pack is renamed into place. Faster, and a machine that loses power mid-save can then come back holding a pack of the right length full of zeros — which the manifest vouches for. Only worth it where the checkpoint is not the thing being protected. |
 
 The parallel work runs in a pool of Moonclip's own, not rayon's global one, so it
 neither claims every core on the machine nor competes with your application's

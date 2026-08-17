@@ -89,6 +89,47 @@ impl LocalStorage {
     }
 }
 
+/// Whether writes are flushed to the device before they are made reachable.
+///
+/// On by default, and `MOONCLIP_FSYNC=0` turns it off.
+///
+/// The temp-file-then-rename dance below is atomic with respect to *readers* —
+/// nobody ever sees a half-written pack — and says nothing about power. The
+/// rename is a metadata operation and can reach the disk while the data it
+/// points at is still in the page cache, so a machine that loses power at the
+/// wrong moment comes back with a pack of exactly the right length, full of
+/// zeros, indexed by a manifest that vouches for it. That is worse than a
+/// missing checkpoint: recovery believes it. Meanwhile `flush()` promised the
+/// data was "durably on disk", which it was not.
+///
+/// The cost is a real one — an fsync per pack, on the path this library exists
+/// to make fast — which is why there is a way out. Spot instances and
+/// preemptible nodes are the case it is on for: the whole premise is that the
+/// machine can disappear.
+fn fsync_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            std::env::var("MOONCLIP_FSYNC").as_deref(),
+            Ok("0") | Ok("false")
+        )
+    })
+}
+
+/// Flush a directory entry so a rename into it survives a power cut.
+///
+/// Unix only. Windows has no way to open a directory as a file, and NTFS
+/// orders its metadata through the journal, so there is nothing to do there.
+#[cfg(unix)]
+fn sync_dir(dir: &Path) {
+    // Best effort: a filesystem that refuses this (some network mounts do)
+    // should not fail a checkpoint that is otherwise written.
+    let _ = std::fs::File::open(dir).and_then(|d| d.sync_all());
+}
+
+#[cfg(not(unix))]
+fn sync_dir(_dir: &Path) {}
+
 impl StorageBackend for LocalStorage {
     fn put(&self, rel_path: &str, data: &[u8]) -> Result<()> {
         self.put_parts(rel_path, &[data])
@@ -119,10 +160,21 @@ impl StorageBackend for LocalStorage {
                 file.write_all(&vec![0u8; pad])?;
             }
             file.flush()?;
+            // The bytes reach the device before the rename makes them
+            // reachable, so the two can never be persisted out of order.
+            // See `fsync_enabled`.
+            if fsync_enabled() {
+                file.sync_all()?;
+            }
         }
         tmp.persist(&path).map_err(|e| {
             MoonclipError::Storage(format!("Failed to persist {}: {}", path.display(), e))
         })?;
+        // And the rename itself, which is a change to the directory rather
+        // than to the file, and is not covered by the sync above.
+        if fsync_enabled() {
+            sync_dir(dir);
+        }
         Ok(())
     }
 

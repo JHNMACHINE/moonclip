@@ -301,7 +301,43 @@ impl S3Storage {
         Ok(S3Storage { config, agent })
     }
 
+    /// One attempt, retried on the failures that are worth retrying.
+    ///
+    /// There were none before 0.0.6: a single 503, a reset connection or a DNS
+    /// hiccup failed the sync, and object stores produce all three as a matter
+    /// of course — S3's own guidance is that clients retry 5xx and 429. A
+    /// checkpoint upload that gives up on the first blip is a checkpoint that
+    /// did not leave the machine.
+    ///
+    /// What is *not* retried: 4xx other than 429. A wrong key, a missing
+    /// bucket or a bad signature fails identically the second time, and
+    /// retrying only delays the error.
+    ///
+    /// Every request here is idempotent — PUT of a fixed key with fixed bytes,
+    /// GET, HEAD, DELETE — so a retry cannot compound.
     fn do_request(
+        &self,
+        method: &str,
+        key: &str,
+        body: Option<&[u8]>,
+        query_params: &[(&str, &str)],
+    ) -> std::result::Result<ureq::Response, MoonclipError> {
+        let mut backoff = std::time::Duration::from_millis(200);
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            match self.attempt_request(method, key, body, query_params) {
+                Ok(resp) => return Ok(resp),
+                Err(e) if attempt < MAX_ATTEMPTS && is_retryable(&e) => {
+                    std::thread::sleep(backoff);
+                    backoff *= 2;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    fn attempt_request(
         &self,
         method: &str,
         key: &str,
@@ -342,13 +378,98 @@ impl S3Storage {
             req.call()
         };
 
-        response.map_err(|e| match e {
-            ureq::Error::Status(code, resp) => {
-                let body = resp.into_string().unwrap_or_default();
-                MoonclipError::Storage(format!("S3 HTTP {code}: {body}"))
+        response.map_err(|e| status_error(key, e))
+    }
+
+    /// GET with a byte range, which is what a pack read wants.
+    ///
+    /// The trait's default implementation downloads the whole object and
+    /// slices it. On local storage that is a seek; on S3 it was the entire
+    /// checkpoint pulled over the network to read one tensor's few hundred
+    /// kilobytes — once per tensor. `Range` is not part of the signed header
+    /// set (host, x-amz-date and x-amz-content-sha256 are), so it can be
+    /// attached after signing.
+    fn ranged_get(&self, key: &str, offset: u64, len: usize) -> Result<Vec<u8>> {
+        use std::io::Read;
+
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+        let range = format!("bytes={}-{}", offset, offset + len as u64 - 1);
+
+        let mut backoff = std::time::Duration::from_millis(200);
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let signed = sign_request(&self.config, "GET", key, &sha256_hex(b""), &[], None);
+            let mut req = self.agent.get(&signed.url);
+            for (k, v) in &signed.headers {
+                req = req.set(k, v);
             }
-            ureq::Error::Transport(t) => MoonclipError::Storage(format!("S3 transport error: {t}")),
-        })
+
+            match req.set("Range", &range).call() {
+                Ok(resp) => {
+                    let mut buf = Vec::with_capacity(len);
+                    // Bounded by `len`, not by what the far side sends: a
+                    // server that ignores `Range` answers with the whole
+                    // object, and reading all of it would defeat the point.
+                    let mut reader = resp.into_reader().take(len as u64);
+                    reader
+                        .read_to_end(&mut buf)
+                        .map_err(|e| MoonclipError::Storage(format!("S3 read error: {e}")))?;
+                    return Ok(buf);
+                }
+                Err(e) => {
+                    let err = status_error(key, e);
+                    if attempt < MAX_ATTEMPTS && is_retryable(&err) {
+                        std::thread::sleep(backoff);
+                        backoff *= 2;
+                        continue;
+                    }
+                    return Err(err);
+                }
+            }
+        }
+    }
+}
+
+/// Three attempts total: enough to ride out a rolling restart on the far side,
+/// short enough that a genuinely broken endpoint is reported while the caller
+/// still has a machine to react on.
+const MAX_ATTEMPTS: u32 = 3;
+
+/// Turn a ureq failure into ours, keeping the status where callers can act on
+/// it.
+///
+/// 404 becomes `NotFound` here rather than being recovered from the message
+/// later. Callers used to look for the substring "404" in the error text,
+/// which also matched any object whose *key* contained those digits — a step
+/// number, a shard id — and reported a real failure as a missing object.
+fn status_error(key: &str, e: ureq::Error) -> MoonclipError {
+    match e {
+        ureq::Error::Status(404, _) => MoonclipError::NotFound(key.to_string()),
+        ureq::Error::Status(code, resp) => {
+            let body = resp.into_string().unwrap_or_default();
+            MoonclipError::Storage(format!("S3 HTTP {code}: {body}"))
+        }
+        ureq::Error::Transport(t) => MoonclipError::Storage(format!("S3 transport error: {t}")),
+    }
+}
+
+/// Whether this failure is worth another attempt.
+fn is_retryable(e: &MoonclipError) -> bool {
+    match e {
+        MoonclipError::Storage(msg) if msg.starts_with("S3 transport error") => true,
+        MoonclipError::Storage(msg) => {
+            // "S3 HTTP <code>: ..." — 5xx is the far side failing, 429 is it
+            // asking to be slowed down.
+            let code = msg
+                .strip_prefix("S3 HTTP ")
+                .and_then(|rest| rest.split(':').next())
+                .and_then(|c| c.trim().parse::<u16>().ok());
+            matches!(code, Some(429) | Some(500..=599))
+        }
+        _ => false,
     }
 }
 
@@ -361,14 +482,10 @@ impl StorageBackend for S3Storage {
 
     fn get(&self, rel_path: &str) -> Result<Vec<u8>> {
         let key = self.config.object_key(rel_path);
-        let resp = self.do_request("GET", &key, None, &[]).map_err(|e| {
-            // Convert 404 to NotFound
-            let msg = e.to_string();
-            if msg.contains("404") || msg.contains("NoSuchKey") {
-                MoonclipError::NotFound(rel_path.to_string())
-            } else {
-                e
-            }
+        let resp = self.do_request("GET", &key, None, &[]).map_err(|e| match e {
+            // Reported under the caller's path rather than the bucket key.
+            MoonclipError::NotFound(_) => MoonclipError::NotFound(rel_path.to_string()),
+            other => other,
         })?;
 
         let mut buf = Vec::new();
@@ -382,9 +499,17 @@ impl StorageBackend for S3Storage {
         let key = self.config.object_key(rel_path);
         match self.do_request("HEAD", &key, None, &[]) {
             Ok(_) => Ok(true),
-            Err(MoonclipError::Storage(msg)) if msg.contains("404") => Ok(false),
+            Err(MoonclipError::NotFound(_)) => Ok(false),
             Err(e) => Err(e),
         }
+    }
+
+    fn get_range(&self, rel_path: &str, offset: u64, len: usize) -> Result<Vec<u8>> {
+        let key = self.config.object_key(rel_path);
+        self.ranged_get(&key, offset, len).map_err(|e| match e {
+            MoonclipError::NotFound(_) => MoonclipError::NotFound(rel_path.to_string()),
+            other => other,
+        })
     }
 
     fn delete(&self, rel_path: &str) -> Result<()> {
@@ -445,6 +570,22 @@ impl StorageBackend for S3Storage {
 
 // ─── Minimal XML helpers (no dep needed for S3 ListObjects) ─────────
 
+/// Undo the escaping S3 applies to key names in its XML.
+///
+/// Keys may hold `&`, `<` and `>`, and the ampersand is not exotic: a shard
+/// name or metadata string containing `a&b` produces one. Without this,
+/// listing returned `a&amp;b`, every later `get` and `delete` used that
+/// literal key, and the object was invisible to retention — still billed,
+/// never reachable. `&amp;` is expanded last so `&amp;lt;` comes back as the
+/// text `&lt;` instead of being expanded twice.
+fn unescape_xml(s: &str) -> String {
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
+}
+
 fn extract_xml_values(xml: &str, tag: &str) -> Vec<String> {
     let open = format!("<{}>", tag);
     let close = format!("</{}>", tag);
@@ -454,7 +595,7 @@ fn extract_xml_values(xml: &str, tag: &str) -> Vec<String> {
     while let Some(start) = xml[search_from..].find(&open) {
         let abs_start = search_from + start + open.len();
         if let Some(end) = xml[abs_start..].find(&close) {
-            results.push(xml[abs_start..abs_start + end].to_string());
+            results.push(unescape_xml(&xml[abs_start..abs_start + end]));
             search_from = abs_start + end + close.len();
         } else {
             break;
@@ -535,6 +676,55 @@ mod tests {
 
         let truncated = extract_xml_value(xml, "IsTruncated");
         assert_eq!(truncated, Some("false".to_string()));
+    }
+
+    /// S3 escapes key names in its XML, and a key with `&` in it is the
+    /// common case: unescaped, every later call used a key that does not
+    /// exist, so the object could never be read or deleted again.
+    #[test]
+    fn listed_keys_come_back_unescaped() {
+        let xml = "<Contents><Key>runs/a&amp;b/rank_0.pack</Key></Contents>                   <Contents><Key>runs/x&lt;y&gt;z/rank_0.pack</Key></Contents>";
+        let keys = extract_xml_values(xml, "Key");
+        assert_eq!(keys[0], "runs/a&b/rank_0.pack");
+        assert_eq!(keys[1], "runs/x<y>z/rank_0.pack");
+    }
+
+    /// `&amp;lt;` is the text `&lt;`, not `<`: expanding the ampersand first
+    /// would turn it into a tag delimiter that was never in the key.
+    #[test]
+    fn unescaping_does_not_run_twice() {
+        assert_eq!(unescape_xml("a&amp;lt;b"), "a&lt;b");
+    }
+
+    /// Which failures are worth another attempt. Before 0.0.6 there were
+    /// none, and a single 503 failed a checkpoint upload.
+    #[test]
+    fn retries_cover_the_far_side_failing_and_nothing_else() {
+        let transport = MoonclipError::Storage("S3 transport error: connection reset".into());
+        let throttled = MoonclipError::Storage("S3 HTTP 429: SlowDown".into());
+        let unavailable = MoonclipError::Storage("S3 HTTP 503: please retry".into());
+        assert!(is_retryable(&transport));
+        assert!(is_retryable(&throttled));
+        assert!(is_retryable(&unavailable));
+
+        let denied = MoonclipError::Storage("S3 HTTP 403: SignatureDoesNotMatch".into());
+        let missing = MoonclipError::NotFound("snapshots/a/rank_0.pack".into());
+        assert!(!is_retryable(&denied), "a bad signature fails the same way twice");
+        assert!(!is_retryable(&missing));
+    }
+
+    /// A key holding the digits 404 must not read as a missing object. The
+    /// old check looked for that substring in the error text, and step
+    /// numbers are exactly where it appears.
+    #[test]
+    fn a_key_containing_404_is_not_a_missing_object() {
+        let real_failure =
+            MoonclipError::Storage("S3 HTTP 500: snapshots/step_404/rank_0.pack".into());
+        assert!(
+            !matches!(real_failure, MoonclipError::NotFound(_)),
+            "a server error was reported as a missing object"
+        );
+        assert!(is_retryable(&real_failure));
     }
 
     #[test]

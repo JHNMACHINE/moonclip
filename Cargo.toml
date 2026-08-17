@@ -1,6 +1,6 @@
 [package]
 name = "moonclip"
-version = "0.0.5"
+version = "0.0.6"
 edition = "2021"
 # Set by pyo3 0.29, the highest MSRV among the dependencies. Declared so a
 # toolchain that is too old fails with that message instead of an unrelated

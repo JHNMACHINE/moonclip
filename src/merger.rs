@@ -12,6 +12,7 @@ use crate::hash::hash_hex;
 use crate::inflight::InFlight;
 use crate::manifest::*;
 use crate::pack;
+use crate::remote_sync::PendingDeletes;
 use crate::storage::StorageBackend;
 
 /// Configuration for the delta merger.
@@ -75,6 +76,7 @@ impl DeltaMerger {
         manifest: Arc<Mutex<Manifest>>,
         compression: CompressionAlgo,
         in_flight: Arc<InFlight>,
+        pending_deletes: Arc<PendingDeletes>,
     ) -> Self {
         let (tx, rx) = mpsc::channel();
 
@@ -88,14 +90,14 @@ impl DeltaMerger {
                     match cmd {
                         MergeCommand::CheckAndMerge => {
                             if let Err(e) = crate::pool::install(|| {
-                                do_stride_merge(&config, &storage, &manifest, &compression, &in_flight)
+                                do_stride_merge(&config, &storage, &manifest, &compression, &in_flight, &pending_deletes)
                             }) {
                                 eprintln!("[Moonclip merger] stride merge error: {e}");
                             }
                         }
                         MergeCommand::ForceFullMerge(done) => {
                             let outcome = crate::pool::install(|| {
-                                do_full_merge(&storage, &manifest, &compression, &in_flight)
+                                do_full_merge(&storage, &manifest, &compression, &in_flight, &pending_deletes)
                             });
                             match done {
                                 // Somebody is waiting on this one, so the
@@ -205,6 +207,7 @@ fn do_stride_merge(
     manifest_lock: &Arc<Mutex<Manifest>>,
     compression: &CompressionAlgo,
     in_flight: &Arc<InFlight>,
+    pending_deletes: &Arc<PendingDeletes>,
 ) -> Result<()> {
     let mut manifest = manifest_lock.lock().unwrap();
     let delta_count = manifest.pending_delta_count();
@@ -214,7 +217,7 @@ fn do_stride_merge(
     // early every time and the depth cap could never fire.
     if delta_count >= config.max_chain_depth {
         drop(manifest);
-        return do_full_merge(storage, manifest_lock, compression, in_flight);
+        return do_full_merge(storage, manifest_lock, compression, in_flight, pending_deletes);
     }
 
     if config.stride == 0 || delta_count < config.stride {
@@ -291,10 +294,12 @@ fn do_stride_merge(
         for rank_entry in snap.ranks.values() {
             if let Some(ref pack_file) = rank_entry.pack_file {
                 let _ = storage.delete(pack_file);
+                pending_deletes.push(pack_file.clone());
             }
             for tensor in &rank_entry.tensors {
                 if let Some(ref filename) = tensor.filename {
                     let _ = storage.delete(filename);
+                    pending_deletes.push(filename.clone());
                 }
             }
         }
@@ -319,6 +324,7 @@ pub(crate) fn do_full_merge(
     manifest_lock: &Arc<Mutex<Manifest>>,
     compression: &CompressionAlgo,
     in_flight: &Arc<InFlight>,
+    pending_deletes: &Arc<PendingDeletes>,
 ) -> Result<()> {
     let manifest = manifest_lock.lock().unwrap();
 
@@ -589,13 +595,18 @@ pub(crate) fn do_full_merge(
         for rank_entry in snap.ranks.values() {
             if let Some(ref pack_file) = rank_entry.pack_file {
                 let _ = storage.delete(pack_file);
+                // The remote holds a copy of everything that was ever synced,
+                // and a merge makes most of it unreachable at once.
+                pending_deletes.push(pack_file.clone());
             }
             for tensor in &rank_entry.tensors {
                 if let Some(ref filename) = tensor.filename {
                     let _ = storage.delete(filename);
+                    pending_deletes.push(filename.clone());
                 }
             }
         }
+        let _ = storage.remove_dir(&format!("snapshots/{}", snap.id));
     }
 
     Ok(())
@@ -727,6 +738,12 @@ mod tests {
     /// touching these snapshots. See `crate::inflight`.
     fn unread() -> Arc<InFlight> {
         Arc::new(InFlight::default())
+    }
+
+    /// No remote configured, so the queue of keys to remove from it goes
+    /// nowhere. See `crate::remote_sync::PendingDeletes`.
+    fn no_remote() -> Arc<PendingDeletes> {
+        Arc::new(PendingDeletes::default())
     }
 
     /// Deterministic pseudo-random bytes. Real tensors barely compress, and a
@@ -926,7 +943,7 @@ mod tests {
         let (manifest, expected) = scenario(storage.as_ref(), 4, 40_000);
         let manifest = Arc::new(Mutex::new(manifest));
 
-        do_full_merge(&storage, &manifest, &ZSTD3, &unread()).unwrap();
+        do_full_merge(&storage, &manifest, &ZSTD3, &unread(), &no_remote()).unwrap();
 
         let m = manifest.lock().unwrap();
         assert_eq!(m.snapshots.len(), 1, "base and delta collapse into one");
@@ -957,7 +974,7 @@ mod tests {
         let (manifest, expected) = scenario(storage.as_ref(), 3, 30_000);
         let manifest = Arc::new(Mutex::new(manifest));
 
-        do_full_merge(&storage, &manifest, &ZSTD3, &unread()).unwrap();
+        do_full_merge(&storage, &manifest, &ZSTD3, &unread(), &no_remote()).unwrap();
 
         let m = manifest.lock().unwrap();
         let merged = &m.snapshots[0];
@@ -1009,7 +1026,7 @@ mod tests {
         counting.whole_file_reads.store(0, Ordering::Relaxed);
 
         let manifest = Arc::new(Mutex::new(manifest));
-        do_full_merge(&storage, &manifest, &ZSTD3, &unread()).unwrap();
+        do_full_merge(&storage, &manifest, &ZSTD3, &unread(), &no_remote()).unwrap();
 
         // Two packs hold everything the merge needs: the base and the delta.
         // Reading a whole pack per tensor makes a merge O(tensors x snapshots)
@@ -1049,7 +1066,7 @@ mod tests {
         assert_eq!(dropped.len(), 2);
 
         let manifest = Arc::new(Mutex::new(manifest));
-        do_stride_merge(&stride_config(3, 10), &storage, &manifest, &ZSTD3, &unread()).unwrap();
+        do_stride_merge(&stride_config(3, 10), &storage, &manifest, &ZSTD3, &unread(), &no_remote()).unwrap();
 
         {
             let m = manifest.lock().unwrap();
@@ -1066,7 +1083,7 @@ mod tests {
         // The survivor has to still reconstruct. It is a XOR against the base,
         // and nothing it needs was in the snapshots just dropped — that is the
         // whole claim the fold rests on.
-        do_full_merge(&storage, &manifest, &ZSTD3, &unread()).unwrap();
+        do_full_merge(&storage, &manifest, &ZSTD3, &unread(), &no_remote()).unwrap();
         let m = manifest.lock().unwrap();
         let merged = &m.snapshots[0];
         let rank = merged.ranks.get(&0).unwrap();
@@ -1089,7 +1106,7 @@ mod tests {
         let before: Vec<Uuid> = manifest.snapshots.iter().map(|s| s.id).collect();
 
         let manifest = Arc::new(Mutex::new(manifest));
-        do_stride_merge(&stride_config(3, 10), &storage, &manifest, &ZSTD3, &unread()).unwrap();
+        do_stride_merge(&stride_config(3, 10), &storage, &manifest, &ZSTD3, &unread(), &no_remote()).unwrap();
 
         let m = manifest.lock().unwrap();
         let after: Vec<Uuid> = m.snapshots.iter().map(|s| s.id).collect();
@@ -1107,7 +1124,7 @@ mod tests {
         let (manifest, _) = delta_run(storage.as_ref(), 2, 10_000, 3);
 
         let manifest = Arc::new(Mutex::new(manifest));
-        do_stride_merge(&stride_config(20, 3), &storage, &manifest, &ZSTD3, &unread()).unwrap();
+        do_stride_merge(&stride_config(20, 3), &storage, &manifest, &ZSTD3, &unread(), &no_remote()).unwrap();
 
         let m = manifest.lock().unwrap();
         assert_eq!(m.snapshots.len(), 1, "the depth limit should have merged");
@@ -1131,7 +1148,7 @@ mod tests {
         let base_id = manifest.snapshots[0].id;
 
         let manifest = Arc::new(Mutex::new(manifest));
-        do_stride_merge(&stride_config(3, 10), &storage, &manifest, &ZSTD3, &unread()).unwrap();
+        do_stride_merge(&stride_config(3, 10), &storage, &manifest, &ZSTD3, &unread(), &no_remote()).unwrap();
 
         let m = manifest.lock().unwrap();
         let ids: Vec<Uuid> = m.snapshots.iter().map(|s| s.id).collect();
@@ -1160,7 +1177,7 @@ mod tests {
             .collect();
 
         let manifest = Arc::new(Mutex::new(manifest));
-        let result = do_stride_merge(&stride_config(3, 10), &storage, &manifest, &ZSTD3, &unread());
+        let result = do_stride_merge(&stride_config(3, 10), &storage, &manifest, &ZSTD3, &unread(), &no_remote());
         assert!(result.is_err(), "the injected manifest write must fail");
 
         for pack in &packs {
@@ -1193,7 +1210,7 @@ mod tests {
         assert_eq!(packs.len(), 2);
 
         let manifest = Arc::new(Mutex::new(manifest));
-        let result = do_full_merge(&storage, &manifest, &ZSTD3, &unread());
+        let result = do_full_merge(&storage, &manifest, &ZSTD3, &unread(), &no_remote());
         assert!(result.is_err(), "the injected manifest write must fail");
 
         // The merge did not complete, so the snapshots it was merging are
@@ -1252,7 +1269,7 @@ mod tests {
             ..Default::default()
         }));
 
-        do_full_merge(&storage, &manifest, &ZSTD3, &unread()).unwrap();
+        do_full_merge(&storage, &manifest, &ZSTD3, &unread(), &no_remote()).unwrap();
 
         let m = manifest.lock().unwrap();
         let merged = m.snapshots.iter().find(|s| s.base_snapshot_id.is_none()).unwrap();
@@ -1300,7 +1317,7 @@ mod tests {
             ..Default::default()
         }));
 
-        do_full_merge(&storage, &manifest, &ZSTD3, &unread()).unwrap();
+        do_full_merge(&storage, &manifest, &ZSTD3, &unread(), &no_remote()).unwrap();
 
         let m = manifest.lock().unwrap();
         let merged = m.snapshots.iter().find(|s| s.base_snapshot_id.is_none()).unwrap();
@@ -1358,7 +1375,7 @@ mod tests {
             ..Default::default()
         }));
 
-        do_full_merge(&storage, &manifest, &ZSTD3, &unread()).unwrap();
+        do_full_merge(&storage, &manifest, &ZSTD3, &unread(), &no_remote()).unwrap();
 
         let m = manifest.lock().unwrap();
         let merged = m.snapshots.iter().find(|s| s.base_snapshot_id.is_none()).unwrap();

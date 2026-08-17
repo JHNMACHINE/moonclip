@@ -103,9 +103,28 @@ class MoonclipManager:
         """
         Save a checkpoint (single-rank mode).
 
+        Tensors may also be passed as `torch.Tensor` objects instead of
+        `(shape, dtype, bytes)` tuples, which skips a copy.
+
+        **The caller must not mutate those tensors' storage while this call is
+        running.** Moonclip reads them through `data_ptr()` with the GIL
+        released, so it is reading the live buffer, not a copy — the copy is
+        what this call is taking. Assigning into a tensor from another Python
+        thread races the read and stores a mixture of both states;
+        `resize_()`, `set_()` or letting the tensor be freed reallocates the
+        storage and leaves the pointer dangling, which is undefined behaviour
+        rather than a bad checkpoint.
+
+        The thread that called this is blocked inside it, so an ordinary
+        single-threaded training loop cannot violate this and nothing needs to
+        change. It is worth knowing about if a second thread touches the model
+        — an EMA updater, a pruning callback, an async evaluation loop. Pass
+        `(shape, dtype, bytes)` tuples there, or copy first.
+
         Args:
             step: Training step.
-            tensors: Dict mapping tensor_name -> (shape, dtype, bytes).
+            tensors: Dict mapping tensor_name -> (shape, dtype, bytes), or
+                tensor_name -> torch.Tensor (CPU, contiguous).
             metadata: Optional dict of string metadata.
 
         Returns:

@@ -401,11 +401,13 @@ fn make_full_entry(
     })
 }
 
+/// What a base-entry lookup answers with: the entry, the compression of the
+/// snapshot it came from, and that snapshot's pack bytes when a caller has
+/// already read them.
+pub type BaseEntry = (TensorEntry, CompressionAlgo, Option<Arc<Vec<u8>>>);
+
 /// Resolver for base-snapshot tensor entries during load.
-/// Returns (entry, compression of the base snapshot, optional shared pack bytes).
-pub type BaseEntryResolver<'a> = dyn Fn(uuid::Uuid, &str) -> Result<(TensorEntry, CompressionAlgo, Option<Arc<Vec<u8>>>)>
-    + Sync
-    + 'a;
+pub type BaseEntryResolver<'a> = dyn Fn(uuid::Uuid, &str) -> Result<BaseEntry> + Sync + 'a;
 
 /// Load a tensor's raw bytes, resolving delta chains if needed.
 /// If the tensor was saved with a cast (e.g. fp32→bf16), it is
@@ -480,7 +482,7 @@ fn resolve_base_entry(
     base_id: uuid::Uuid,
     name: &str,
     find_base_entry: &BaseEntryResolver<'_>,
-) -> Result<(TensorEntry, CompressionAlgo, Option<Arc<Vec<u8>>>)> {
+) -> Result<BaseEntry> {
     let mut current = name.to_string();
     // One hop is the rule: an alias points at a tensor that holds bytes. The
     // bound is for a manifest that is corrupt or written by something else —

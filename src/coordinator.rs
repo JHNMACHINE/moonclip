@@ -12,7 +12,7 @@ use crate::inflight::InFlight;
 use crate::manifest::*;
 use crate::merger::{DeltaMerger, MergerConfig};
 use crate::pack;
-use crate::remote_sync::{RemoteSyncConfig, RemoteSyncer};
+use crate::remote_sync::{PendingDeletes, RemoteSyncConfig, RemoteSyncer};
 use crate::storage::StorageBackend;
 use crate::tensor::{self, BaseCache, TensorData};
 
@@ -330,6 +330,9 @@ pub(crate) struct Core {
     /// See [`crate::inflight`]: it is what keeps a merge from deleting the
     /// base a save is diffing against.
     in_flight: Arc<InFlight>,
+    /// Files retention and the merger have deleted locally, waiting for the
+    /// syncer to take them off the remote too.
+    pending_deletes: Arc<PendingDeletes>,
     /// See [`CoordinatorConfig::keep_base_in_memory`].
     retained_base: Mutex<Option<RetainedBase>>,
 }
@@ -386,6 +389,7 @@ impl Coordinator {
         let manifest = Arc::new(Mutex::new(manifest));
 
         let in_flight = Arc::new(InFlight::default());
+        let pending_deletes = Arc::new(PendingDeletes::default());
 
         // Spawn merger if configured
         let merger = config.merger.clone().map(|mc| {
@@ -395,6 +399,7 @@ impl Coordinator {
                 Arc::clone(&manifest),
                 config.compression.clone(),
                 Arc::clone(&in_flight),
+                Arc::clone(&pending_deletes),
             )
         });
 
@@ -404,6 +409,7 @@ impl Coordinator {
                 Arc::clone(&storage),
                 Arc::clone(remote),
                 sync_config.clone(),
+                Arc::clone(&pending_deletes),
             )),
             _ => None,
         };
@@ -417,6 +423,7 @@ impl Coordinator {
             merger,
             syncer,
             in_flight,
+            pending_deletes,
             retained_base: Mutex::new(None),
         });
 
@@ -705,33 +712,88 @@ impl Core {
         let rank_entry =
             self.save_rank_tensors(snap_id, &snap_dir, &base_snap, tensors, &context)?;
 
-        // Re-read manifest again (another rank may have saved concurrently)
-        self.reload_manifest()?;
-
-        // Update the snapshot with this rank's data
-        let mut manifest = self.manifest.lock().unwrap();
-        if let Some(snap) = manifest.snapshots.iter_mut().find(|s| s.id == snap_id) {
-            snap.ranks.insert(self.config.rank, rank_entry);
-        }
-        self.persist_manifest(&manifest)?;
-
+        // **This rank writes its pack and stops there.**
+        //
+        // It used to reload the manifest, insert its own entry and write the
+        // whole file back. Every rank is a separate process sharing one
+        // storage root, so that sequence is read-modify-write with no lock
+        // around it: two ranks that reload before either persists each write
+        // back a manifest containing only their own entry, and the loser's
+        // shard is referenced by nothing. The Python layer worked around it by
+        // putting a barrier between the ranks and saving them one at a time —
+        // which made the README's "each rank saves its own shard
+        // independently" false, and a multi-GPU save serial.
+        //
+        // Nothing needs writing here anyway: the pack already carries a
+        // descriptor holding exactly this `RankEntry` (see `crate::pack`), and
+        // `finalize_snapshot` reads them back to assemble the snapshot. One
+        // writer, no lock, and the shards go in parallel.
+        let _ = rank_entry;
         Ok(())
+    }
+
+    /// Every rank's entry for `snap_id`, read back from the packs themselves.
+    ///
+    /// A rank that has not written yet is simply absent, which is what the
+    /// caller counts against `world_size`. A pack that is present but
+    /// unreadable is an error rather than an absence: silently finalizing a
+    /// snapshot one rank short produces a checkpoint that cannot be restored,
+    /// and does it at the only moment anyone was watching.
+    fn collect_rank_shards(&self, snap_id: Uuid) -> Result<HashMap<u32, RankEntry>> {
+        let prefix = format!("snapshots/{snap_id}");
+        let files = match self.storage.list(&prefix) {
+            Ok(f) => f,
+            Err(MoonclipError::NotFound(_)) => Vec::new(),
+            Err(e) => return Err(e),
+        };
+
+        let mut shards = HashMap::new();
+        for file in files.iter().filter(|f| f.ends_with(".pack")) {
+            let header = self.storage.get_range(file, 0, pack::HEADER_LEN as usize)?;
+            let (offset, length) = pack::decode_header(&header).ok_or_else(|| {
+                MoonclipError::Storage(format!("{file} has no pack header"))
+            })?;
+            let encoded = self.storage.get_range(file, offset, length as usize)?;
+            if encoded.len() != length as usize {
+                return Err(MoonclipError::Storage(format!(
+                    "{file} is truncated: the rank that wrote it did not finish"
+                )));
+            }
+            let descriptor: pack::PackDescriptor = serde_json::from_slice(&encoded)
+                .map_err(|e| MoonclipError::Serialization(format!("{file}: {e}")))?;
+            if descriptor.snapshot_id != snap_id {
+                return Err(MoonclipError::Storage(format!(
+                    "{file} belongs to snapshot {}, not {snap_id}",
+                    descriptor.snapshot_id
+                )));
+            }
+            shards.insert(descriptor.rank.rank, descriptor.rank);
+        }
+
+        Ok(shards)
     }
 
     fn finalize_snapshot(&self, snap_id: Uuid) -> Result<()> {
         // Re-read from storage to see all ranks' contributions
         self.reload_manifest()?;
 
+        // The ranks are collected from the packs they wrote, not from what
+        // they managed to get into the manifest — see `save_rank_in_pool`.
+        // Every rank's `RankEntry` is inside its own pack's descriptor, so
+        // this is the same data by a route that has one writer.
+        let shards = self.collect_rank_shards(snap_id)?;
+
         let mut manifest = self.manifest.lock().unwrap();
         if let Some(snap) = manifest.snapshots.iter_mut().find(|s| s.id == snap_id) {
             // Verify all ranks have reported
             let expected = self.config.world_size;
-            let actual = snap.ranks.len() as u32;
+            let actual = shards.len() as u32;
             if actual < expected {
                 return Err(MoonclipError::Config(format!(
                     "Cannot finalize: only {actual}/{expected} ranks have saved"
                 )));
             }
+            snap.ranks = shards;
             snap.finalized = true;
         } else {
             return Err(MoonclipError::NotFound(format!("Snapshot {snap_id}")));
@@ -828,7 +890,7 @@ impl Core {
 
         let resolver = |base_id: Uuid,
                         tensor_name: &str|
-         -> Result<(TensorEntry, CompressionAlgo, Option<Arc<Vec<u8>>>)> {
+         -> Result<crate::tensor::BaseEntry> {
             if let Some((cached_id, entries, comp, pack)) = &base_ctx {
                 if *cached_id == base_id {
                     let entry = entries.get(tensor_name).cloned().ok_or_else(|| {
@@ -1184,7 +1246,7 @@ impl Core {
         &self,
         base_id: Uuid,
         tensor_name: &str,
-    ) -> Result<(TensorEntry, CompressionAlgo, Option<Arc<Vec<u8>>>)> {
+    ) -> Result<crate::tensor::BaseEntry> {
         let manifest = self.manifest.lock().unwrap();
         let base_snap = manifest
             .find_snapshot(base_id)
@@ -1375,11 +1437,16 @@ impl Core {
                 // Delete pack file
                 if let Some(ref pack_file) = rank_entry.pack_file {
                     let _ = self.storage.delete(pack_file);
+                    // And, eventually, from the bucket: retention that only
+                    // bounds the local disk leaves the remote growing for the
+                    // length of the run. See `crate::remote_sync`.
+                    self.pending_deletes.push(pack_file.clone());
                 }
                 // Delete legacy individual files
                 for tensor in &rank_entry.tensors {
                     if let Some(ref filename) = tensor.filename {
                         let _ = self.storage.delete(filename);
+                        self.pending_deletes.push(filename.clone());
                     }
                 }
             }
@@ -2133,6 +2200,7 @@ mod tests {
             &manifest,
             &CompressionAlgo::Zstd { level: 1 },
             &Arc::new(InFlight::default()),
+            &Arc::new(crate::remote_sync::PendingDeletes::default()),
         )
         .unwrap();
         let merged = {
@@ -2933,6 +3001,7 @@ mod tests {
                 &merge_manifest,
                 &merge_compression,
                 &merge_in_flight,
+                &Arc::new(crate::remote_sync::PendingDeletes::default()),
             );
         }));
 
