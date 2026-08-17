@@ -475,21 +475,106 @@ class TestSaveDtype:
         assert hi == float("inf") and lo == float("-inf")
 
 
-# ─── Warnings ───────────────────────────────────────────────────────
+# ─── Merging ────────────────────────────────────────────────────────
 
-class TestMergerWarning:
-    def test_merge_stride_warns_about_the_known_defect(self, tmp_path):
-        """Merging drops tensors added after the base snapshot (fixed in 0.0.6).
+class TestMerging:
+    """The fold has to stand in for the newest snapshot exactly.
 
-        Whoever turns it on has to hear that before the run, not after.
-        """
-        with pytest.warns(UserWarning, match="merge_stride"):
-            MoonclipManager(storage_root=str(tmp_path), merge_stride=3)
+    Until 0.0.6 it rebuilt the merged snapshot from the *base* snapshot's
+    tensor list, so the model's shape at the base decided what survived.
+    """
 
-    def test_the_default_is_silent(self, tmp_path):
+    def _mgr(self, tmp_path):
+        return MoonclipManager(
+            storage_root=str(tmp_path),
+            merge_stride=2,
+            merge_max_chain=3,
+            full_every_steps=100000,
+        )
+
+    def test_a_tensor_added_after_the_base_survives_the_merge(self, tmp_path):
+        mgr = self._mgr(tmp_path)
+        weight = random.Random(3).randbytes(40_000)
+        adapter = random.Random(4).randbytes(40_000)
+
+        mgr.save_tensors(step=1, tensors={"w": ([10000], "float32", weight)})
+        for step in (2, 3, 4):
+            mgr.save_tensors(
+                step=step,
+                tensors={
+                    "w": ([10000], "float32", weight),
+                    "adapter": ([10000], "float32", adapter),
+                },
+            )
+        mgr.merge_now()
+        mgr.flush()
+
+        _, loaded = mgr.load_latest()
+        assert "adapter" in loaded, f"the merge dropped it; kept: {sorted(loaded)}"
+        assert loaded["adapter"] == adapter
+
+    def test_a_tensor_removed_after_the_base_stays_removed(self, tmp_path):
+        mgr = self._mgr(tmp_path)
+        keep = random.Random(5).randbytes(40_000)
+        drop = random.Random(6).randbytes(40_000)
+
+        mgr.save_tensors(
+            step=1,
+            tensors={
+                "keep": ([10000], "float32", keep),
+                "dropped": ([10000], "float32", drop),
+            },
+        )
+        for step in (2, 3, 4):
+            mgr.save_tensors(step=step, tensors={"keep": ([10000], "float32", keep)})
+        mgr.merge_now()
+        mgr.flush()
+
+        _, loaded = mgr.load_latest()
+        assert "dropped" not in loaded, "a pruned tensor came back through the merge"
+        assert loaded["keep"] == keep
+
+    def test_the_constructor_is_silent(self, tmp_path):
+        """0.0.5 warned here, because the fold lost tensors. 0.0.6 does not."""
         with warnings.catch_warnings():
             warnings.simplefilter("error")
-            MoonclipManager(storage_root=str(tmp_path))
+            MoonclipManager(storage_root=str(tmp_path), merge_stride=3)
+
+
+# ─── Tied weights ───────────────────────────────────────────────────
+
+class TestTiedWeights:
+    def test_a_change_in_tensor_order_keeps_the_snapshot_readable(self, tmp_path):
+        """Dedup keeps the first of a tied pair and aliases the second.
+
+        Which one comes first is the state dict's iteration order, and that
+        changes when a model is wrapped differently — FSDP, a compile pass, a
+        renamed module. The tensor that used to be the alias then carries the
+        bytes, is unchanged since the base, and is stored `Skipped`; resolving
+        that skip used to land on the base's alias entry and fail the load.
+        """
+        mgr = MoonclipManager(storage_root=str(tmp_path), full_every_steps=100000)
+        shared = random.Random(9).randbytes(200_000)
+
+        mgr.save_tensors(
+            step=1,
+            tensors={
+                "emb": ([50000], "float32", shared),
+                "head": ([50000], "float32", shared),
+            },
+        )
+        second = mgr.save_tensors(
+            step=2,
+            tensors={
+                "head": ([50000], "float32", shared),
+                "emb": ([50000], "float32", shared),
+            },
+        )
+        mgr.flush()
+
+        loaded = mgr.load(second)
+        assert loaded["emb"] == shared
+        assert loaded["head"] == shared
 
 
 # ─── Concurrency ────────────────────────────────────────────────────

@@ -9,26 +9,23 @@ use crate::compression;
 use crate::delta;
 use crate::error::{Result, MoonclipError};
 use crate::hash::hash_hex;
+use crate::inflight::InFlight;
 use crate::manifest::*;
 use crate::pack;
 use crate::storage::StorageBackend;
 
 /// Configuration for the delta merger.
 ///
-/// # Known defect
+/// Folding is opt-in — the Python constructor defaults `merge_stride` to 0,
+/// which leaves this unconstructed — because it trades restore points for
+/// space: N snapshots become one, and the N-1 steps in between stop being
+/// checkpoints anyone can go back to.
 ///
-/// [`do_full_merge`] rebuilds a merged snapshot by walking the **base**
-/// snapshot's tensor list, so the merge only ever knows about the tensors that
-/// existed at the base. A tensor that first appears in a later delta is not in
-/// that list and is dropped; a tensor removed after the base is resurrected
-/// from it. The merged snapshot loads without complaint either way — the
-/// parameters are simply gone.
-///
-/// This is safe when the set of tensor names is fixed for the whole run, which
-/// covers ordinary training. It is not safe for anything that grows or prunes
-/// the model between checkpoints. Merging is opt-in for that reason: the
-/// Python constructor defaults `merge_stride` to 0, which leaves this
-/// unconstructed.
+/// Until 0.0.6 it also traded away tensors. [`do_full_merge`] rebuilt the
+/// merged snapshot from the *base* snapshot's tensor list, so a parameter the
+/// model gained after the base was dropped and one it lost came back, in
+/// silence. It walks the newest delta now, which is the state dict as it stood
+/// at the step the merge stands in for.
 #[derive(Debug, Clone)]
 pub struct MergerConfig {
     /// After `stride` consecutive deltas, fold them into the newest one.
@@ -52,7 +49,11 @@ impl Default for MergerConfig {
 
 pub(crate) enum MergeCommand {
     CheckAndMerge,
-    ForceFullMerge,
+    /// The channel, when present, is how the caller waits for the fold to
+    /// finish. `save_final` needs that: it merges and then syncs, and a merge
+    /// that is still running when the upload starts means the merged snapshot
+    /// — the one holding the whole run — is not among the files that go up.
+    ForceFullMerge(Option<mpsc::Sender<Result<()>>>),
     Shutdown,
 }
 
@@ -64,11 +65,16 @@ pub struct DeltaMerger {
 }
 
 impl DeltaMerger {
-    pub fn new(
+    /// Crate-internal since 0.0.6: a merger has to share the coordinator's
+    /// in-flight registry, or it deletes snapshots out from under saves and
+    /// loads that are reading them. There is no way to hand one in from
+    /// outside the crate, and no way to make one safely without it.
+    pub(crate) fn new(
         config: MergerConfig,
         storage: Arc<dyn StorageBackend>,
         manifest: Arc<Mutex<Manifest>>,
         compression: CompressionAlgo,
+        in_flight: Arc<InFlight>,
     ) -> Self {
         let (tx, rx) = mpsc::channel();
 
@@ -82,16 +88,27 @@ impl DeltaMerger {
                     match cmd {
                         MergeCommand::CheckAndMerge => {
                             if let Err(e) = crate::pool::install(|| {
-                                do_stride_merge(&config, &storage, &manifest, &compression)
+                                do_stride_merge(&config, &storage, &manifest, &compression, &in_flight)
                             }) {
                                 eprintln!("[Moonclip merger] stride merge error: {e}");
                             }
                         }
-                        MergeCommand::ForceFullMerge => {
-                            if let Err(e) = crate::pool::install(|| {
-                                do_full_merge(&storage, &manifest, &compression)
-                            }) {
-                                eprintln!("[Moonclip merger] full merge error: {e}");
+                        MergeCommand::ForceFullMerge(done) => {
+                            let outcome = crate::pool::install(|| {
+                                do_full_merge(&storage, &manifest, &compression, &in_flight)
+                            });
+                            match done {
+                                // Somebody is waiting on this one, so the
+                                // failure is theirs to see rather than the
+                                // log's to keep.
+                                Some(tx) => {
+                                    let _ = tx.send(outcome);
+                                }
+                                None => {
+                                    if let Err(e) = outcome {
+                                        eprintln!("[Moonclip merger] full merge error: {e}");
+                                    }
+                                }
                             }
                         }
                         MergeCommand::Shutdown => break,
@@ -112,9 +129,33 @@ impl DeltaMerger {
         }
     }
 
-    pub fn force_full_merge(&self) {
-        if let Some(ref tx) = self.sender {
-            let _ = tx.lock().unwrap().send(MergeCommand::ForceFullMerge);
+    /// Fold everything into one full snapshot and **wait for it**.
+    ///
+    /// Sending the command and returning is not enough for the one caller that
+    /// matters. `save_final` merges and then syncs to remote storage, and the
+    /// merge runs on another thread: without the wait, the upload lists the
+    /// files while the merge is still writing, and the run's final checkpoint
+    /// — every earlier one having just been folded into it — is the one thing
+    /// that does not reach the bucket.
+    pub(crate) fn force_full_merge(&self) -> Result<()> {
+        let Some(ref sender) = self.sender else {
+            return Ok(());
+        };
+        let (tx, rx) = mpsc::channel();
+        if sender
+            .lock()
+            .unwrap()
+            .send(MergeCommand::ForceFullMerge(Some(tx)))
+            .is_err()
+        {
+            // The merger thread is gone, so there is nothing to wait for and
+            // nothing was merged. Not an error: shutdown races with this.
+            return Ok(());
+        }
+        match rx.recv() {
+            Ok(outcome) => outcome,
+            // Same case, one step later: the thread died holding the channel.
+            Err(_) => Ok(()),
         }
     }
 
@@ -163,6 +204,7 @@ fn do_stride_merge(
     storage: &Arc<dyn StorageBackend>,
     manifest_lock: &Arc<Mutex<Manifest>>,
     compression: &CompressionAlgo,
+    in_flight: &Arc<InFlight>,
 ) -> Result<()> {
     let mut manifest = manifest_lock.lock().unwrap();
     let delta_count = manifest.pending_delta_count();
@@ -172,7 +214,7 @@ fn do_stride_merge(
     // early every time and the depth cap could never fire.
     if delta_count >= config.max_chain_depth {
         drop(manifest);
-        return do_full_merge(storage, manifest_lock, compression);
+        return do_full_merge(storage, manifest_lock, compression, in_flight);
     }
 
     if config.stride == 0 || delta_count < config.stride {
@@ -206,6 +248,14 @@ fn do_stride_merge(
     if superseded.is_empty() {
         return Ok(());
     }
+
+    // Nothing is folded out from under a reader. Taken while the manifest lock
+    // is still held, so the set decided above is the set claimed here — see
+    // `crate::inflight`. A refusal is not an error: the next save notifies the
+    // merger again, and by then the reader is gone.
+    let Some(_claim) = in_flight.claim(&superseded) else {
+        return Ok(());
+    };
 
     let doomed: Vec<Snapshot> = manifest
         .snapshots
@@ -268,6 +318,7 @@ pub(crate) fn do_full_merge(
     storage: &Arc<dyn StorageBackend>,
     manifest_lock: &Arc<Mutex<Manifest>>,
     compression: &CompressionAlgo,
+    in_flight: &Arc<InFlight>,
 ) -> Result<()> {
     let manifest = manifest_lock.lock().unwrap();
 
@@ -289,14 +340,21 @@ pub(crate) fn do_full_merge(
         return Ok(());
     }
 
+    // The base and every delta folded into it are about to stop existing, so
+    // claim them before the manifest lock goes: a save that picks this base up
+    // afterwards writes a full snapshot instead of a delta against something
+    // that will be gone, and a save already inside one of them makes the claim
+    // fail. See `crate::inflight` for why neither side waits for the other.
+    let claimed: Vec<Uuid> = std::iter::once(base_id).chain(deltas.iter().map(|s| s.id)).collect();
+    let Some(_claim) = in_flight.claim(&claimed) else {
+        return Ok(());
+    };
+
     drop(manifest);
 
     let merged_id = Uuid::new_v4();
     let merged_dir = format!("snapshots/{}", merged_id);
     let mut merged_ranks: HashMap<u32, RankEntry> = HashMap::new();
-
-    let mut all_ranks: Vec<u32> = base_snap.ranks.keys().cloned().collect();
-    all_ranks.sort();
 
     // Fixed before the first pack is written, because every rank's descriptor
     // repeats them: a reader that finds two ranks describing different
@@ -310,12 +368,53 @@ pub(crate) fn do_full_merge(
         m.insert("merged_deltas".into(), format!("{}", deltas.len()));
         m
     };
+
+    let mut all_ranks: Vec<u32> = base_snap
+        .ranks
+        .keys()
+        .chain(last_delta.ranks.keys())
+        .cloned()
+        .collect();
+    all_ranks.sort_unstable();
+    all_ranks.dedup();
     let world_size = all_ranks.len() as u32;
 
     for &rank in &all_ranks {
-        let base_rank = match base_snap.ranks.get(&rank) {
+        // **The newest delta decides which tensors exist, not the base.**
+        //
+        // Every delta is written against the last full snapshot and carries an
+        // entry for each tensor in the state dict — `Skipped` for the ones that
+        // match the base. So a delta is a complete description of the state at
+        // its step, and it is exactly what `Core::load` walks when that
+        // snapshot is loaded. A merge stands in for the newest delta, so it has
+        // to walk the same list.
+        //
+        // Walking the *base's* list instead, which is what this did until
+        // 0.0.6, gets both edges wrong and neither one loudly: a tensor the
+        // model gained after the base is absent from that list and vanishes
+        // from the merged snapshot, and a tensor the model dropped is still in
+        // it and comes back from the dead. Adapters, growing heads and pruning
+        // all produce one or the other, and the merged checkpoint loads
+        // perfectly well afterwards — with the wrong set of parameters.
+        //
+        // The intermediate deltas are not replayed either. They cannot add
+        // information: each describes the same base, so the newest supersedes
+        // all of them. Replaying them in order also actively corrupted the
+        // "changed and changed back" case, where the newest delta says
+        // `Skipped` (identical to the base) but the sequence left the earlier
+        // value in place.
+        let source = match last_delta
+            .ranks
+            .get(&rank)
+            .or_else(|| base_snap.ranks.get(&rank))
+        {
             Some(r) => r,
             None => continue,
+        };
+        let source_snap = if last_delta.ranks.contains_key(&rank) {
+            last_delta
+        } else {
+            &base_snap
         };
 
         let mut merged_tensors = Vec::new();
@@ -327,79 +426,39 @@ pub(crate) fn do_full_merge(
         let mut total_compressed = 0u64;
         let mut total_raw = 0u64;
 
-        for base_tensor in &base_rank.tensors {
-            // What the delta chain does to this tensor after the base.
-            let chain: Vec<&TensorEntry> = deltas
-                .iter()
-                .filter_map(|d| d.ranks.get(&rank))
-                .filter_map(|r| r.tensors.iter().find(|t| t.name == base_tensor.name))
-                .collect();
-
-            // An alias holds no bytes of its own. Unless the chain later
-            // overwrites it, carry the reference through — the tensor it
-            // points at is materialized in this same rank entry.
-            let stays_alias = base_tensor.storage == TensorStorage::Alias
-                && chain.iter().all(|t| {
-                    matches!(t.storage, TensorStorage::Skipped | TensorStorage::Alias)
-                });
-            if stays_alias {
-                let latest = chain
-                    .iter()
-                    .rev()
-                    .find(|t| t.storage == TensorStorage::Alias)
-                    .copied()
-                    .unwrap_or(base_tensor);
-                total_raw += latest.raw_size;
-                merged_tensors.push(latest.clone());
+        for entry in &source.tensors {
+            // An alias holds no bytes of its own: it points at another tensor
+            // in this same rank entry, which is materialized below under its
+            // own name. Carry the reference through untouched.
+            if entry.storage == TensorStorage::Alias {
+                total_raw += entry.raw_size;
+                merged_tensors.push(entry.clone());
                 continue;
             }
 
-            let mut current_data = if base_tensor.storage == TensorStorage::Alias {
-                // A Full later in the chain replaces this wholesale; a
-                // delta can never target an alias, since deltas are only
-                // computed against Full bases.
-                Vec::new()
-            } else {
-                load_tensor_data(base_tensor, &base_snap, rank, storage, compression)?
-            };
-
-            for delta_snap in &deltas {
-                if let Some(delta_rank) = delta_snap.ranks.get(&rank) {
-                    if let Some(delta_tensor) = delta_rank
-                        .tensors
-                        .iter()
-                        .find(|t| t.name == base_tensor.name)
-                    {
-                        match delta_tensor.storage {
-                            // Unchanged, or a reference whose bytes are
-                            // materialized under the target's own name.
-                            TensorStorage::Skipped | TensorStorage::Alias => {}
-                            TensorStorage::Full => {
-                                current_data = load_tensor_data(
-                                    delta_tensor,
-                                    delta_snap,
-                                    rank,
-                                    storage,
-                                    compression,
-                                )?;
-                            }
-                            TensorStorage::DeltaXor => {
-                                let compressed =
-                                    load_compressed_data(delta_tensor, delta_snap, rank, storage)?;
-                                let mut delta_bytes =
-                                    compression::decompress(&compressed, compression)?;
-                                if delta_tensor.shuffled {
-                                    delta_bytes = crate::shuffle::unshuffle(
-                                        &delta_bytes,
-                                        crate::shuffle::element_size(&delta_tensor.dtype),
-                                    );
-                                }
-                                current_data = delta::apply_delta(&current_data, &delta_bytes)?;
-                            }
-                        }
-                    }
+            let current_data = match entry.storage {
+                TensorStorage::Full => {
+                    load_tensor_data(entry, source_snap, rank, storage, compression)?
                 }
-            }
+                TensorStorage::Skipped => {
+                    // Unchanged since the base, so the bytes are the base's.
+                    base_tensor_data(&base_snap, rank, &entry.name, storage, compression)?
+                }
+                TensorStorage::DeltaXor => {
+                    let base_raw =
+                        base_tensor_data(&base_snap, rank, &entry.name, storage, compression)?;
+                    let compressed = load_compressed_data(entry, source_snap, rank, storage)?;
+                    let mut delta_bytes = compression::decompress(&compressed, compression)?;
+                    if entry.shuffled {
+                        delta_bytes = crate::shuffle::unshuffle(
+                            &delta_bytes,
+                            crate::shuffle::element_size(&entry.dtype),
+                        );
+                    }
+                    delta::apply_delta(&base_raw, &delta_bytes)?
+                }
+                TensorStorage::Alias => unreachable!("handled above"),
+            };
 
             // Store as full, at its place in the pack.
             let raw_hash = hash_hex(&current_data);
@@ -409,9 +468,9 @@ pub(crate) fn do_full_merge(
             total_raw += current_data.len() as u64;
 
             merged_tensors.push(TensorEntry {
-                name: base_tensor.name.clone(),
-                shape: base_tensor.shape.clone(),
-                dtype: base_tensor.dtype.clone(),
+                name: entry.name.clone(),
+                shape: entry.shape.clone(),
+                dtype: entry.dtype.clone(),
                 storage: TensorStorage::Full,
                 alias_of: None,
                 filename: None,
@@ -421,7 +480,7 @@ pub(crate) fn do_full_merge(
                 hash_raw: raw_hash,
                 hash_compressed: Some(compressed_hash),
                 shuffled: false,
-                original_dtype: None,
+                original_dtype: entry.original_dtype.clone(),
             });
 
             offset += compressed.len() as u64;
@@ -435,15 +494,17 @@ pub(crate) fn do_full_merge(
             .count();
         let full_count = merged_tensors.len() - alias_count;
 
-        // A rank of nothing but aliases holds no bytes, so there is no pack to
-        // write — the same call the save path makes when a snapshot changed
-        // nothing.
-        let pack_file = (!blobs.is_empty()).then(|| format!("{}/rank_{}.pack", merged_dir, rank));
+        // A rank of nothing but aliases holds no bytes, and still gets a pack:
+        // the descriptor in it is what startup recovery rebuilds a snapshot
+        // from, and a merge is the worst moment to produce something recovery
+        // cannot read — the run's whole history has just collapsed into this
+        // one snapshot. Same rule as the save path.
+        let pack_file = format!("{}/rank_{}.pack", merged_dir, rank);
 
         let rank_entry = RankEntry {
             rank,
             tensors: merged_tensors,
-            pack_file,
+            pack_file: Some(pack_file),
             total_compressed,
             total_raw,
             skipped_count: alias_count,
@@ -451,28 +512,27 @@ pub(crate) fn do_full_merge(
             full_count,
         };
 
-        if let Some(ref pack_filename) = rank_entry.pack_file {
-            let descriptor = pack::PackDescriptor {
-                snapshot_id: merged_id,
-                step: merged_step,
-                created_at: merged_created_at,
-                // A merge produces a full: there is no base left to apply.
-                base_snapshot_id: None,
-                metadata: merged_metadata.clone(),
-                compression: compression.clone(),
-                world_size,
-                rank: rank_entry.clone(),
-            };
-            let encoded = serde_json::to_vec(&descriptor)
-                .map_err(|e| MoonclipError::Serialization(e.to_string()))?;
-            let header = pack::encode_header(blobs_end, encoded.len() as u64);
+        let pack_filename = rank_entry.pack_file.as_ref().expect("set just above");
+        let descriptor = pack::PackDescriptor {
+            snapshot_id: merged_id,
+            step: merged_step,
+            created_at: merged_created_at,
+            // A merge produces a full: there is no base left to apply.
+            base_snapshot_id: None,
+            metadata: merged_metadata.clone(),
+            compression: compression.clone(),
+            world_size,
+            rank: rank_entry.clone(),
+        };
+        let encoded = serde_json::to_vec(&descriptor)
+            .map_err(|e| MoonclipError::Serialization(e.to_string()))?;
+        let header = pack::encode_header(blobs_end, encoded.len() as u64);
 
-            let mut parts: Vec<&[u8]> = Vec::with_capacity(blobs.len() + 2);
-            parts.push(&header);
-            parts.extend(blobs.iter().map(|b| b.as_slice()));
-            parts.push(&encoded);
-            storage.put_parts(pack_filename, &parts)?;
-        }
+        let mut parts: Vec<&[u8]> = Vec::with_capacity(blobs.len() + 2);
+        parts.push(&header);
+        parts.extend(blobs.iter().map(|b| b.as_slice()));
+        parts.push(&encoded);
+        storage.put_parts(pack_filename, &parts)?;
 
         merged_ranks.insert(rank, rank_entry);
     }
@@ -584,6 +644,58 @@ fn load_compressed_data(
     )))
 }
 
+/// The base snapshot's bytes for `name`, following an alias if that is what
+/// the base stored.
+///
+/// A tensor can be `Skipped` in the delta — unchanged — while the base holds
+/// it as an `Alias` of a tied weight: deduplication keeps the first occurrence
+/// and points the second at it, and which of the two comes first depends only
+/// on the order the state dict was iterated in. So "look the name up in the
+/// base" is not enough; the lookup has to resolve the reference the same way a
+/// load does.
+fn base_tensor_data(
+    base_snap: &Snapshot,
+    rank: u32,
+    name: &str,
+    storage: &Arc<dyn StorageBackend>,
+    compression: &CompressionAlgo,
+) -> Result<Vec<u8>> {
+    let base_rank = base_snap.ranks.get(&rank).ok_or_else(|| {
+        MoonclipError::NotFound(format!("Rank {rank} is not in base snapshot {}", base_snap.id))
+    })?;
+
+    let mut current = name;
+    // Aliases point at a tensor that carries bytes, so one hop is the rule.
+    // The bound is for a base written by some future version, or corrupted:
+    // an alias cycle here would otherwise hang the merger thread.
+    for _ in 0..8 {
+        let entry = base_rank
+            .tensors
+            .iter()
+            .find(|t| t.name == current)
+            .ok_or_else(|| {
+                MoonclipError::NotFound(format!(
+                    "Tensor '{current}' is not in base snapshot {}",
+                    base_snap.id
+                ))
+            })?;
+
+        match entry.storage {
+            TensorStorage::Alias => {
+                current = entry.alias_of.as_deref().ok_or_else(|| {
+                    MoonclipError::NotFound(format!("Alias '{current}' has no target"))
+                })?;
+            }
+            _ => return load_tensor_data(entry, base_snap, rank, storage, compression),
+        }
+    }
+
+    Err(MoonclipError::Delta(format!(
+        "Alias chain starting at '{name}' in base snapshot {} does not end",
+        base_snap.id
+    )))
+}
+
 fn load_tensor_data(
     entry: &TensorEntry,
     snap: &Snapshot,
@@ -610,6 +722,12 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     const ZSTD3: CompressionAlgo = CompressionAlgo::Zstd { level: 3 };
+
+    /// No reader is inside anything: the merges below are the only thing
+    /// touching these snapshots. See `crate::inflight`.
+    fn unread() -> Arc<InFlight> {
+        Arc::new(InFlight::default())
+    }
 
     /// Deterministic pseudo-random bytes. Real tensors barely compress, and a
     /// merger test on runs of constant bytes would hide any amount of
@@ -808,7 +926,7 @@ mod tests {
         let (manifest, expected) = scenario(storage.as_ref(), 4, 40_000);
         let manifest = Arc::new(Mutex::new(manifest));
 
-        do_full_merge(&storage, &manifest, &ZSTD3).unwrap();
+        do_full_merge(&storage, &manifest, &ZSTD3, &unread()).unwrap();
 
         let m = manifest.lock().unwrap();
         assert_eq!(m.snapshots.len(), 1, "base and delta collapse into one");
@@ -839,7 +957,7 @@ mod tests {
         let (manifest, expected) = scenario(storage.as_ref(), 3, 30_000);
         let manifest = Arc::new(Mutex::new(manifest));
 
-        do_full_merge(&storage, &manifest, &ZSTD3).unwrap();
+        do_full_merge(&storage, &manifest, &ZSTD3, &unread()).unwrap();
 
         let m = manifest.lock().unwrap();
         let merged = &m.snapshots[0];
@@ -891,7 +1009,7 @@ mod tests {
         counting.whole_file_reads.store(0, Ordering::Relaxed);
 
         let manifest = Arc::new(Mutex::new(manifest));
-        do_full_merge(&storage, &manifest, &ZSTD3).unwrap();
+        do_full_merge(&storage, &manifest, &ZSTD3, &unread()).unwrap();
 
         // Two packs hold everything the merge needs: the base and the delta.
         // Reading a whole pack per tensor makes a merge O(tensors x snapshots)
@@ -931,7 +1049,7 @@ mod tests {
         assert_eq!(dropped.len(), 2);
 
         let manifest = Arc::new(Mutex::new(manifest));
-        do_stride_merge(&stride_config(3, 10), &storage, &manifest, &ZSTD3).unwrap();
+        do_stride_merge(&stride_config(3, 10), &storage, &manifest, &ZSTD3, &unread()).unwrap();
 
         {
             let m = manifest.lock().unwrap();
@@ -948,7 +1066,7 @@ mod tests {
         // The survivor has to still reconstruct. It is a XOR against the base,
         // and nothing it needs was in the snapshots just dropped — that is the
         // whole claim the fold rests on.
-        do_full_merge(&storage, &manifest, &ZSTD3).unwrap();
+        do_full_merge(&storage, &manifest, &ZSTD3, &unread()).unwrap();
         let m = manifest.lock().unwrap();
         let merged = &m.snapshots[0];
         let rank = merged.ranks.get(&0).unwrap();
@@ -971,7 +1089,7 @@ mod tests {
         let before: Vec<Uuid> = manifest.snapshots.iter().map(|s| s.id).collect();
 
         let manifest = Arc::new(Mutex::new(manifest));
-        do_stride_merge(&stride_config(3, 10), &storage, &manifest, &ZSTD3).unwrap();
+        do_stride_merge(&stride_config(3, 10), &storage, &manifest, &ZSTD3, &unread()).unwrap();
 
         let m = manifest.lock().unwrap();
         let after: Vec<Uuid> = m.snapshots.iter().map(|s| s.id).collect();
@@ -989,7 +1107,7 @@ mod tests {
         let (manifest, _) = delta_run(storage.as_ref(), 2, 10_000, 3);
 
         let manifest = Arc::new(Mutex::new(manifest));
-        do_stride_merge(&stride_config(20, 3), &storage, &manifest, &ZSTD3).unwrap();
+        do_stride_merge(&stride_config(20, 3), &storage, &manifest, &ZSTD3, &unread()).unwrap();
 
         let m = manifest.lock().unwrap();
         assert_eq!(m.snapshots.len(), 1, "the depth limit should have merged");
@@ -1013,7 +1131,7 @@ mod tests {
         let base_id = manifest.snapshots[0].id;
 
         let manifest = Arc::new(Mutex::new(manifest));
-        do_stride_merge(&stride_config(3, 10), &storage, &manifest, &ZSTD3).unwrap();
+        do_stride_merge(&stride_config(3, 10), &storage, &manifest, &ZSTD3, &unread()).unwrap();
 
         let m = manifest.lock().unwrap();
         let ids: Vec<Uuid> = m.snapshots.iter().map(|s| s.id).collect();
@@ -1042,7 +1160,7 @@ mod tests {
             .collect();
 
         let manifest = Arc::new(Mutex::new(manifest));
-        let result = do_stride_merge(&stride_config(3, 10), &storage, &manifest, &ZSTD3);
+        let result = do_stride_merge(&stride_config(3, 10), &storage, &manifest, &ZSTD3, &unread());
         assert!(result.is_err(), "the injected manifest write must fail");
 
         for pack in &packs {
@@ -1075,7 +1193,7 @@ mod tests {
         assert_eq!(packs.len(), 2);
 
         let manifest = Arc::new(Mutex::new(manifest));
-        let result = do_full_merge(&storage, &manifest, &ZSTD3);
+        let result = do_full_merge(&storage, &manifest, &ZSTD3, &unread());
         assert!(result.is_err(), "the injected manifest write must fail");
 
         // The merge did not complete, so the snapshots it was merging are
@@ -1087,5 +1205,175 @@ mod tests {
                 "{pack} was deleted before the new manifest was durable"
             );
         }
+    }
+
+    // ── The tensor set a merge is supposed to produce ───────────────
+    //
+    // A delta is complete with respect to its base: `save_sync` writes an
+    // entry for *every* tensor in the state dict, `Skipped` for the ones that
+    // match the base. So a delta's tensor list is the state dict as it stood
+    // at that step — which is exactly what `Core::load` iterates, and
+    // therefore what a merge standing in for that delta has to reproduce.
+    //
+    // Both directions of getting that wrong lose data silently: a tensor the
+    // model gained after the base disappears, and one it dropped comes back.
+
+    /// The state dict grew after the base: a parameter that only ever appears
+    /// in the delta must survive the fold.
+    #[test]
+    fn a_merge_keeps_tensors_added_after_the_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(dir.path()).unwrap());
+
+        let w0 = noise(20_000, 1);
+        let adapter = noise(20_000, 99);
+
+        let base = packed_snapshot(
+            storage.as_ref(),
+            &[("w0".into(), w0.clone(), TensorStorage::Full)],
+            None,
+            0,
+        );
+        let base_id = base.id;
+
+        // The delta carries w0 unchanged and the tensor the model just gained.
+        let delta = packed_snapshot(
+            storage.as_ref(),
+            &[
+                ("w0".into(), Vec::new(), TensorStorage::Skipped),
+                ("adapter".into(), adapter.clone(), TensorStorage::Full),
+            ],
+            Some(base_id),
+            1,
+        );
+
+        let manifest = Arc::new(Mutex::new(Manifest {
+            snapshots: vec![base, delta],
+            ..Default::default()
+        }));
+
+        do_full_merge(&storage, &manifest, &ZSTD3, &unread()).unwrap();
+
+        let m = manifest.lock().unwrap();
+        let merged = m.snapshots.iter().find(|s| s.base_snapshot_id.is_none()).unwrap();
+        let rank = merged.ranks.get(&0).unwrap();
+        let names: Vec<&str> = rank.tensors.iter().map(|t| t.name.as_str()).collect();
+
+        let entry = rank
+            .tensors
+            .iter()
+            .find(|t| t.name == "adapter")
+            .unwrap_or_else(|| panic!("'adapter' did not survive the merge; kept: {names:?}"));
+        let got = load_tensor_data(entry, merged, 0, &storage, &ZSTD3).unwrap();
+        assert_eq!(got, adapter, "'adapter' survived the merge with the wrong bytes");
+    }
+
+    /// The state dict shrank after the base: a parameter the model dropped
+    /// must not be resurrected by the fold.
+    #[test]
+    fn a_merge_does_not_resurrect_tensors_removed_after_the_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(dir.path()).unwrap());
+
+        let base = packed_snapshot(
+            storage.as_ref(),
+            &[
+                ("kept".into(), noise(20_000, 1), TensorStorage::Full),
+                ("dropped".into(), noise(20_000, 2), TensorStorage::Full),
+            ],
+            None,
+            0,
+        );
+        let base_id = base.id;
+
+        // The step after: the model no longer has `dropped`, so the save path
+        // writes no entry for it at all.
+        let delta = packed_snapshot(
+            storage.as_ref(),
+            &[("kept".into(), Vec::new(), TensorStorage::Skipped)],
+            Some(base_id),
+            1,
+        );
+
+        let manifest = Arc::new(Mutex::new(Manifest {
+            snapshots: vec![base, delta],
+            ..Default::default()
+        }));
+
+        do_full_merge(&storage, &manifest, &ZSTD3, &unread()).unwrap();
+
+        let m = manifest.lock().unwrap();
+        let merged = m.snapshots.iter().find(|s| s.base_snapshot_id.is_none()).unwrap();
+        let names: Vec<&str> = merged
+            .ranks
+            .get(&0)
+            .unwrap()
+            .tensors
+            .iter()
+            .map(|t| t.name.as_str())
+            .collect();
+
+        assert!(
+            !names.contains(&"dropped"),
+            "a tensor removed from the model came back through the merge: {names:?}"
+        );
+        assert!(names.contains(&"kept"));
+    }
+
+    /// Changed, then changed back. The newest delta says `Skipped`, meaning
+    /// "identical to the base" — so the merged snapshot has to hold the base's
+    /// bytes, not the intermediate delta's.
+    #[test]
+    fn a_merge_takes_the_newest_delta_as_the_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(dir.path()).unwrap());
+
+        let original = noise(20_000, 5);
+        let mut touched = original.clone();
+        touched[7] ^= 0xff;
+        let xor = delta::compute_delta(&original, &touched).unwrap();
+
+        let base = packed_snapshot(
+            storage.as_ref(),
+            &[("w".into(), original.clone(), TensorStorage::Full)],
+            None,
+            0,
+        );
+        let base_id = base.id;
+        let d1 = packed_snapshot(
+            storage.as_ref(),
+            &[("w".into(), xor, TensorStorage::DeltaXor)],
+            Some(base_id),
+            1,
+        );
+        let d2 = packed_snapshot(
+            storage.as_ref(),
+            &[("w".into(), Vec::new(), TensorStorage::Skipped)],
+            Some(base_id),
+            2,
+        );
+
+        let manifest = Arc::new(Mutex::new(Manifest {
+            snapshots: vec![base, d1, d2],
+            ..Default::default()
+        }));
+
+        do_full_merge(&storage, &manifest, &ZSTD3, &unread()).unwrap();
+
+        let m = manifest.lock().unwrap();
+        let merged = m.snapshots.iter().find(|s| s.base_snapshot_id.is_none()).unwrap();
+        let entry = merged
+            .ranks
+            .get(&0)
+            .unwrap()
+            .tensors
+            .iter()
+            .find(|t| t.name == "w")
+            .unwrap();
+        let got = load_tensor_data(entry, merged, 0, &storage, &ZSTD3).unwrap();
+        assert_eq!(
+            got, original,
+            "the merge replayed an intermediate delta the newest one had undone"
+        );
     }
 }

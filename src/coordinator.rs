@@ -8,6 +8,7 @@ use uuid::Uuid;
 
 use crate::cast::DType;
 use crate::error::{Result, MoonclipError};
+use crate::inflight::InFlight;
 use crate::manifest::*;
 use crate::merger::{DeltaMerger, MergerConfig};
 use crate::pack;
@@ -325,6 +326,10 @@ pub(crate) struct Core {
     config: CoordinatorConfig,
     merger: Option<DeltaMerger>,
     syncer: Option<RemoteSyncer>,
+    /// Snapshots being read right now, and the ones a merge has claimed.
+    /// See [`crate::inflight`]: it is what keeps a merge from deleting the
+    /// base a save is diffing against.
+    in_flight: Arc<InFlight>,
     /// See [`CoordinatorConfig::keep_base_in_memory`].
     retained_base: Mutex<Option<RetainedBase>>,
 }
@@ -380,6 +385,8 @@ impl Coordinator {
 
         let manifest = Arc::new(Mutex::new(manifest));
 
+        let in_flight = Arc::new(InFlight::default());
+
         // Spawn merger if configured
         let merger = config.merger.clone().map(|mc| {
             DeltaMerger::new(
@@ -387,6 +394,7 @@ impl Coordinator {
                 Arc::clone(&storage),
                 Arc::clone(&manifest),
                 config.compression.clone(),
+                Arc::clone(&in_flight),
             )
         });
 
@@ -408,6 +416,7 @@ impl Coordinator {
             config,
             merger,
             syncer,
+            in_flight,
             retained_base: Mutex::new(None),
         });
 
@@ -514,9 +523,15 @@ impl Coordinator {
     }
 
     /// Force merge all pending deltas into a full checkpoint.
-    pub fn merge_now(&self) {
+    /// Fold every pending delta into one full snapshot, and wait for it.
+    ///
+    /// Returns when the merge is done rather than when it is queued: the
+    /// caller that matters is `save_final`, which merges and then uploads, and
+    /// an upload that starts while the merge is still running leaves the run's
+    /// last checkpoint — the one everything was folded into — on the machine.
+    pub fn merge_now(&self) -> Result<()> {
         self.wait_idle();
-        self.core.merge_now();
+        self.core.merge_now()
     }
 
     /// Force sync all local data to remote storage immediately.
@@ -559,13 +574,26 @@ impl Core {
         let save_started = Instant::now();
         let raw_bytes: u64 = tensors.iter().map(|t| t.data.len() as u64).sum();
 
+        // The base, and a pin on it that lasts until this save is recorded.
+        //
+        // Both decisions are made under the manifest lock, together: picking a
+        // base and then pinning it in two steps is the race itself. A base a
+        // merge has already claimed is not picked up at all — this save writes
+        // a full snapshot instead, which costs bytes for one step and cannot
+        // end up as a delta against something that no longer exists.
         let manifest = self.manifest.lock().unwrap();
         let force_full = manifest.should_force_full(step);
         let base_snap = if force_full {
             None
         } else {
-            manifest.last_full_snapshot().cloned()
+            manifest
+                .last_full_snapshot()
+                .filter(|b| !self.in_flight.is_doomed(b.id))
+                .cloned()
         };
+        let _base_pin = base_snap
+            .as_ref()
+            .map(|b| self.in_flight.pin(std::slice::from_ref(&b.id)));
         drop(manifest);
 
         let created_at = Utc::now();
@@ -730,11 +758,17 @@ impl Core {
     fn load_in_pool(&self, snap_id: Uuid) -> Result<HashMap<String, Vec<u8>>> {
         use rayon::prelude::*;
 
+        // Pinned for the duration, base included: a merge running beside this
+        // load would otherwise delete the packs it is reading. Same rule as the
+        // save path — see `crate::inflight`.
         let manifest = self.manifest.lock().unwrap();
         let snap = manifest
             .find_snapshot(snap_id)
             .ok_or_else(|| MoonclipError::NotFound(format!("Snapshot {snap_id}")))?
             .clone();
+        let mut pinned = vec![snap.id];
+        pinned.extend(snap.base_snapshot_id);
+        let _pin = self.in_flight.pin(&pinned);
         drop(manifest);
 
         let rank_entry = snap.ranks.get(&self.config.rank).ok_or_else(|| {
@@ -899,9 +933,10 @@ impl Core {
             .collect()
     }
 
-    fn merge_now(&self) {
-        if let Some(ref merger) = self.merger {
-            merger.force_full_merge();
+    fn merge_now(&self) -> Result<()> {
+        match self.merger {
+            Some(ref merger) => merger.force_full_merge(),
+            None => Ok(()),
         }
     }
 
@@ -989,9 +1024,24 @@ impl Core {
         let blobs_end = offset;
 
         // ── 4. Build the rank entry, which the descriptor carries ───
-        let has_data = blobs_end > pack::HEADER_LEN;
-        let pack_file =
-            has_data.then(|| format!("{}/rank_{}.pack", snap_dir, self.config.rank));
+        //
+        // Always a pack, even when this rank has no bytes to write.
+        //
+        // A step where nothing changed is the ordinary case in fine-tuning:
+        // whole stretches of the model do not move, every tensor comes out
+        // `Skipped`, and there is not a single blob to store. Skipping the
+        // pack then saved one small file and cost the checkpoint its
+        // description — `recover_or_reclaim_orphans` rebuilds a snapshot the
+        // manifest lost from the descriptors in its packs, so a snapshot with
+        // no pack is not merely unrecovered, there is nothing for recovery to
+        // read. A process killed between the save and the manifest write left
+        // it unrecoverable, and `crate::pack` claimed that state was
+        // impossible.
+        //
+        // What it costs: a header plus a JSON descriptor per rank per empty
+        // snapshot, a few hundred bytes, against a checkpoint that can be
+        // brought back.
+        let pack_file = format!("{}/rank_{}.pack", snap_dir, self.config.rank);
 
         let mut entries = Vec::new();
         let mut total_compressed = 0u64;
@@ -1020,7 +1070,7 @@ impl Core {
         let rank_entry = RankEntry {
             rank: self.config.rank,
             tensors: entries,
-            pack_file,
+            pack_file: Some(pack_file),
             total_compressed,
             total_raw,
             skipped_count: skipped,
@@ -1029,30 +1079,29 @@ impl Core {
         };
 
         // ── 5. Write header + blobs + descriptor, in one object ─────
-        if let Some(ref pack_filename) = rank_entry.pack_file {
-            let descriptor = pack::PackDescriptor {
-                snapshot_id: snap_id,
-                step: context.step,
-                created_at: context.created_at,
-                base_snapshot_id: base_snap.as_ref().map(|s| s.id),
-                metadata: context.metadata.clone(),
-                compression: self.config.compression.clone(),
-                world_size: self.config.world_size,
-                rank: rank_entry.clone(),
-            };
-            let encoded = serde_json::to_vec(&descriptor)
-                .map_err(|e| MoonclipError::Serialization(e.to_string()))?;
-            let header = pack::encode_header(blobs_end, encoded.len() as u64);
+        let pack_filename = rank_entry.pack_file.as_ref().expect("set just above");
+        let descriptor = pack::PackDescriptor {
+            snapshot_id: snap_id,
+            step: context.step,
+            created_at: context.created_at,
+            base_snapshot_id: base_snap.as_ref().map(|s| s.id),
+            metadata: context.metadata.clone(),
+            compression: self.config.compression.clone(),
+            world_size: self.config.world_size,
+            rank: rank_entry.clone(),
+        };
+        let encoded = serde_json::to_vec(&descriptor)
+            .map_err(|e| MoonclipError::Serialization(e.to_string()))?;
+        let header = pack::encode_header(blobs_end, encoded.len() as u64);
 
-            let mut parts: Vec<&[u8]> = Vec::with_capacity(processed.len() + 2);
-            parts.push(&header);
-            parts.extend(processed.iter().filter_map(|pt| pt.write_data.as_deref()));
-            parts.push(&encoded);
+        let mut parts: Vec<&[u8]> = Vec::with_capacity(processed.len() + 2);
+        parts.push(&header);
+        parts.extend(processed.iter().filter_map(|pt| pt.write_data.as_deref()));
+        parts.push(&encoded);
 
-            crate::profile::time(crate::profile::Phase::PackWrite, || {
-                self.storage.put_parts(pack_filename, &parts)
-            })?;
-        }
+        crate::profile::time(crate::profile::Phase::PackWrite, || {
+            self.storage.put_parts(pack_filename, &parts)
+        })?;
 
         Ok(rank_entry)
     }
@@ -2079,8 +2128,13 @@ mod tests {
         let end = raw.iter().rposition(|&b| b != 0).map(|i| i + 1).unwrap_or(0);
         let manifest: Manifest = serde_json::from_slice(&raw[..end]).unwrap();
         let manifest = Arc::new(Mutex::new(manifest));
-        crate::merger::do_full_merge(&storage, &manifest, &CompressionAlgo::Zstd { level: 1 })
-            .unwrap();
+        crate::merger::do_full_merge(
+            &storage,
+            &manifest,
+            &CompressionAlgo::Zstd { level: 1 },
+            &Arc::new(InFlight::default()),
+        )
+        .unwrap();
         let merged = {
             let m = manifest.lock().unwrap();
             assert_eq!(m.snapshots.len(), 1, "base and delta collapse into one");
@@ -2660,5 +2714,256 @@ mod tests {
             !steps.contains(&0),
             "step 0 outlived a cap of one; steps left: {steps:?}"
         );
+    }
+
+    /// Tied weights, and the order they arrive in changes between saves.
+    ///
+    /// Deduplication keeps the first occurrence and records the second as an
+    /// `Alias` of it, so the pair `{emb, head}` sharing one buffer stores
+    /// whichever came first and points the other at it. Swap the order on the
+    /// next save — which costs nothing more than wrapping the model
+    /// differently — and the tensor that used to be the alias is now the one
+    /// carrying the bytes. It is unchanged since the base, so it is written
+    /// `Skipped`, and a skipped tensor resolves through the base by name:
+    /// straight onto the base's `Alias` entry, which holds no bytes.
+    #[test]
+    fn tied_weights_survive_a_change_in_tensor_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let coord = make_coordinator(dir.path());
+
+        let shared = vec![7u8; 8192];
+        let tied = |first: &str, second: &str| {
+            vec![
+                TensorData {
+                    name: first.into(),
+                    shape: vec![8192],
+                    dtype: "uint8".into(),
+                    data: shared.clone(),
+                },
+                TensorData {
+                    name: second.into(),
+                    shape: vec![8192],
+                    dtype: "uint8".into(),
+                    data: shared.clone(),
+                },
+            ]
+        };
+
+        coord.save(100, tied("emb", "head"), HashMap::new()).unwrap();
+        let second = coord.save(200, tied("head", "emb"), HashMap::new()).unwrap();
+        coord.flush().unwrap();
+
+        let loaded = coord.load(second).unwrap_or_else(|e| {
+            panic!("the tied pair became unreadable when the order changed: {e}")
+        });
+        assert_eq!(loaded["emb"], shared);
+        assert_eq!(loaded["head"], shared);
+    }
+
+    /// A checkpoint where nothing changed is still a checkpoint.
+    ///
+    /// With every tensor skipped there are no bytes to write, so the save path
+    /// writes no pack — and the pack is what carries the descriptor that
+    /// startup recovery rebuilds a lost snapshot from. Kill the process
+    /// between the pack and the manifest and this one cannot come back: it is
+    /// not merely unrecovered, `recover_or_reclaim_orphans` has nothing to
+    /// judge it by. Fine-tuning, where whole stretches of the model do not
+    /// move, is where this is the common case rather than the odd one.
+    #[test]
+    fn a_checkpoint_that_changed_nothing_can_still_be_recovered() {
+        let dir = tempfile::tempdir().unwrap();
+        let unchanged = sample_tensors(3);
+
+        let coord = make_coordinator(dir.path());
+        coord.save(100, unchanged.clone(), HashMap::new()).unwrap();
+        let quiet = coord.save(200, unchanged.clone(), HashMap::new()).unwrap();
+        coord.flush().unwrap();
+        drop(coord);
+
+        // The crash: the pack landed, the manifest naming it did not.
+        let manifest_path = dir.path().join("manifest.json");
+        let raw = std::fs::read(&manifest_path).unwrap();
+        // Same trailing-zero trim the loader does in `Coordinator::new`.
+        let end = raw.iter().rposition(|&b| b != 0).map(|i| i + 1).unwrap_or(0);
+        let mut manifest: Manifest = serde_json::from_slice(&raw[..end]).unwrap();
+        assert_eq!(manifest.snapshots.len(), 2, "both saves were recorded");
+        manifest.snapshots.retain(|s| s.id != quiet);
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let reopened = make_coordinator(dir.path());
+        let steps: Vec<u64> = reopened.list_snapshots().iter().map(|s| s.step).collect();
+        assert!(
+            steps.contains(&200),
+            "the checkpoint that changed nothing was not recovered; steps: {steps:?}"
+        );
+
+        let loaded = reopened.load(quiet).unwrap();
+        assert_eq!(loaded["w"], vec![3u8; 8192]);
+    }
+
+    /// The merger deletes the base a save is reading.
+    ///
+    /// `save_sync_in_pool` takes its base from the manifest and then *drops
+    /// the lock* before `save_rank_tensors` reads that base off storage. The
+    /// merger holds the same lock only while it decides what to fold, so the
+    /// two windows overlap: the merge can publish and delete the base
+    /// snapshot's packs while a save is in the middle of diffing against
+    /// them. It shows up two ways — the loud one is the save failing with
+    /// `Checkpoint not found: snapshots/…/rank_0.pack`, the quiet one is a
+    /// delta reaching the manifest with a `base_snapshot_id` that no longer
+    /// names anything, which breaks `load_latest` now and is discarded as an
+    /// orphan at the next startup.
+    ///
+    /// The interleaving is forced rather than raced for. A sleep here proves
+    /// nothing: on 8 KB tensors both sides finish before either is preempted,
+    /// and the test would pass on a version that still has the bug. So the
+    /// storage backend itself runs the merge at the exact instant the save
+    /// reaches for the base — the one ordering the lock discipline has to
+    /// survive, and the one a real run hits when the base is gigabytes.
+    #[test]
+    fn a_merge_does_not_delete_the_base_a_save_is_reading() {
+        /// Runs `armed` once, on the first pack read that follows arming it.
+        #[derive(Default)]
+        struct Interleave {
+            armed: Mutex<Option<Box<dyn Fn() + Send>>>,
+            fired: std::sync::atomic::AtomicBool,
+        }
+
+        impl Interleave {
+            fn maybe_fire(&self) {
+                if self.fired.load(std::sync::atomic::Ordering::SeqCst) {
+                    return;
+                }
+                let hook = self.armed.lock().unwrap();
+                if let Some(run) = hook.as_ref() {
+                    self.fired
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    run();
+                }
+            }
+        }
+
+        struct MergeAtBaseRead {
+            inner: Arc<LocalStorage>,
+            interleave: Arc<Interleave>,
+        }
+
+        impl StorageBackend for MergeAtBaseRead {
+            fn put(&self, p: &str, data: &[u8]) -> Result<()> {
+                self.inner.put(p, data)
+            }
+            fn put_parts(&self, p: &str, parts: &[&[u8]]) -> Result<()> {
+                self.inner.put_parts(p, parts)
+            }
+            fn get(&self, p: &str) -> Result<Vec<u8>> {
+                if p.ends_with(".pack") {
+                    self.interleave.maybe_fire();
+                }
+                self.inner.get(p)
+            }
+            fn get_range(&self, p: &str, offset: u64, len: usize) -> Result<Vec<u8>> {
+                if p.ends_with(".pack") {
+                    self.interleave.maybe_fire();
+                }
+                self.inner.get_range(p, offset, len)
+            }
+            fn exists(&self, p: &str) -> Result<bool> {
+                self.inner.exists(p)
+            }
+            fn delete(&self, p: &str) -> Result<()> {
+                self.inner.delete(p)
+            }
+            fn list(&self, prefix: &str) -> Result<Vec<String>> {
+                self.inner.list(prefix)
+            }
+            fn remove_dir(&self, p: &str) -> Result<()> {
+                self.inner.remove_dir(p)
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let plain = Arc::new(LocalStorage::new(dir.path()).unwrap());
+        let interleave = Arc::new(Interleave::default());
+        let storage: Arc<dyn StorageBackend> = Arc::new(MergeAtBaseRead {
+            inner: Arc::clone(&plain),
+            interleave: Arc::clone(&interleave),
+        });
+
+        let compression = CompressionAlgo::Zstd { level: 1 };
+        let config = CoordinatorConfig {
+            world_size: 1,
+            rank: 0,
+            compression: compression.clone(),
+            retention: RetentionPolicy {
+                max_full_snapshots: 5,
+                max_deltas_per_full: 10,
+                full_snapshot_every_steps: 10000,
+                max_total_snapshots: None,
+            },
+            delta_max_ratio: 0.95,
+            // Synchronous, and with the base off storage rather than out of
+            // memory: the race is between a save reading the base and a merge
+            // deleting it, and neither happens when the bytes never leave the
+            // process.
+            async_save: false,
+            keep_base_in_memory: false,
+            ..Default::default()
+        };
+        let coord = Coordinator::new(storage, config).unwrap();
+
+        // A base and two deltas, with nothing interleaved yet.
+        for step in 0..3u64 {
+            coord.save(step, evolving_state(step), HashMap::new()).unwrap();
+        }
+
+        // From here, the next save's reach for the base runs the merge first.
+        let merge_storage: Arc<dyn StorageBackend> = Arc::clone(&plain) as Arc<dyn StorageBackend>;
+        let merge_manifest = Arc::clone(&coord.core.manifest);
+        let merge_compression = compression.clone();
+        // The coordinator's own registry, not a fresh one: what is being
+        // tested is that the save's pin is visible to the merge.
+        let merge_in_flight = Arc::clone(&coord.core.in_flight);
+        *interleave.armed.lock().unwrap() = Some(Box::new(move || {
+            let _ = crate::merger::do_full_merge(
+                &merge_storage,
+                &merge_manifest,
+                &merge_compression,
+                &merge_in_flight,
+            );
+        }));
+
+        coord
+            .save(3, evolving_state(3), HashMap::new())
+            .unwrap_or_else(|e| panic!("the save lost its base to a merge running beside it: {e}"));
+        coord.flush().unwrap();
+
+        assert!(
+            interleave.fired.load(std::sync::atomic::Ordering::SeqCst),
+            "the merge never ran: this probe proved nothing"
+        );
+
+        // The quiet variant: a delta whose base the merge already deleted.
+        let manifest = coord.core.manifest.lock().unwrap();
+        let ids: Vec<Uuid> = manifest.snapshots.iter().map(|s| s.id).collect();
+        let dangling: Vec<(u64, Uuid)> = manifest
+            .snapshots
+            .iter()
+            .filter_map(|s| s.base_snapshot_id.map(|b| (s.step, b)))
+            .filter(|(_, base)| !ids.contains(base))
+            .collect();
+        assert!(
+            dangling.is_empty(),
+            "deltas left pointing at a base the merge removed: {dangling:?}"
+        );
+        drop(manifest);
+
+        let (_, loaded) = coord
+            .load_latest()
+            .unwrap_or_else(|e| panic!("the newest checkpoint is unreadable after merging: {e}"));
+        assert_eq!(loaded["w"][0], 3, "the newest checkpoint is not step 3");
     }
 }

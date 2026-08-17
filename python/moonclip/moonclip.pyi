@@ -57,10 +57,6 @@ class MoonclipManager:
                 already describes the whole state and the fold reads no bytes —
                 but the folded steps stop being restorable. Read it as how
                 coarse the checkpoint history may become.
-                Any value above 0 warns: the fold currently rebuilds the merged
-                snapshot from the base snapshot's tensor list, so tensors added
-                after the base are dropped and tensors removed after it come
-                back. Safe only while the set of tensor names is fixed.
             merge_max_chain: How many deltas may accumulate before they are
                 merged back into a new full snapshot.
             rollback_interval_steps: Steps between rollback snapshots. A full
