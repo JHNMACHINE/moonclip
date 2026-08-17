@@ -77,7 +77,7 @@ fn collect_tensors(tensors: &Bound<'_, PyDict>) -> PyResult<Vec<PendingTensor>> 
     let mut result = Vec::new();
     for (key, value) in tensors.iter() {
         let name: String = key.extract()?;
-        // Vecchio formato: tupla (shape, dtype, bytes)
+        // Old form: a (shape, dtype, bytes) tuple.
         if let Ok(tuple) = value.cast::<PyTuple>() {
             let shape: Vec<usize> = tuple.get_item(0)?.extract()?;
             let dtype: String = tuple.get_item(1)?.extract()?;
@@ -89,7 +89,7 @@ fn collect_tensors(tensors: &Bound<'_, PyDict>) -> PyResult<Vec<PendingTensor>> 
                 bytes,
             });
         }
-        // Nuovo formato: tensore PyTorch direttamente. `value` is already a
+        // New form: a PyTorch tensor straight through. `value` is already a
         // Bound<PyAny>, so the presence of `data_ptr` is the only test that
         // distinguishes a tensor here.
         else if value.hasattr("data_ptr")? {
