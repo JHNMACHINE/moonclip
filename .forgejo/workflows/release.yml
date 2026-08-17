@@ -42,6 +42,55 @@ jobs:
           fi
           echo "$(git rev-parse --short HEAD) is on main"
 
+      # Moved ahead of the build: it costs a `grep` and rules out the mistake
+      # that cannot be undone. Building six wheels first only delays the news.
+      - name: Tag must match the package version
+        run: |
+          set -eu
+          VERSION=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          PY_VERSION=$(grep -m1 '^version = ' pyproject.toml | cut -d'"' -f2)
+          TAG="${{ forgejo.ref_name }}"
+          echo "Cargo.toml $VERSION, pyproject.toml $PY_VERSION, tag $TAG"
+          if [ "$VERSION" != "$PY_VERSION" ]; then
+            echo "Cargo.toml and pyproject.toml disagree" >&2
+            exit 1
+          fi
+          if [ "v$VERSION" != "$TAG" ]; then
+            echo "Tag $TAG does not match version $VERSION" >&2
+            exit 1
+          fi
+
+      # Both secrets, before either upload. Discovering the second one is
+      # missing *after* the first index has accepted its artifact is how a
+      # version number gets half-published, and neither registry lets you retry
+      # it: the release would have to become 0.0.5 for one half only.
+      - name: Both publish tokens must be present
+        env:
+          PYPI_TOKEN: ${{ secrets.MOONCLIP_PYPI_TOKEN }}
+          CARGO_TOKEN: ${{ secrets.MOONCLIP_CARGO_TOKEN }}
+        run: |
+          set -eu
+          missing=""
+          [ -n "${PYPI_TOKEN:-}" ] || missing="$missing MOONCLIP_PYPI_TOKEN"
+          [ -n "${CARGO_TOKEN:-}" ] || missing="$missing MOONCLIP_CARGO_TOKEN"
+          if [ -n "$missing" ]; then
+            echo "Missing secret(s):$missing" >&2
+            echo "A tag was pushed but this release would only go out halfway." >&2
+            echo "Add them on the repository, delete the tag and push it again." >&2
+            exit 1
+          fi
+          echo "both tokens present"
+
+      # The deepest validation available without publishing: it builds the
+      # package tarball and compiles it, so an `exclude` that drops a file the
+      # crate needs fails here rather than after the wheels are already public.
+      # Two minutes to buy that.
+      - name: Dry-run the crate
+        run: |
+          set -eu
+          . "$HOME/.cargo/env"
+          cargo publish --dry-run --locked
+
       # One native wheel per interpreter rather than a single abi3 wheel: the
       # stable ABI would cost PyO3's fast paths, which is the wrong trade for
       # this library. Built in one job so the shared dependencies compile once.
@@ -78,48 +127,23 @@ jobs:
             fi
           done
 
-      # The tag is what someone installs; the version inside the wheel is what
-      # pip believes. A mismatch publishes a release nobody asked for, and it
-      # cannot be taken back — PyPI and crates.io both refuse to reuse a
-      # version number. So this is checked before anything is uploaded.
-      - name: Tag must match the package version
-        run: |
-          set -eu
-          VERSION=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
-          PY_VERSION=$(grep -m1 '^version = ' pyproject.toml | cut -d'"' -f2)
-          TAG="${{ forgejo.ref_name }}"
-          echo "Cargo.toml $VERSION, pyproject.toml $PY_VERSION, tag $TAG"
-          if [ "$VERSION" != "$PY_VERSION" ]; then
-            echo "Cargo.toml and pyproject.toml disagree" >&2
-            exit 1
-          fi
-          if [ "v$VERSION" != "$TAG" ]; then
-            echo "Tag $TAG does not match version $VERSION" >&2
-            exit 1
-          fi
-
       - name: Check the artifacts
         run: /opt/python/cp312-cp312/bin/twine check target/wheels/*.whl
 
-      # PyPI and crates.io only. Codeberg Packages used to get a copy of the
-      # same wheels, which bought nothing: identical bytes at an address almost
-      # nobody would point pip at, and a second token to keep alive.
-      - name: Publish to PyPI
-        env:
-          TWINE_USERNAME: __token__
-          TWINE_PASSWORD: ${{ secrets.MOONCLIP_PYPI_TOKEN }}
-        run: |
-          set -eu
-          if [ -z "${TWINE_PASSWORD:-}" ]; then
-            echo "MOONCLIP_PYPI_TOKEN is not set: a tag was pushed but nothing" >&2
-            echo "reach PyPI. Add the secret, or remove this step on purpose." >&2
-            exit 1
-          fi
-          /opt/python/cp312-cp312/bin/twine upload target/wheels/*.whl
-
-      # The crate, which is the half of this project that has no wheel. The
-      # verification build compiles without `extension-module`, so it does not
-      # need a Python interpreter to link against.
+      # ── from here on, nothing is reversible ──────────────────────────────
+      #
+      # PyPI and crates.io only. Codeberg Packages used to get a copy of the same
+      # wheels, which bought nothing: identical bytes at an address almost nobody
+      # would point pip at, and a second token to keep alive.
+      #
+      # The crate goes first, and the order is a decision rather than an
+      # accident. Neither artifact depends on the other — the wheel carries the
+      # compiled extension and never fetches the crate — so what the order buys
+      # is which half you are left holding if the job dies in between. `cargo
+      # publish` is the step with more ways to fail (name, token scope,
+      # verification build, metadata), so it goes where a failure still costs
+      # nothing: with the wheels not yet uploaded, the version number is free on
+      # both indexes and the same tag can be pushed again.
       - name: Publish to crates.io
         env:
           # Left name: what cargo itself reads. Right name: the Codeberg secret.
@@ -127,9 +151,17 @@ jobs:
         run: |
           set -eu
           . "$HOME/.cargo/env"
-          if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
-            echo "MOONCLIP_CARGO_TOKEN is not set: the wheels went out but the" >&2
-            echo "crate would not. Add the secret, or remove this step." >&2
-            exit 1
-          fi
           cargo publish --locked
+
+      # If this fails, the crate is out and the wheels are not: `pip install
+      # moonclip` finds nothing and `ravex[moonclip]` stays unsatisfiable, while
+      # 0.0.x is spent on crates.io. Recovery is a new patch version for the
+      # wheels — which is why every check that could have prevented it ran
+      # before either upload.
+      - name: Publish to PyPI
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.MOONCLIP_PYPI_TOKEN }}
+        run: |
+          set -eu
+          /opt/python/cp312-cp312/bin/twine upload target/wheels/*.whl
