@@ -14,6 +14,21 @@ use crate::pack;
 use crate::storage::StorageBackend;
 
 /// Configuration for the delta merger.
+///
+/// # Known defect
+///
+/// [`do_full_merge`] rebuilds a merged snapshot by walking the **base**
+/// snapshot's tensor list, so the merge only ever knows about the tensors that
+/// existed at the base. A tensor that first appears in a later delta is not in
+/// that list and is dropped; a tensor removed after the base is resurrected
+/// from it. The merged snapshot loads without complaint either way — the
+/// parameters are simply gone.
+///
+/// This is safe when the set of tensor names is fixed for the whole run, which
+/// covers ordinary training. It is not safe for anything that grows or prunes
+/// the model between checkpoints. Merging is opt-in for that reason: the
+/// Python constructor defaults `merge_stride` to 0, which leaves this
+/// unconstructed.
 #[derive(Debug, Clone)]
 pub struct MergerConfig {
     /// After `stride` consecutive deltas, fold them into the newest one.

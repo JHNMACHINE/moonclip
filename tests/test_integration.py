@@ -11,6 +11,7 @@ import struct
 import threading
 import json
 import time
+import warnings
 
 import pytest
 
@@ -437,6 +438,58 @@ class TestEdgeCases:
         loaded = mgr2.load(snap_id)
         assert loaded["w"] == bytes(10)
         assert mgr2.list_snapshots()[0]["step"] == 42
+
+
+# ─── Casting ────────────────────────────────────────────────────────
+
+class TestSaveDtype:
+    def test_bf16_does_not_turn_nan_into_infinity(self, tmp_path):
+        """A NaN whose payload sits below bit 16 used to round up to +Inf.
+
+        bf16 keeps the top 7 mantissa bits, so 0x7F800001 arrived at the
+        truncation with a zero mantissa under an all-ones exponent — which is
+        infinity. A checkpoint that quietly makes a diverged run look finite is
+        worse than one that fails.
+        """
+        mgr = MoonclipManager(
+            storage_root=str(tmp_path), save_dtype="bf16", full_every_steps=100000
+        )
+        payload = b"".join(
+            struct.pack("<I", bits) for bits in (0x7F800001, 0xFF800001, 0x7FC00000)
+        )
+        snap_id = mgr.save_tensors(step=1, tensors={"w": ([3], "float32", payload)})
+        mgr.flush()
+
+        values = struct.unpack("<3f", mgr.load(snap_id)["w"])
+        assert all(v != v for v in values), f"NaN did not survive the cast: {values}"
+
+    def test_bf16_keeps_infinity(self, tmp_path):
+        mgr = MoonclipManager(
+            storage_root=str(tmp_path), save_dtype="bf16", full_every_steps=100000
+        )
+        payload = struct.pack("<2f", float("inf"), float("-inf"))
+        snap_id = mgr.save_tensors(step=1, tensors={"w": ([2], "float32", payload)})
+        mgr.flush()
+
+        hi, lo = struct.unpack("<2f", mgr.load(snap_id)["w"])
+        assert hi == float("inf") and lo == float("-inf")
+
+
+# ─── Warnings ───────────────────────────────────────────────────────
+
+class TestMergerWarning:
+    def test_merge_stride_warns_about_the_known_defect(self, tmp_path):
+        """Merging drops tensors added after the base snapshot (fixed in 0.0.6).
+
+        Whoever turns it on has to hear that before the run, not after.
+        """
+        with pytest.warns(UserWarning, match="merge_stride"):
+            MoonclipManager(storage_root=str(tmp_path), merge_stride=3)
+
+    def test_the_default_is_silent(self, tmp_path):
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            MoonclipManager(storage_root=str(tmp_path))
 
 
 # ─── Concurrency ────────────────────────────────────────────────────

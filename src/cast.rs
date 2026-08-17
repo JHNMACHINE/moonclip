@@ -58,6 +58,8 @@ pub fn is_castable_float(dtype: &str) -> bool {
 /// bfloat16 is the upper 16 bits of float32, so the cast is just
 /// taking bytes [2,3] of each 4-byte float (little-endian).
 /// With round-to-nearest-even for better accuracy.
+///
+/// NaN never becomes Inf: see [`fp32_bits_to_bf16_bits`].
 pub fn fp32_to_bf16(data: &[u8]) -> Result<Vec<u8>> {
     if data.len() % 4 != 0 {
         return Err(MoonclipError::Config(format!(
@@ -88,14 +90,7 @@ pub fn fp32_to_bf16(data: &[u8]) -> Result<Vec<u8>> {
                     src[offset + 3],
                 ]);
 
-                // Round-to-nearest-even: add rounding bias
-                // If the lower 16 bits are exactly 0x8000 (tie), round to even
-                // Otherwise, add 0x7FFF + bit 16 for round-to-nearest
-                let rounding_bias = ((bits >> 16) & 1) + 0x7FFF;
-                let rounded = bits.wrapping_add(rounding_bias);
-                let bf16_bits = (rounded >> 16) as u16;
-
-                let bf16_bytes = bf16_bits.to_le_bytes();
+                let bf16_bytes = fp32_bits_to_bf16_bits(bits).to_le_bytes();
                 dst[i * 2] = bf16_bytes[0];
                 dst[i * 2 + 1] = bf16_bytes[1];
             }
@@ -269,6 +264,37 @@ pub fn uncast_tensor(
 
 // ─── Internal bit manipulation ──────────────────────────────────────
 
+/// fp32 bit pattern → bf16 bit pattern, round-to-nearest-even.
+///
+/// The rounding bias is what makes the NaN check necessary rather than
+/// pedantic. bf16 keeps only the top 7 mantissa bits, so a NaN whose payload
+/// lives below bit 16 arrives at the shift with a mantissa of all zeros — and a
+/// zero mantissa under an all-ones exponent is Inf, not NaN. `0x7F800001` (a
+/// signalling NaN, and what a comparison against a corrupted tensor tends to
+/// produce) plus the bias of `0x7FFF` carries into `0x7F808000`, which truncates
+/// to `0x7F80`: positive infinity. The quiet NaN `0x7FC00000` survives on its
+/// own because its payload sits in the bits bf16 keeps, so the failure is not
+/// one a casual test catches.
+///
+/// A checkpoint is the last place a NaN should be laundered into a finite-ish
+/// value: it is how a diverged run gets saved as if it were healthy, and the
+/// gradient that produced it is gone by the time anyone looks. So NaN is mapped
+/// to a NaN explicitly — sign and the payload bits bf16 can hold are kept, and
+/// the quiet bit is forced so the result cannot collapse to Inf.
+#[inline]
+fn fp32_bits_to_bf16_bits(bits: u32) -> u16 {
+    // Ignoring the sign, anything above the Inf pattern is a NaN.
+    if bits & 0x7FFF_FFFF > 0x7F80_0000 {
+        return ((bits >> 16) as u16) | 0x0040;
+    }
+
+    // Round-to-nearest-even: add rounding bias
+    // If the lower 16 bits are exactly 0x8000 (tie), round to even
+    // Otherwise, add 0x7FFF + bit 16 for round-to-nearest
+    let rounding_bias = ((bits >> 16) & 1) + 0x7FFF;
+    (bits.wrapping_add(rounding_bias) >> 16) as u16
+}
+
 fn fp32_bits_to_fp16_bits(bits: u32) -> u16 {
     let sign = ((bits >> 16) & 0x8000) as u16;
     let exp = ((bits >> 23) & 0xFF) as i32;
@@ -400,6 +426,67 @@ mod tests {
         let val = f32::from_le_bytes([back[0], back[1], back[2], back[3]]);
         assert!((val - (-3.6)).abs() < 0.05);
         assert!(val < 0.0);
+    }
+
+    /// The bug this guards: rounding a NaN whose payload is below bit 16 used
+    /// to carry it up to the Inf pattern. A checkpoint that turns NaN into +Inf
+    /// hides the divergence that produced it.
+    #[test]
+    fn bf16_keeps_nan_with_a_low_payload() {
+        for &pattern in &[0x7F80_0001u32, 0xFF80_0001, 0x7F80_8000] {
+            let fp32: Vec<u8> = pattern.to_le_bytes().to_vec();
+            let bf16 = fp32_to_bf16(&fp32).unwrap();
+            let back = bf16_to_fp32(&bf16).unwrap();
+            let val = f32::from_le_bytes([back[0], back[1], back[2], back[3]]);
+            assert!(
+                val.is_nan(),
+                "{pattern:#010X} cast to bf16 {:#06X} and came back {val}",
+                u16::from_le_bytes([bf16[0], bf16[1]])
+            );
+        }
+    }
+
+    /// The quiet NaN survives without the guard — its payload sits in the bits
+    /// bf16 keeps — so it is here to pin the case that already worked, and to
+    /// show the guard did not break the sign.
+    #[test]
+    fn bf16_keeps_the_quiet_nan() {
+        let fp32: Vec<u8> = 0x7FC0_0000u32.to_le_bytes().to_vec();
+        let bf16 = fp32_to_bf16(&fp32).unwrap();
+        assert_eq!(u16::from_le_bytes([bf16[0], bf16[1]]), 0x7FC0);
+
+        let negative: Vec<u8> = 0xFFC0_0000u32.to_le_bytes().to_vec();
+        let bf16 = fp32_to_bf16(&negative).unwrap();
+        assert_eq!(u16::from_le_bytes([bf16[0], bf16[1]]), 0xFFC0);
+    }
+
+    /// The other half of the guard: an infinity has to stay an infinity, and
+    /// finite values large enough to round up still reach it.
+    #[test]
+    fn bf16_keeps_infinity_and_still_overflows_to_it() {
+        for (value, expect_sign) in [(f32::INFINITY, 1.0f32), (f32::NEG_INFINITY, -1.0)] {
+            let bf16 = fp32_to_bf16(&value.to_le_bytes()).unwrap();
+            let back = bf16_to_fp32(&bf16).unwrap();
+            let val = f32::from_le_bytes([back[0], back[1], back[2], back[3]]);
+            assert!(val.is_infinite() && val.signum() == expect_sign, "{value} → {val}");
+        }
+
+        // f32::MAX rounds up past the largest bf16, which is Inf by IEEE rules.
+        let bf16 = fp32_to_bf16(&f32::MAX.to_le_bytes()).unwrap();
+        let back = bf16_to_fp32(&bf16).unwrap();
+        let val = f32::from_le_bytes([back[0], back[1], back[2], back[3]]);
+        assert!(val.is_infinite() && val > 0.0, "f32::MAX → {val}");
+    }
+
+    /// fp16 already had the check, in a different shape. Same contract, so the
+    /// same test: a payload below the bits fp16 keeps must not become Inf.
+    #[test]
+    fn fp16_keeps_nan_with_a_low_payload() {
+        let fp32: Vec<u8> = 0x7F80_0001u32.to_le_bytes().to_vec();
+        let fp16 = fp32_to_fp16(&fp32).unwrap();
+        let back = fp16_to_fp32(&fp16).unwrap();
+        let val = f32::from_le_bytes([back[0], back[1], back[2], back[3]]);
+        assert!(val.is_nan(), "fp16 turned a NaN into {val}");
     }
 
     #[test]

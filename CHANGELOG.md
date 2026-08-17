@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.0.5 — unreleased
+
+Correctness and packaging. Most of this comes from an external review of the
+0.0.4 artifacts; the entries below are the parts that were reproduced.
+
+### Fixed
+
+- **The fp32→bf16 cast could turn a NaN into +Inf.** bf16 keeps the top 7
+  mantissa bits, so a NaN whose payload sits below bit 16 — `0x7F800001`, which
+  is what comparisons against a corrupted tensor tend to produce — reached the
+  truncation with a zero mantissa under an all-ones exponent, and that is
+  infinity. The quiet NaN `0x7FC00000` was never affected, which is why no test
+  caught it. NaN is now mapped to a NaN explicitly, sign and the surviving
+  payload bits kept. Only affected checkpoints saved with `save_dtype="bf16"`.
+  A diverged run could be saved looking finite.
+- **`max_rollback_snapshots` was never read.** It was defined, defaulted,
+  documented and passed in from Python, and no code consulted it: every
+  snapshot that ever landed on `rollback_interval_steps` kept its exemption from
+  retention forever, and the store grew without bound. Only the newest N are
+  protected now; past that they become ordinary snapshots again and retention
+  prunes them in its own order. `0` disables rollback protection, as it already
+  did for the interval.
+- **`requirements.txt` was UTF-16LE**, so `pip install -r requirements.txt`
+  failed to parse it. UTF-8 now.
+
+### Changed
+
+- **`merge_stride > 0` now warns.** `do_full_merge` rebuilds a merged snapshot
+  from the *base* snapshot's tensor list, so a tensor first written by a later
+  delta is dropped and a tensor removed after the base comes back — silently,
+  in both directions. The fix is scheduled for 0.0.6; until then the constructor
+  says so. Merging is off by default (`merge_stride = 0`) and this reaches only
+  the people who turned it on. Safe if the set of tensor names is fixed for the
+  whole run, which covers ordinary training.
+- **Development status classifier is `4 - Beta`**, not `5 - Production/Stable`.
+  On a 0.0.x release the old one was a claim the package could not support.
+- **Wheels no longer carry `__pycache__`.** Every 0.0.4 wheel shipped cp314
+  bytecode, from a working tree where the tests had already run. Harmless, but
+  six wheels for six interpreters holding one interpreter's `.pyc` files.
+
 ## 0.0.4 — 2026-08-17
 
 First release on PyPI (`pip install moonclip`) and crates.io. Until now the only

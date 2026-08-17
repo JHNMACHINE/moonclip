@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "moonclip"
-version = "0.0.4"
+version = "0.0.5"
 description = "High-performance ML checkpoint management — per-tensor delta tracking, Rust-native compression, rank-aware distributed saves"
 requires-python = ">=3.9"
 license = {text = "Apache-2.0"}
@@ -14,7 +14,10 @@ authors = [
 readme = "README.md"
 keywords = ["checkpointing", "machine-learning", "deep-learning", "pytorch", "distributed", "delta-compression", "fsdp"]
 classifiers = [
-    "Development Status :: 5 - Production/Stable",
+    # 4, not 5. The version number is 0.0.x, the format version of the pack is
+    # still allowed to move, and PyPI shows this string on the project page —
+    # "Production/Stable" next to 0.0.5 is a claim the release cannot support.
+    "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
     "License :: OSI Approved :: Apache Software License",
@@ -47,6 +50,13 @@ torch = ["torch>=2.0"]
 features = ["extension-module"]
 python-source = "python"
 module-name = "moonclip.moonclip"
+# Every 0.0.4 wheel shipped a `__pycache__/` full of cp314 `.pyc` files: they
+# were built from a working tree where the test suite had already run, and
+# maturin copies whatever sits under `python-source`. Harmless but wrong —
+# bytecode compiled for one interpreter, inside wheels for six. The release
+# workflow clones fresh so it cannot happen there; this is the guard for
+# everything built by hand.
+exclude = ["**/__pycache__/**", "**/*.py[cod]"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

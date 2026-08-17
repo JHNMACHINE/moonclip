@@ -31,6 +31,10 @@ class CheckpointManager:
         merge_stride: int = 0,
         merge_max_chain: int = 10,
         save_dtype: str = "none",
+        max_total_snapshots: Optional[int] = None,
+        async_save: bool = True,
+        keep_base_in_memory: bool = True,
+        pin_device_copies: bool = True,
         **kwargs: Any,
     ) -> None: ...
 

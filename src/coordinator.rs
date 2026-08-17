@@ -2615,4 +2615,50 @@ mod tests {
             assert_eq!(loaded.get("w").unwrap()[0], info.step as u8);
         }
     }
+
+    /// The other side of the previous test, and the point of the cap: without
+    /// it, every snapshot that ever fell on the interval keeps its exemption
+    /// and a long run ends with a store retention is not allowed to touch.
+    /// Same shape as the test above, `max_rollback_snapshots` lowered to one.
+    #[test]
+    fn only_the_newest_rollback_snapshots_stay_protected() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(dir.path()).unwrap());
+        let config = CoordinatorConfig {
+            world_size: 1,
+            rank: 0,
+            compression: CompressionAlgo::Zstd { level: 1 },
+            retention: RetentionPolicy {
+                max_full_snapshots: 1,
+                max_deltas_per_full: 2,
+                full_snapshot_every_steps: 2,
+                max_total_snapshots: Some(3),
+            },
+            lineage: LineageConfig {
+                rollback_interval_steps: 4,
+                max_rollback_snapshots: 1,
+            },
+            delta_max_ratio: 0.95,
+            ..Default::default()
+        };
+        let coord = Coordinator::new(storage, config).unwrap();
+
+        for step in 0..12u64 {
+            coord.save(step, evolving_state(step), HashMap::new()).unwrap();
+        }
+        coord.flush().unwrap();
+
+        let steps: Vec<u64> = coord.list_snapshots().iter().map(|s| s.step).collect();
+        let on_interval: Vec<u64> = steps.iter().copied().filter(|s| s % 4 == 0).collect();
+
+        assert!(
+            on_interval.len() <= 1,
+            "a cap of one left {} protected snapshots: {steps:?}",
+            on_interval.len()
+        );
+        assert!(
+            !steps.contains(&0),
+            "step 0 outlived a cap of one; steps left: {steps:?}"
+        );
+    }
 }
