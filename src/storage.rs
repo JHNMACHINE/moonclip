@@ -130,6 +130,37 @@ fn sync_dir(dir: &Path) {
 #[cfg(not(unix))]
 fn sync_dir(_dir: &Path) {}
 
+/// Create `dir` and every missing ancestor, returning the ones that had to be
+/// created, deepest first.
+///
+/// The caller needs that list because creating a directory is itself a change
+/// to its *parent*, and an unsynced parent can lose the entry. Syncing the
+/// pack and then the directory holding it says nothing about whether the
+/// directory is still named by anything: every snapshot writes into a fresh
+/// `snapshots/<uuid>/`, so on the first pack of every snapshot the entry for
+/// `<uuid>` lives in `snapshots/`, which nothing had synced. A power cut there
+/// takes the whole snapshot with it — a fully fsynced pack in a directory that
+/// no longer exists — which is exactly the outcome `fsync_enabled` is on to
+/// prevent.
+///
+/// In the steady state a directory already exists and this returns empty, so
+/// the extra syncs are paid once per snapshot rather than once per pack.
+fn create_dirs_recording_new(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let mut created = Vec::new();
+    let mut cursor = Some(dir);
+    while let Some(path) = cursor {
+        if path.exists() {
+            break;
+        }
+        created.push(path.to_path_buf());
+        cursor = path.parent();
+    }
+    if !created.is_empty() {
+        std::fs::create_dir_all(dir)?;
+    }
+    Ok(created)
+}
+
 impl StorageBackend for LocalStorage {
     fn put(&self, rel_path: &str, data: &[u8]) -> Result<()> {
         self.put_parts(rel_path, &[data])
@@ -139,9 +170,10 @@ impl StorageBackend for LocalStorage {
         use std::io::Write;
 
         let path = self.full_path(rel_path);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
+        let new_dirs = match path.parent() {
+            Some(parent) => create_dirs_recording_new(parent)?,
+            None => Vec::new(),
+        };
 
         // Atomic write: temp file → rename. Parts are streamed directly
         // to the file — no concatenated or padded copy of the data.
@@ -174,6 +206,17 @@ impl StorageBackend for LocalStorage {
         // than to the file, and is not covered by the sync above.
         if fsync_enabled() {
             sync_dir(dir);
+            // Then the entries naming any directory this call had to create,
+            // deepest first: a synced pack inside a directory whose own entry
+            // never reached the device is still a lost checkpoint. Bottom-up
+            // so a crash part-way through leaves a shorter reachable chain
+            // rather than a directory nothing names. See
+            // `create_dirs_recording_new`, which returns them in that order.
+            for created in &new_dirs {
+                if let Some(parent) = created.parent() {
+                    sync_dir(parent);
+                }
+            }
         }
         Ok(())
     }

@@ -409,10 +409,25 @@ impl S3Storage {
 
             match req.set("Range", &range).call() {
                 Ok(resp) => {
+                    // A server is allowed to ignore `Range` and answer 200 with
+                    // the whole object. Truncating that to `len` would hand
+                    // back the bytes at offset 0 as if they were the bytes at
+                    // `offset` — a pack descriptor read that quietly returns
+                    // the header, or a tensor blob that is somebody else's.
+                    // Wrong bytes are worse than no bytes, so this is an error
+                    // unless the window happens to start at 0 anyway.
+                    if resp.status() != 206 && offset != 0 {
+                        return Err(MoonclipError::Storage(format!(
+                            "S3 answered {} for a ranged read of {key}: the endpoint ignored \
+                             Range, so bytes {}..{} cannot be read a piece at a time",
+                            resp.status(),
+                            offset,
+                            offset + len as u64
+                        )));
+                    }
                     let mut buf = Vec::with_capacity(len);
-                    // Bounded by `len`, not by what the far side sends: a
-                    // server that ignores `Range` answers with the whole
-                    // object, and reading all of it would defeat the point.
+                    // Bounded by `len` rather than by what the far side sends,
+                    // so an over-long body cannot balloon the read.
                     let mut reader = resp.into_reader().take(len as u64);
                     reader
                         .read_to_end(&mut buf)

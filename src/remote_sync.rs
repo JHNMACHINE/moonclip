@@ -22,13 +22,41 @@ use crate::storage::StorageBackend;
 /// remote, delete whatever is not local — is a foot-gun with the safety off:
 /// point a fresh machine with an empty checkpoint directory at an existing
 /// bucket and it erases the backup it was meant to restore from.
-#[derive(Default)]
+///
+/// **A queue nobody drains has to refuse work.** Only the syncer thread drains
+/// this, so with no remote configured — the default — every retention eviction
+/// and every merge appended a key that was never read and never freed. That is
+/// unbounded growth in a process whose whole purpose is to run for weeks, so a
+/// registry built by [`PendingDeletes::disabled`] drops pushes on the floor.
 pub struct PendingDeletes {
     keys: Mutex<Vec<String>>,
+    /// Whether anything will ever drain `keys`. False when the coordinator has
+    /// no remote, in which case there is no remote copy to delete either.
+    collecting: bool,
+}
+
+impl Default for PendingDeletes {
+    fn default() -> Self {
+        PendingDeletes {
+            keys: Mutex::new(Vec::new()),
+            collecting: true,
+        }
+    }
 }
 
 impl PendingDeletes {
+    /// A registry for a coordinator with no remote: `push` is a no-op.
+    pub fn disabled() -> Self {
+        PendingDeletes {
+            keys: Mutex::new(Vec::new()),
+            collecting: false,
+        }
+    }
+
     pub fn push(&self, key: impl Into<String>) {
+        if !self.collecting {
+            return;
+        }
         self.keys.lock().unwrap().push(key.into());
     }
 
@@ -229,7 +257,8 @@ fn apply_deletes(remote: &Arc<dyn StorageBackend>, deletes: &Arc<PendingDeletes>
     }
     if failed > 0 {
         eprintln!(
-            "[Moonclip sync] {failed} of {} deleted checkpoints could not be              removed from the remote; they are unreferenced but still billed",
+            "[Moonclip sync] {failed} of {} deleted checkpoints could not be removed \
+             from the remote; they are unreferenced but still billed",
             keys.len()
         );
     }
@@ -504,6 +533,11 @@ mod tests {
         // What retention does: gone locally, queued for the remote.
         src.delete("snapshots/old/rank_0.pack").unwrap();
         deletes.push("snapshots/old/rank_0.pack");
+        assert_eq!(
+            deletes.keys.lock().unwrap().len(),
+            1,
+            "a collecting registry dropped the key"
+        );
 
         syncer.sync_now().unwrap();
         assert!(
@@ -515,6 +549,24 @@ mod tests {
             "the live checkpoint went with it"
         );
         syncer.shutdown();
+    }
+
+    /// With no remote there is nothing to drain the queue and nothing on a
+    /// remote to delete, so pushes have to go nowhere. Collecting them was an
+    /// unbounded leak: every retention eviction and every merge appended a key
+    /// that nothing would ever read, for the length of a run measured in
+    /// weeks.
+    #[test]
+    fn a_registry_with_no_remote_keeps_nothing() {
+        let deletes = PendingDeletes::disabled();
+        for step in 0..10_000 {
+            deletes.push(format!("snapshots/{step}/rank_0.pack"));
+        }
+        assert!(
+            deletes.keys.lock().unwrap().is_empty(),
+            "keys nobody will ever drain accumulated anyway"
+        );
+        assert!(deletes.drain().is_empty());
     }
 
     /// A remote that cannot delete must not fail the sync: the upload is what

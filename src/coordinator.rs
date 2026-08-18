@@ -389,7 +389,15 @@ impl Coordinator {
         let manifest = Arc::new(Mutex::new(manifest));
 
         let in_flight = Arc::new(InFlight::default());
-        let pending_deletes = Arc::new(PendingDeletes::default());
+        // Only the syncer drains this, so with no remote there is nothing to
+        // drain it and nothing on a remote to delete — collecting keys would
+        // be a leak that grows for the length of the run.
+        let has_remote = config.remote_storage.is_some() && config.remote_sync.is_some();
+        let pending_deletes = Arc::new(if has_remote {
+            PendingDeletes::default()
+        } else {
+            PendingDeletes::disabled()
+        });
 
         // Spawn merger if configured
         let merger = config.merger.clone().map(|mc| {
@@ -598,7 +606,7 @@ impl Core {
                 .filter(|b| !self.in_flight.is_doomed(b.id))
                 .cloned()
         };
-        let _base_pin = base_snap
+        let base_pin = base_snap
             .as_ref()
             .map(|b| self.in_flight.pin(std::slice::from_ref(&b.id)));
         drop(manifest);
@@ -611,6 +619,15 @@ impl Core {
         };
         let rank_entry =
             self.save_rank_tensors(snap_id, &snap_dir, &base_snap, tensors, &context)?;
+
+        // Released here rather than at the end of the function, which is where
+        // it would fall out of scope. Retention runs below and its unlink waits
+        // for readers, so any pin still held at that point is one this thread
+        // would be waiting on itself — and it takes only the right arrangement
+        // of rollback protection for retention to choose the very snapshot this
+        // save pinned. Nothing above needs the pin once the base has been read,
+        // so the narrow scope costs nothing and removes the question.
+        drop(base_pin);
 
         let snapshot = Snapshot {
             id: snap_id,
@@ -630,8 +647,18 @@ impl Core {
         let mut manifest = self.manifest.lock().unwrap();
         manifest.snapshots.push(snapshot);
         // apply_retention persists the manifest when done.
-        self.apply_retention(&mut manifest)?;
+        let evicted = self.apply_retention(&mut manifest)?;
         drop(manifest);
+        // Unlinked after the lock is released, never under it: the unlink
+        // waits for readers, and a reader reacquires the manifest lock while
+        // pinned. See `Core::remove_snapshots`.
+        crate::merger::unlink_snapshots(
+            &self.storage,
+            &self.pending_deletes,
+            &self.in_flight,
+            &evicted,
+            crate::inflight::RETENTION_UNLINK_WAIT,
+        );
 
         // Notify merger
         if let Some(ref merger) = self.merger {
@@ -655,12 +682,19 @@ impl Core {
     fn create_snapshot(&self, step: u64, metadata: HashMap<String, String>) -> Result<Uuid> {
         let snap_id = Uuid::new_v4();
 
+        // A base a merge has already claimed is not picked up, exactly as in
+        // the single-rank path: it will not exist by the time anyone loads the
+        // delta written against it. Rank 0 chooses for every rank here, so
+        // getting it wrong costs the whole snapshot rather than one shard.
         let manifest = self.manifest.lock().unwrap();
         let force_full = manifest.should_force_full(step);
         let base_id = if force_full {
             None
         } else {
-            manifest.last_full_snapshot().map(|s| s.id)
+            manifest
+                .last_full_snapshot()
+                .filter(|b| !self.in_flight.is_doomed(b.id))
+                .map(|s| s.id)
         };
         drop(manifest);
 
@@ -701,6 +735,15 @@ impl Core {
         let base_snap = snap
             .base_snapshot_id
             .and_then(|id| manifest.find_snapshot(id).cloned());
+        // Pinned in the same critical section that read it, and held until
+        // this rank's pack is written. `save_rank_tensors` reads the base off
+        // storage after the lock is gone — without this, rank 0's own merger
+        // could unlink those packs mid-read, which is the same race the
+        // single-rank path guards. Rank 0 already refused a doomed base in
+        // `create_snapshot`; this covers a merge that starts afterwards.
+        let _base_pin = base_snap
+            .as_ref()
+            .map(|b| self.in_flight.pin(std::slice::from_ref(&b.id)));
         drop(manifest);
 
         let snap_dir = format!("snapshots/{}", snap_id);
@@ -799,8 +842,18 @@ impl Core {
             return Err(MoonclipError::NotFound(format!("Snapshot {snap_id}")));
         }
 
-        self.apply_retention(&mut manifest)?;
+        let evicted = self.apply_retention(&mut manifest)?;
         drop(manifest);
+        // Unlinked after the lock is released, never under it: the unlink
+        // waits for readers, and a reader reacquires the manifest lock while
+        // pinned. See `Core::remove_snapshots`.
+        crate::merger::unlink_snapshots(
+            &self.storage,
+            &self.pending_deletes,
+            &self.in_flight,
+            &evicted,
+            crate::inflight::RETENTION_UNLINK_WAIT,
+        );
 
         if let Some(ref merger) = self.merger {
             merger.notify();
@@ -821,8 +874,16 @@ impl Core {
         use rayon::prelude::*;
 
         // Pinned for the duration, base included: a merge running beside this
-        // load would otherwise delete the packs it is reading. Same rule as the
-        // save path — see `crate::inflight`.
+        // load would otherwise delete the packs it is reading. The pin is what
+        // holds off the unlink — a merge that has already claimed these blocks
+        // in `unlink_snapshots` until this guard drops. Checking `is_doomed`
+        // here instead would not do: it can be overtaken between the manifest
+        // read and the first byte read. See `crate::inflight`.
+        //
+        // Note the lock discipline this depends on: the base entries are read
+        // under the manifest lock *below*, while this pin is held. That is
+        // only safe because nothing waits on a pin while holding the manifest
+        // lock.
         let manifest = self.manifest.lock().unwrap();
         let snap = manifest
             .find_snapshot(snap_id)
@@ -1312,10 +1373,16 @@ impl Core {
     }
 
     /// Apply retention policy: cap full snapshots, then cap total snapshots.
-    fn apply_retention(&self, manifest: &mut Manifest) -> Result<()> {
+    ///
+    /// Returns the snapshots it evicted. Their files are still on disk: the
+    /// caller unlinks them after dropping the manifest lock, because the
+    /// unlink waits for readers and that wait deadlocks under this lock. See
+    /// [`Core::remove_snapshots`].
+    fn apply_retention(&self, manifest: &mut Manifest) -> Result<Vec<Snapshot>> {
         let max_full = manifest.retention.max_full_snapshots;
         let max_total = manifest.retention.effective_total_cap();
         let rollback_ids = manifest.rollback_snapshot_ids();
+        let mut evicted: Vec<Snapshot> = Vec::new();
 
         // ── Pass 1: Cap full snapshot count ──────────────────────────
         // Loop until we're within the full-snapshot limit.
@@ -1342,7 +1409,9 @@ impl Core {
                 .map(|s| s.id);
 
             match oldest_removable {
-                Some(oldest_id) => self.remove_snapshot_group(manifest, oldest_id)?,
+                Some(oldest_id) => {
+                    evicted.extend(self.remove_snapshot_group(manifest, oldest_id)?)
+                }
                 None => break, // All remaining are rollback-protected
             }
         }
@@ -1380,7 +1449,7 @@ impl Core {
                 .map(|s| s.id);
 
             if let Some(delta_id) = oldest_delta {
-                self.remove_snapshots(manifest, &[delta_id])?;
+                evicted.extend(self.remove_snapshots(manifest, &[delta_id])?);
                 continue;
             }
 
@@ -1402,17 +1471,23 @@ impl Core {
                 break;
             }
             match removable_fulls.first() {
-                Some(&oldest_id) => self.remove_snapshot_group(manifest, oldest_id)?,
+                Some(&oldest_id) => {
+                    evicted.extend(self.remove_snapshot_group(manifest, oldest_id)?)
+                }
                 None => break,
             }
         }
 
         self.persist_manifest(manifest)?;
-        Ok(())
+        Ok(evicted)
     }
 
     /// Remove a full snapshot and all its dependent deltas.
-    fn remove_snapshot_group(&self, manifest: &mut Manifest, full_id: Uuid) -> Result<()> {
+    fn remove_snapshot_group(
+        &self,
+        manifest: &mut Manifest,
+        full_id: Uuid,
+    ) -> Result<Vec<Snapshot>> {
         let to_remove: Vec<Uuid> = manifest
             .snapshots
             .iter()
@@ -1422,41 +1497,34 @@ impl Core {
         self.remove_snapshots(manifest, &to_remove)
     }
 
-    /// Delete these snapshots' data and drop them from the manifest.
+    /// Drop these snapshots from the manifest and hand their descriptions back
+    /// for the caller to unlink.
     ///
     /// The caller owns the question of what is safe to remove: a delta can go
     /// on its own, a full only with everything computed against it.
-    fn remove_snapshots(&self, manifest: &mut Manifest, to_remove: &[Uuid]) -> Result<()> {
-        // Delete files from storage
-        for snap in manifest
+    ///
+    /// **It does not delete.** This runs with the manifest lock held, and the
+    /// unlink has to wait for readers — a wait that cannot happen under that
+    /// lock, because `load_in_pool` reacquires it while pinned and the two
+    /// would deadlock. So the files go back to the caller, which unlinks them
+    /// through `merger::unlink_snapshots` once the lock is gone. Same rule as
+    /// the merger, for the same reason: retention evicting a snapshot out from
+    /// under a load that is reading it is the same failure as a merge doing
+    /// it.
+    fn remove_snapshots(
+        &self,
+        manifest: &mut Manifest,
+        to_remove: &[Uuid],
+    ) -> Result<Vec<Snapshot>> {
+        let evicted: Vec<Snapshot> = manifest
             .snapshots
             .iter()
             .filter(|s| to_remove.contains(&s.id))
-        {
-            for rank_entry in snap.ranks.values() {
-                // Delete pack file
-                if let Some(ref pack_file) = rank_entry.pack_file {
-                    let _ = self.storage.delete(pack_file);
-                    // And, eventually, from the bucket: retention that only
-                    // bounds the local disk leaves the remote growing for the
-                    // length of the run. See `crate::remote_sync`.
-                    self.pending_deletes.push(pack_file.clone());
-                }
-                // Delete legacy individual files
-                for tensor in &rank_entry.tensors {
-                    if let Some(ref filename) = tensor.filename {
-                        let _ = self.storage.delete(filename);
-                        self.pending_deletes.push(filename.clone());
-                    }
-                }
-            }
-            // No separate description to clean up: it lives inside the pack
-            // that was just deleted.
-            let _ = self.storage.remove_dir(&format!("snapshots/{}", snap.id));
-        }
+            .cloned()
+            .collect();
 
         manifest.snapshots.retain(|s| !to_remove.contains(&s.id));
-        Ok(())
+        Ok(evicted)
     }
 }
 

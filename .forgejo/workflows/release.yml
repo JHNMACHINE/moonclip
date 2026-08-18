@@ -181,8 +181,13 @@ jobs:
   # One wheel per interpreter, one job each. Native wheels rather than a single
   # abi3 one: the stable ABI would cost PyO3's fast paths, which is the wrong
   # trade for this library.
+  #
+  # After the sdist, not beside it. Both needing only `crate` ran them in
+  # parallel, so an sdist that failed `twine check` still let six wheels reach
+  # PyPI — a version burned with wheels and no source distribution, and
+  # `--skip-existing` means a re-run cannot repair it.
   wheels:
-    needs: crate
+    needs: sdist
     runs-on: codeberg-medium
     container:
       # The PyPA manylinux image ships every supported CPython under
