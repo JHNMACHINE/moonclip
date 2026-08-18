@@ -9,11 +9,30 @@ use crate::compression;
 use crate::delta;
 use crate::error::{Result, MoonclipError};
 use crate::hash::hash_hex;
-use crate::inflight::InFlight;
+use crate::inflight::{InFlight, FORCED_CLAIM_WAIT, UNLINK_WAIT};
 use crate::manifest::*;
 use crate::pack;
 use crate::remote_sync::PendingDeletes;
 use crate::storage::StorageBackend;
+
+/// What a merge actually did.
+///
+/// A merge that stood down is not a failure and not a success, and collapsing
+/// it into `Ok(())` is how `save_final` came to report a fold that never
+/// happened: it merges and then uploads, so "skipped because something was
+/// being read" is an answer it has to be able to see. See
+/// [`DeltaMerger::force_full_merge`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MergeOutcome {
+    /// The snapshots were folded and published.
+    Merged,
+    /// There was nothing to fold — no deltas against the current base.
+    NothingToMerge,
+    /// A reader was inside the inputs and would not leave. Opportunistic
+    /// merges treat this as "try again on the next notify"; a forced one has
+    /// already waited [`FORCED_CLAIM_WAIT`] and must report it.
+    Busy,
+}
 
 /// Configuration for the delta merger.
 ///
@@ -96,9 +115,44 @@ impl DeltaMerger {
                             }
                         }
                         MergeCommand::ForceFullMerge(done) => {
-                            let outcome = crate::pool::install(|| {
-                                do_full_merge(&storage, &manifest, &compression, &in_flight, &pending_deletes)
-                            });
+                            // A forced merge does not stand down. `save_final`
+                            // folds the run and uploads straight afterwards,
+                            // so a merge skipped because something was being
+                            // read used to be reported as success and the
+                            // unmerged chain went to the bucket. Retry until
+                            // the reader leaves, then give up loudly.
+                            //
+                            // The wait is here rather than inside the claim
+                            // because this holds no manifest lock — the
+                            // closure has returned by then. See
+                            // `crate::inflight` on lock order.
+                            let deadline = std::time::Instant::now() + FORCED_CLAIM_WAIT;
+                            let outcome = loop {
+                                let attempt = crate::pool::install(|| {
+                                    do_full_merge(&storage, &manifest, &compression, &in_flight, &pending_deletes)
+                                });
+                                match attempt {
+                                    Ok(MergeOutcome::Busy) => {
+                                        let left = deadline
+                                            .checked_duration_since(std::time::Instant::now());
+                                        match left {
+                                            Some(left) => in_flight.wait_for_any_unpin(
+                                                left.min(std::time::Duration::from_secs(1)),
+                                            ),
+                                            None => {
+                                                break Err(MoonclipError::Storage(
+                                                    "Forced merge stood down: something has \
+                                                     been reading the snapshots it would fold \
+                                                     for longer than the merge waits"
+                                                        .into(),
+                                                ))
+                                            }
+                                        }
+                                    }
+                                    Ok(_) => break Ok(()),
+                                    Err(e) => break Err(e),
+                                }
+                            };
                             match done {
                                 // Somebody is waiting on this one, so the
                                 // failure is theirs to see rather than the
@@ -217,7 +271,11 @@ fn do_stride_merge(
     // early every time and the depth cap could never fire.
     if delta_count >= config.max_chain_depth {
         drop(manifest);
-        return do_full_merge(storage, manifest_lock, compression, in_flight, pending_deletes);
+        // Opportunistic like the rest of this function: a full merge that
+        // stands down because something is being read runs again on the next
+        // notify, and the depth cap fires then instead.
+        return do_full_merge(storage, manifest_lock, compression, in_flight, pending_deletes)
+            .map(|_| ());
     }
 
     if config.stride == 0 || delta_count < config.stride {
@@ -290,10 +348,60 @@ fn do_stride_merge(
     }
     drop(manifest);
 
-    for snap in &doomed {
+    // The manifest lock is gone before this waits, which is not optional: a
+    // reader reacquires it *after* pinning, so waiting while holding it would
+    // deadlock against the reader being waited for. See `crate::inflight`.
+    unlink_snapshots(storage, pending_deletes, in_flight, &doomed, UNLINK_WAIT);
+
+    Ok(())
+}
+
+/// Remove the files of snapshots the manifest no longer names.
+///
+/// **Waits for readers first.** Publishing has already happened, so nothing
+/// new can reach these snapshots; what can still be inside them is a load that
+/// pinned them before they were dropped, or — the case the claim cannot cover
+/// — one that pinned them *after* the merge claimed and before it got here.
+/// Unlinking under that reader is the failure this whole mechanism exists to
+/// prevent, and the wait is the only place it can be stopped.
+///
+/// `wait` bounds that, and the two callers want different bounds: a merge runs
+/// on the merger thread and can afford [`UNLINK_WAIT`], while retention runs on
+/// the save path, where a long block is a stalled checkpoint. Timing out leaves
+/// the files alone rather than pulling them out from under the reader. They are
+/// already out of the manifest, so what they cost is disk until the next
+/// startup, where `recover_or_reclaim_orphans` either folds them back in — they
+/// are, after all, intact — or discards them. Both are better than a load that
+/// fails halfway through.
+///
+/// The caller must not hold the manifest lock — see `crate::inflight`.
+pub(crate) fn unlink_snapshots(
+    storage: &Arc<dyn StorageBackend>,
+    pending_deletes: &Arc<PendingDeletes>,
+    in_flight: &Arc<InFlight>,
+    doomed: &[Snapshot],
+    wait: std::time::Duration,
+) {
+    if doomed.is_empty() {
+        return;
+    }
+    let ids: Vec<Uuid> = doomed.iter().map(|s| s.id).collect();
+    if !in_flight.wait_until_unpinned(&ids, wait) {
+        eprintln!(
+            "[Moonclip] {} dropped snapshot(s) are still being read after {}s; \
+             leaving their files rather than unlinking under the reader",
+            ids.len(),
+            wait.as_secs()
+        );
+        return;
+    }
+
+    for snap in doomed {
         for rank_entry in snap.ranks.values() {
             if let Some(ref pack_file) = rank_entry.pack_file {
                 let _ = storage.delete(pack_file);
+                // The remote holds a copy of everything that was ever synced,
+                // and a merge makes most of it unreachable at once.
                 pending_deletes.push(pack_file.clone());
             }
             for tensor in &rank_entry.tensors {
@@ -305,8 +413,6 @@ fn do_stride_merge(
         }
         let _ = storage.remove_dir(&format!("snapshots/{}", snap.id));
     }
-
-    Ok(())
 }
 
 /// Merge all deltas into the base, producing a new full snapshot.
@@ -319,13 +425,18 @@ fn do_stride_merge(
 /// exactly the snapshot that recovery discards — and the merge is the moment
 /// the run's entire history collapses into that one snapshot, so it is the
 /// worst one to lose.
+///
+/// Returns [`MergeOutcome::Busy`] rather than standing down silently when a
+/// reader is inside the inputs. An opportunistic caller ignores that — it will
+/// be notified again anyway — while a forced one retries; see
+/// [`DeltaMerger::force_full_merge`].
 pub(crate) fn do_full_merge(
     storage: &Arc<dyn StorageBackend>,
     manifest_lock: &Arc<Mutex<Manifest>>,
     compression: &CompressionAlgo,
     in_flight: &Arc<InFlight>,
     pending_deletes: &Arc<PendingDeletes>,
-) -> Result<()> {
+) -> Result<MergeOutcome> {
     let manifest = manifest_lock.lock().unwrap();
 
     let base_snap = manifest
@@ -343,17 +454,20 @@ pub(crate) fn do_full_merge(
         .collect();
 
     if deltas.is_empty() {
-        return Ok(());
+        return Ok(MergeOutcome::NothingToMerge);
     }
 
     // The base and every delta folded into it are about to stop existing, so
     // claim them before the manifest lock goes: a save that picks this base up
     // afterwards writes a full snapshot instead of a delta against something
     // that will be gone, and a save already inside one of them makes the claim
-    // fail. See `crate::inflight` for why neither side waits for the other.
+    // fail. The claim does not block — it runs under the manifest lock, and a
+    // reader reacquires that lock after pinning, so blocking here would
+    // deadlock against the reader being waited for. Retrying is the caller's
+    // job, from outside the lock.
     let claimed: Vec<Uuid> = std::iter::once(base_id).chain(deltas.iter().map(|s| s.id)).collect();
     let Some(_claim) = in_flight.claim(&claimed) else {
-        return Ok(());
+        return Ok(MergeOutcome::Busy);
     };
 
     drop(manifest);
@@ -589,27 +703,16 @@ pub(crate) fn do_full_merge(
     }
     drop(manifest);
 
-    // Durable and unreferenced: deleting these can no longer lose data a
-    // reader could reach.
-    for snap in deltas.iter().chain(std::iter::once(&base_snap)) {
-        for rank_entry in snap.ranks.values() {
-            if let Some(ref pack_file) = rank_entry.pack_file {
-                let _ = storage.delete(pack_file);
-                // The remote holds a copy of everything that was ever synced,
-                // and a merge makes most of it unreachable at once.
-                pending_deletes.push(pack_file.clone());
-            }
-            for tensor in &rank_entry.tensors {
-                if let Some(ref filename) = tensor.filename {
-                    let _ = storage.delete(filename);
-                    pending_deletes.push(filename.clone());
-                }
-            }
-        }
-        let _ = storage.remove_dir(&format!("snapshots/{}", snap.id));
-    }
+    // Durable and unreferenced: nothing new can reach these. What still can is
+    // a load that pinned them before they were dropped, or after the claim —
+    // so the unlink waits, outside the manifest lock. See `unlink_snapshots`.
+    let spent: Vec<Snapshot> = deltas
+        .into_iter()
+        .chain(std::iter::once(base_snap))
+        .collect();
+    unlink_snapshots(storage, pending_deletes, in_flight, &spent, UNLINK_WAIT);
 
-    Ok(())
+    Ok(MergeOutcome::Merged)
 }
 
 /// Load tensor compressed data, supporting both pack files and legacy individual files.
@@ -1392,5 +1495,188 @@ mod tests {
             got, original,
             "the merge replayed an intermediate delta the newest one had undone"
         );
+    }
+
+    /// Standing down has to be distinguishable from having merged.
+    ///
+    /// `do_full_merge` returned `Ok(())` for both, so `save_final` — which
+    /// merges and then uploads — reported a fold that never happened and sent
+    /// the unmerged chain to the bucket. A reader inside the inputs is the
+    /// case that produces it.
+    #[test]
+    fn a_merge_refused_by_a_reader_says_so_instead_of_reporting_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(dir.path()).unwrap());
+        let (manifest, _) = scenario(storage.as_ref(), 2, 20_000);
+
+        let base_id = manifest.snapshots[0].id;
+        let manifest = Arc::new(Mutex::new(manifest));
+        let in_flight = unread();
+
+        // A load is inside the base, which is one of the snapshots the fold
+        // would consume.
+        let reader = in_flight.pin(&[base_id]);
+        assert_eq!(
+            do_full_merge(&storage, &manifest, &ZSTD3, &in_flight, &no_remote()).unwrap(),
+            MergeOutcome::Busy,
+            "a merge that stood down reported the same thing as one that folded"
+        );
+        assert!(
+            manifest.lock().unwrap().snapshots.len() > 1,
+            "the merge claimed to stand down but folded anyway"
+        );
+
+        drop(reader);
+        assert_eq!(
+            do_full_merge(&storage, &manifest, &ZSTD3, &in_flight, &no_remote()).unwrap(),
+            MergeOutcome::Merged,
+            "the merge stayed refused after the reader left"
+        );
+    }
+
+    /// The unlink is the step a reader cannot survive, and the claim cannot
+    /// cover it: a load that pins *after* the merge has claimed meets no
+    /// refusal at all. Proven at the registry level in `crate::inflight`; here
+    /// it is the merger actually parking on it rather than deleting.
+    #[test]
+    fn a_merge_does_not_unlink_under_a_reader_that_arrived_after_the_claim() {
+        /// Pins the base on the merge's first pack read, which is the one
+        /// moment that is reliably *after* the claim and before the unlink.
+        ///
+        /// Pinning from the test thread instead would race the claim and
+        /// usually lose: the merge would be refused outright, which is the
+        /// other half of the mechanism and already covered above.
+        struct PinOnRead {
+            inner: Arc<LocalStorage>,
+            in_flight: Arc<InFlight>,
+            base_id: Uuid,
+            held: Mutex<Option<crate::inflight::PinGuard>>,
+            armed: std::sync::atomic::AtomicBool,
+        }
+
+        impl PinOnRead {
+            fn arrive(&self) {
+                use std::sync::atomic::Ordering;
+                if self.armed.swap(false, Ordering::SeqCst) {
+                    *self.held.lock().unwrap() = Some(self.in_flight.pin(&[self.base_id]));
+                }
+            }
+        }
+
+        impl StorageBackend for PinOnRead {
+            fn put(&self, p: &str, data: &[u8]) -> Result<()> {
+                self.inner.put(p, data)
+            }
+            fn put_parts(&self, p: &str, parts: &[&[u8]]) -> Result<()> {
+                self.inner.put_parts(p, parts)
+            }
+            fn get(&self, p: &str) -> Result<Vec<u8>> {
+                if p.ends_with(".pack") {
+                    self.arrive();
+                }
+                self.inner.get(p)
+            }
+            fn get_range(&self, p: &str, offset: u64, len: usize) -> Result<Vec<u8>> {
+                if p.ends_with(".pack") {
+                    self.arrive();
+                }
+                self.inner.get_range(p, offset, len)
+            }
+            fn exists(&self, p: &str) -> Result<bool> {
+                self.inner.exists(p)
+            }
+            fn delete(&self, p: &str) -> Result<()> {
+                self.inner.delete(p)
+            }
+            fn list(&self, prefix: &str) -> Result<Vec<String>> {
+                self.inner.list(prefix)
+            }
+            fn remove_dir(&self, p: &str) -> Result<()> {
+                self.inner.remove_dir(p)
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let plain = Arc::new(LocalStorage::new(dir.path()).unwrap());
+        let (manifest, _) = scenario(plain.as_ref(), 2, 20_000);
+
+        let base_id = manifest.snapshots[0].id;
+        let base_packs: Vec<String> = manifest.snapshots[0]
+            .ranks
+            .values()
+            .filter_map(|r| r.pack_file.clone())
+            .collect();
+        assert!(!base_packs.is_empty(), "the base wrote no pack to protect");
+
+        let manifest = Arc::new(Mutex::new(manifest));
+        let in_flight = unread();
+        let hooked = Arc::new(PinOnRead {
+            inner: Arc::clone(&plain),
+            in_flight: Arc::clone(&in_flight),
+            base_id,
+            held: Mutex::new(None),
+            armed: std::sync::atomic::AtomicBool::new(true),
+        });
+
+        // Reported over a channel rather than a join handle: the assertion
+        // below is that the merge has *not* finished, and `join` can only wait
+        // for one that has.
+        let (finished, merged) = mpsc::channel();
+        let merging = {
+            let storage: Arc<dyn StorageBackend> = Arc::clone(&hooked) as Arc<dyn StorageBackend>;
+            let manifest = Arc::clone(&manifest);
+            let in_flight = Arc::clone(&in_flight);
+            std::thread::spawn(move || {
+                let outcome = do_full_merge(&storage, &manifest, &ZSTD3, &in_flight, &no_remote());
+                let _ = finished.send(outcome);
+            })
+        };
+
+        // Publish happens before the unlink, so a manifest of one snapshot
+        // means the merge has reached the step this is about.
+        let started = std::time::Instant::now();
+        while manifest.lock().unwrap().snapshots.len() > 1 {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(30),
+                "the merge never published"
+            );
+            std::thread::yield_now();
+        }
+        assert!(
+            hooked.held.lock().unwrap().is_some(),
+            "the reader never arrived: this probe proved nothing"
+        );
+
+        // The load-bearing assertion, and the reason it is phrased as a
+        // timeout: having published, the merge is one step from unlinking, and
+        // the only thing between it and those files is the pin. Checking that
+        // the packs still exist would race the unlink and pass either way —
+        // this cannot, because a merge that is not blocked finishes these 20 KB
+        // in microseconds.
+        assert!(
+            merged
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .is_err(),
+            "the merge ran to completion with a reader still inside its inputs"
+        );
+        for pack in &base_packs {
+            assert!(
+                plain.exists(pack).unwrap(),
+                "{pack} was unlinked while a reader was inside it"
+            );
+        }
+
+        hooked.held.lock().unwrap().take();
+        let outcome = merged
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the merge never woke after the reader left");
+        assert_eq!(outcome.unwrap(), MergeOutcome::Merged);
+        merging.join().unwrap();
+        for pack in &base_packs {
+            assert!(
+                !plain.exists(pack).unwrap(),
+                "{pack} outlived the reader that was holding it back"
+            );
+        }
     }
 }
