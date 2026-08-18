@@ -1,6 +1,70 @@
 # Changelog
 
-## 0.0.6 — unreleased
+## 0.0.7 — 2026-08-18
+
+Retention and merging stopped being able to pull a snapshot out from under a
+reader, and the save path stopped being able to wedge the interpreter. Both are
+things that had to go wrong at the wrong moment to be seen at all, which is why
+neither showed up in 0.0.6.
+
+### Fixed — data loss
+
+- **A merge could unlink a snapshot somebody was still reading.** `InFlight`
+  tracked what was being read, but nothing made the unlink *wait* for it: the
+  window between deciding to fold a snapshot and removing its files was open,
+  and a load that had already resolved its paths would find them gone.
+  `unlink_snapshots` now waits for readers to leave before it removes anything,
+  and `InFlight` grew the claim and wait primitives to make that expressible
+  rather than a sleep. A reader that arrives after the claim is made does not
+  get in.
+- **Directories were created without being recorded or synced.** A crash between
+  creating a directory and writing into it left a path that existed and a parent
+  that did not know about it — recoverable on most filesystems, not on all of
+  them, and never detectably. `create_dirs_recording_new` tracks what it made
+  and fsyncs the parents, so the tree a snapshot lives in is as durable as the
+  snapshot.
+- **Retention unlinked while holding the lock.** `apply_retention` now returns
+  the evicted snapshots and lets the caller remove them after releasing the
+  lock, which is both shorter to hold and the only order in which the wait above
+  can work.
+
+### Fixed — deadlock
+
+- **`save` and `save_rank` could wedge the interpreter, roughly one run in
+  three.** `MoonclipManager::save_tensors` wrapped both the shadow copy *and*
+  `inner.save` in `crate::pool::install`. `inner.save` reaches
+  `AsyncSaver::submit`, which **blocks** until the previous save drains — so the
+  wait happened on one of our own rayon workers. That worker is one the pool has
+  lost, and it can be holding a stolen piece of the `process_tensors_parallel`
+  whose completion is exactly what would release it: the save waits for work
+  only the waiter could finish.
+
+  The copy stays in the pool; the blocking call moved out. `AsyncSaver::submit`
+  now carries a `debug_assert!(rayon::current_thread_index().is_none())` so the
+  pattern cannot come back unnoticed.
+
+  Measured before the fix: 10 of 30 isolated repros wedged, 3 of 6 full suites.
+  After, on a 128-core box — a wider pool than the one where it was found, so
+  more workers and more ways to interleave — 0 of 60 and 0 of 10.
+
+### Changed
+
+- **`PendingDeletes` is only built when a remote is configured.** Without one
+  there was nothing to eventually delete remotely, and the structure grew for
+  the life of the process anyway.
+- **`MergeOutcome`** replaces the boolean a merge used to return, so "nothing to
+  do", "folded" and "declined because a reader is inside" stop being the same
+  answer to the caller.
+
+### Notes
+
+Nothing here changes the pack format: a 0.0.6 checkpoint reads unchanged.
+
+The Rust suite goes from 162 to 167 tests, the new ones covering the reader/merge
+interaction and retention with no remote configured.
+
+
+## 0.0.6 — 2026-08-17
 
 Everything an external review of the 0.0.4 artifacts found, plus the four things
 that turned up while fixing them. Each entry below has a regression test that
