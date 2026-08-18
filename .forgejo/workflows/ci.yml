@@ -1,10 +1,21 @@
 name: CI
 
+# Only `main`. The full suite is eight container jobs — MinIO, a PyTorch build
+# and a six-interpreter matrix, each compiling the extension from scratch — and
+# running it on the pull request *and* again on the merge paid for it twice for
+# the same code.
+#
+# What guards the branch instead is `checks.yml`, which is fast and runs on
+# every push that is not main. The trade is deliberate and worth stating: a
+# branch is no longer proven against the full matrix before it is merged, so a
+# failure specific to, say, Python 3.9 or to the S3 backend now surfaces on
+# main rather than on the pull request. `main` is what `release.yml` publishes
+# from, so when that happens, fix forward promptly.
 on:
   push:
     branches: [main]
-  pull_request:
-    branches: [main]
+  # Replay it without inventing a commit — the same reason ravex has one.
+  workflow_dispatch:
 
 jobs:
   rust:

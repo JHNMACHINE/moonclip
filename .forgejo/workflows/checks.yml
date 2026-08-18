@@ -1,0 +1,68 @@
+name: Checks
+
+# The branch guard. `ci.yml` runs the full matrix and only on main, so this is
+# what stands between a broken branch and a merge — it has to be quick enough
+# that it is never the reason to skip a push, and honest enough to be worth
+# looking at.
+#
+# One job, one container, no MinIO and no interpreter matrix: `cargo test`
+# covers the library and its 177 tests in seconds, and clippy covers the rest.
+# What it deliberately does *not* cover is what needs a real environment — the
+# S3 backend against MinIO, the PyTorch adapter, and Python 3.9 through 3.14.
+# Those wait for main.
+on:
+  push:
+    branches-ignore: [main]
+  workflow_dispatch:
+
+jobs:
+  checks:
+    runs-on: codeberg-small
+    container:
+      # Matches ci.yml. Bump both together.
+      image: rust:1.90-bookworm
+    steps:
+      - name: Install git
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq git
+
+      # Not shallow, and the checkout is allowed to fail the job — the same
+      # reasoning as ci.yml: `--depth 1` fetches only the default branch's tip,
+      # so the pushed commit is not in the clone and the job silently tests
+      # main instead. A green tick for code nobody built is worse than no tick.
+      - name: Checkout
+        run: |
+          set -eu
+          git clone ${{ forgejo.server_url }}/${{ forgejo.repository }}.git .
+          git checkout ${{ forgejo.sha }}
+
+      - name: Clippy
+        run: |
+          set -eu
+          rustup component add clippy
+          # `-D warnings` so a new lint fails the branch rather than scrolling
+          # past. The four allowances below are pre-existing debt, listed one
+          # per line so that removing one is a one-line change:
+          #
+          #   too_many_arguments  MoonclipManager::new takes 24 — it is the
+          #                       Python constructor, and every argument is a
+          #                       documented keyword.
+          #   type_complexity     the BaseEntryResolver signature in tensor.rs.
+          #   unnecessary_sort_by \
+          #   manual_checked_ops   surfaced by the 1.97 clippy, not yet fixed.
+          #
+          # Anything not on this list is a real finding and stops the push.
+          cargo clippy --all-targets --features python -- \
+            -D warnings \
+            -A clippy::too_many_arguments \
+            -A clippy::type_complexity \
+            -A clippy::unnecessary_sort_by \
+            -A clippy::manual_checked_ops
+
+      # Last, because a compile error should be reported by clippy above with a
+      # better message than a bare test failure.
+      - name: Rust tests
+        run: |
+          set -eu
+          cargo test --all-targets
