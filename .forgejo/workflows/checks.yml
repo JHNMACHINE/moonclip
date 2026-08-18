@@ -74,8 +74,29 @@ jobs:
             -A clippy::manual_checked_ops
 
       # Last, because a compile error should be reported by clippy above with a
-      # better message than a bare test failure.
+      # better message than a bare test failure — and split in two so that when
+      # something does go red, the step name already says whether it was the
+      # build or the tests. Compiling first also keeps the test step's log to
+      # test output instead of a wall of rustc.
+      - name: Build the test binaries
+        run: |
+          set -eu
+          cargo test --no-run --lib --tests
+
       - name: Rust tests
         run: |
           set -eu
-          cargo test --all-targets
+          cargo test --lib --tests
+
+      # No bench target here, deliberately. This used to be `--all-targets`,
+      # which does not just build `delta_bench` — it runs it: `harness = false`
+      # means cargo executes the binary's `main` rather than probing it for test
+      # cases, and that main walks three 256 MB buffers five times. The branch
+      # guard was spending most of its budget measuring memory bandwidth, in a
+      # debug build, and reporting the result as a test pass. The timings now
+      # live in `bench.yml`, on main.
+      #
+      # Nothing is lost by not building it here: the clippy step above passes
+      # `--all-targets`, so a change to `delta` that leaves the bench
+      # uncompilable still fails this job — with a better message, and without
+      # codegen.

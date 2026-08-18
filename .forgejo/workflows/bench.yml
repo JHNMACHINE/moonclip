@@ -1,0 +1,64 @@
+name: Bench
+
+# Split out of `checks.yml`, where it never belonged. The Rust step there was
+# `cargo test --all-targets`, and that does not merely build `delta_bench` — it
+# runs it. `harness = false` means cargo executes the binary's `main` instead of
+# probing it for test cases, so every branch push was walking three 256 MB
+# buffers five times, in a debug build, on the small runner whose entire job is
+# to answer quickly. It measured nothing usable and spent the guard's budget
+# doing it.
+#
+# Main only, and never on a branch. What comes out of a shared runner is a
+# tripwire, not a measurement: useful for noticing that `delta` got an order of
+# magnitude slower, useless for anything finer. A number worth quoting needs a
+# machine whose neighbours are known.
+#
+# Nothing here guards compilation. `checks.yml` type-checks the bench on every
+# branch push already, because its clippy invocation passes `--all-targets` —
+# which is why dropping the bench from that job cost nothing.
+on:
+  push:
+    branches: [main]
+  # Replay it without inventing a commit — the same reason ci.yml has one, and
+  # the more useful trigger of the two here: re-running the bench on an
+  # unchanged main is how you find out how much of a delta is just the runner.
+  workflow_dispatch:
+
+jobs:
+  bench:
+    # Not `codeberg-small`. The bench holds base, target and a distinct copy of
+    # base at 256 MB each, plus a transient output buffer per call, so it peaks
+    # near 1.1 GB — and on these runners the memory quota counts filesystem
+    # writes, so a release `target/` is spending from the same budget.
+    runs-on: codeberg-medium
+    container:
+      # Matches ci.yml and checks.yml. Bump all three together.
+      image: rust:1.90-bookworm
+    steps:
+      - name: Install git
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq git
+
+      # Not shallow, same reasoning as the other two workflows: `--depth 1`
+      # fetches only the default branch's tip, and a job that benchmarks a
+      # commit it did not check out is worse than no job.
+      - name: Checkout
+        run: |
+          set -eu
+          git clone ${{ forgejo.server_url }}/${{ forgejo.repository }}.git .
+          git checkout ${{ forgejo.sha }}
+
+      # `--locked` because the whole value of a number here is comparing it with
+      # the previous one, and a dependency that updated underneath makes that
+      # comparison a lie without saying so.
+      #
+      # `cargo bench` rather than building and invoking the binary by hand: the
+      # bench profile inherits `[profile.release]`, so this is the `lto = true`,
+      # `codegen-units = 1` build. That is the only build worth timing — and
+      # also the slow half of this job. If it ever runs past the runner's clock,
+      # suspect the link-time optimisation, not the benchmark.
+      - name: Run the delta benchmark
+        run: |
+          set -eu
+          cargo bench --bench delta_bench --locked
