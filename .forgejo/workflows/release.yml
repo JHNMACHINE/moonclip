@@ -139,6 +139,18 @@ jobs:
     container:
       image: quay.io/pypa/manylinux_2_28_x86_64
     steps:
+      # The manylinux image carries the Python interpreters, not a Rust
+      # toolchain — the `crate` job gets cargo from `rust:1.90-bookworm`, and
+      # `wheels` installs it here for the same reason. This job needed it too
+      # and did not say so: `maturin sdist` shells out to `cargo metadata` to
+      # read the crate, so it failed with "Do you have cargo in your PATH?"
+      # before writing anything. Nothing compiles here — the sdist ships
+      # sources — but the metadata still has to be readable.
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain 1.90.0 --profile minimal
+
       - name: Checkout
         run: |
           set -eu
@@ -158,6 +170,7 @@ jobs:
       - name: Build the sdist
         run: |
           set -eu
+          . "$HOME/.cargo/env"
           /opt/python/cp312-cp312/bin/pip install --quiet maturin twine
           export PATH="/opt/python/cp312-cp312/bin:$PATH"
           maturin sdist --out dist
