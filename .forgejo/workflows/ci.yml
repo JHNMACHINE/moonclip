@@ -86,7 +86,7 @@ jobs:
   # users actually call, and it is where the multi-rank save flow lives, so it
   # gets one job of its own with a real torch in it.
   torch-adapter:
-    runs-on: codeberg-small
+    runs-on: codeberg-medium
     container:
       image: python:3.12-bookworm
     steps:
@@ -124,7 +124,7 @@ jobs:
           pytest tests/ -v
 
   python:
-    runs-on: codeberg-small
+    runs-on: codeberg-medium
     strategy:
       fail-fast: false
       matrix:
