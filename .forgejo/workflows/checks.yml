@@ -53,8 +53,21 @@ jobs:
           #   manual_checked_ops   surfaced by the 1.97 clippy, not yet fixed.
           #
           # Anything not on this list is a real finding and stops the push.
+          #
+          # `-A unknown-lints` is what makes that list survive two toolchains.
+          # `manual_checked_ops` only exists from clippy 1.97; this container
+          # pins 1.90, where naming it is `error[E0602]: unknown lint` — and
+          # `-D warnings` promotes that from a note to a hard failure. This job
+          # had never passed for exactly that reason. Deleting the line would
+          # fix today and break the day the image is bumped, which is the one
+          # moment nobody would think to look here.
+          #
+          # What it costs: a misspelled lint name in the list above is ignored
+          # rather than reported. Four commented lines is a cheap place to pay
+          # that.
           cargo clippy --all-targets --features python -- \
             -D warnings \
+            -A unknown-lints \
             -A clippy::too_many_arguments \
             -A clippy::type_complexity \
             -A clippy::unnecessary_sort_by \
