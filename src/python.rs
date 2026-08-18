@@ -362,10 +362,14 @@ impl MoonclipManager {
         // (see `crate::pool`) — the save pipeline installs it again downstream,
         // but this copy happens on the calling thread, before any of that.
         let id = py.detach(|| {
-            crate::pool::install(move || {
-                let tensor_data = materialize_tensors(pending);
-                self.inner.save(step, tensor_data, meta)
-            })
+            let tensor_data = crate::pool::install(move || materialize_tensors(pending));
+            // `save` stays outside the pool. It blocks until the previous save
+            // drains, and a blocked pool worker is a worker the pool has lost
+            // — one that can be holding a stolen piece of the very
+            // `process_tensors_parallel` whose completion would release it.
+            // The save then waits for work only the waiter could finish, and
+            // the training loop stops for good. See `AsyncSaver::submit`.
+            self.inner.save(step, tensor_data, meta)
         })?;
         Ok(id.to_string())
     }
@@ -384,10 +388,10 @@ impl MoonclipManager {
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
         let pending = collect_tensors(&tensors)?;
         py.detach(|| {
-            crate::pool::install(move || {
-                let tensor_data = materialize_tensors(pending);
-                self.inner.save_rank(uuid, tensor_data)
-            })
+            let tensor_data = crate::pool::install(move || materialize_tensors(pending));
+            // Same rule as `save_tensors`: the copy is pool work, the call
+            // that waits on the queue is not.
+            self.inner.save_rank(uuid, tensor_data)
         })?;
         Ok(())
     }

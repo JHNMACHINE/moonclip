@@ -1638,6 +1638,15 @@ impl AsyncSaver {
     /// clears it after the first completes: `flush()` returns while a save is
     /// still queued, and the caller sees a manifest missing that snapshot.
     fn submit(&self, job: SaveJob) -> Result<()> {
+        // This function blocks. Doing that on a Moonclip pool thread is the
+        // deadlock described in `crate::python::save_tensors`: the wait can
+        // only end when a save pipeline finishes, that pipeline runs on this
+        // same pool, and a blocked worker may be sitting on a piece of it.
+        // Callers must submit from outside the pool.
+        debug_assert!(
+            rayon::current_thread_index().is_none(),
+            "AsyncSaver::submit blocked on a Moonclip pool thread"
+        );
         let tx = self
             .tx
             .as_ref()
