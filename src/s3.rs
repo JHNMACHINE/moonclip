@@ -1,3 +1,41 @@
+//! S3-compatible storage over a hand-written SigV4.
+//!
+//! Signing is ours rather than the AWS SDK's, and that is a decision rather
+//! than an accident: the SDK speaks the same one protocol this does — it is
+//! not a multi-cloud abstraction — while bringing a dependency tree into a
+//! library that is deliberately thin. Its recent defaults also send checksum
+//! headers that GCS and other S3-compatible services reject, so adopting it
+//! would cost configuration to get back where we already are. Reconsider if
+//! the list below stops being short.
+//!
+//! # What is not covered
+//!
+//! Written down because ten integration tests against MinIO make this module
+//! look more complete than it is. MinIO is forgiving in the places real S3 is
+//! not, and the next person here should not start from the assumption that
+//! everything is handled.
+//!
+//! * **Temporary credentials.** Only a long-lived access key and secret. No
+//!   `x-amz-security-token` header is signed or sent, so anything issuing
+//!   session credentials — `AssumeRole`, EC2 instance profiles, IRSA on EKS,
+//!   any OIDC federation — cannot be used. The credentials have to be static.
+//! * **Objects above the single-`PUT` ceiling.** Every write is one `PUT`, and
+//!   S3 refuses a single `PUT` over 5 GiB; multipart upload is not
+//!   implemented. A gathered checkpoint of a large model reaches that on its
+//!   own. See the tracking issue.
+//! * **Clock skew.** The signature is stamped with the local clock and a
+//!   `RequestTimeTooSkewed` is treated as any other error. A host more than
+//!   fifteen minutes off signs requests that will never be accepted, and the
+//!   error does not say so in those words.
+//! * **Checksum headers.** None are sent (`Content-MD5`, `x-amz-checksum-*`).
+//!   Integrity is covered a layer up — every tensor carries its own hash in
+//!   the manifest — so this is a deliberate omission, and it is also why the
+//!   module works unmodified against GCS and R2.
+//!
+//! Path-style versus virtual-hosted addressing, percent-encoding of key names,
+//! and `ListObjectsV2` pagination *are* handled; see [`S3Config`] and the
+//! `uri_encode` and `list` implementations.
+
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 use std::fmt::Write as FmtWrite;

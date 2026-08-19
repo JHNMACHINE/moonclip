@@ -620,15 +620,6 @@ impl Core {
         let rank_entry =
             self.save_rank_tensors(snap_id, &snap_dir, &base_snap, tensors, &context)?;
 
-        // Released here rather than at the end of the function, which is where
-        // it would fall out of scope. Retention runs below and its unlink waits
-        // for readers, so any pin still held at that point is one this thread
-        // would be waiting on itself — and it takes only the right arrangement
-        // of rollback protection for retention to choose the very snapshot this
-        // save pinned. Nothing above needs the pin once the base has been read,
-        // so the narrow scope costs nothing and removes the question.
-        drop(base_pin);
-
         let snapshot = Snapshot {
             id: snap_id,
             step,
@@ -649,6 +640,18 @@ impl Core {
         // apply_retention persists the manifest when done.
         let evicted = self.apply_retention(&mut manifest)?;
         drop(manifest);
+        // Released here, and not before: the pin has to cover the push above,
+        // or a merge is free to fold the base away in the window between the
+        // last byte of this pack and the snapshot appearing in the manifest —
+        // which is the window `crate::inflight` exists to close, and it leaves
+        // a delta naming a base that is no longer on disk.
+        //
+        // It cannot be held past this point either. The unlink below waits for
+        // readers, so a pin still held there is one this thread would wait on
+        // itself, and it takes only the right arrangement of rollback
+        // protection for retention to choose the very snapshot this save
+        // pinned. Between the two, so neither can happen.
+        drop(base_pin);
         // Unlinked after the lock is released, never under it: the unlink
         // waits for readers, and a reader reacquires the manifest lock while
         // pinned. See `Core::remove_snapshots`.

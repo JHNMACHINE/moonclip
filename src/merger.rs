@@ -457,6 +457,32 @@ pub(crate) fn do_full_merge(
         return Ok(MergeOutcome::NothingToMerge);
     }
 
+    // An unfinalized snapshot is one other ranks are still writing into. The
+    // filter above keeps it out of `deltas`, so it is neither folded nor
+    // claimed — but it still names this base, and the base is about to be
+    // unlinked. Fold it away and that snapshot is left describing a delta
+    // against something that is no longer on disk: `load` gives NotFound and
+    // recovery discards it.
+    //
+    // The pin `save_rank_in_pool` takes does not cover this. It spans one rank
+    // inside that function, not the gap between `create_snapshot` and the
+    // first rank arriving, nor the gaps between ranks — and `InFlight` is
+    // per-process, so co-located ranks cannot see each other's pins at all.
+    // The manifest can, which is why the question is asked here.
+    //
+    // Standing down is opportunistic like the rest of this function: the next
+    // notify tries again, and `finalize_snapshot` sends one. It is also the
+    // choice `do_stride_merge` already makes when the survivor is not
+    // finalized. `Busy` rather than `NothingToMerge` because the condition is
+    // temporary and a forced merge should wait it out.
+    if manifest
+        .snapshots
+        .iter()
+        .any(|s| s.base_snapshot_id == Some(base_id) && !s.finalized)
+    {
+        return Ok(MergeOutcome::Busy);
+    }
+
     // The base and every delta folded into it are about to stop existing, so
     // claim them before the manifest lock goes: a save that picks this base up
     // afterwards writes a full snapshot instead of a delta against something
@@ -1531,6 +1557,71 @@ mod tests {
             do_full_merge(&storage, &manifest, &ZSTD3, &in_flight, &no_remote()).unwrap(),
             MergeOutcome::Merged,
             "the merge stayed refused after the reader left"
+        );
+    }
+
+    /// A merge must not unlink a base that a snapshot still being written
+    /// names as its own.
+    ///
+    /// `do_full_merge` keeps unfinalized snapshots out of the fold — right,
+    /// they are other ranks' to finish — and used to unlink the base anyway.
+    /// What survived was a delta against a base that no longer existed on
+    /// disk: `load` gave NotFound and startup recovery discarded a checkpoint
+    /// that was whole. The window is real between `create_snapshot` and the
+    /// first rank reaching `save_rank_in_pool`, because no pin exists yet —
+    /// and pins would not settle it anyway, being per-process while co-located
+    /// ranks are not.
+    #[test]
+    fn a_merge_leaves_the_base_alone_while_a_rank_is_still_writing_against_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(dir.path()).unwrap());
+        let (mut manifest, _) = scenario(storage.as_ref(), 2, 20_000);
+        let base_id = manifest.snapshots[0].id;
+
+        // Rank 0 has announced the snapshot and no rank has written into it,
+        // so there is nothing pinned anywhere. Only the manifest knows.
+        let mut in_progress = packed_snapshot(
+            storage.as_ref(),
+            &[
+                ("w0".into(), Vec::new(), TensorStorage::Skipped),
+                ("w1".into(), Vec::new(), TensorStorage::Skipped),
+            ],
+            Some(base_id),
+            9,
+        );
+        in_progress.finalized = false;
+        let in_progress_id = in_progress.id;
+        manifest.snapshots.push(in_progress);
+
+        let manifest = Arc::new(Mutex::new(manifest));
+        assert_eq!(
+            do_full_merge(&storage, &manifest, &ZSTD3, &unread(), &no_remote()).unwrap(),
+            MergeOutcome::Busy,
+            "the merge folded a base a half-written snapshot still names"
+        );
+        assert!(
+            manifest
+                .lock()
+                .unwrap()
+                .snapshots
+                .iter()
+                .any(|s| s.id == base_id),
+            "the base was taken out of the manifest under an unfinalized delta"
+        );
+
+        // Every rank is in. The base is nobody's now, and the fold proceeds.
+        manifest
+            .lock()
+            .unwrap()
+            .snapshots
+            .iter_mut()
+            .find(|s| s.id == in_progress_id)
+            .unwrap()
+            .finalized = true;
+        assert_eq!(
+            do_full_merge(&storage, &manifest, &ZSTD3, &unread(), &no_remote()).unwrap(),
+            MergeOutcome::Merged,
+            "the merge stayed stood down after the snapshot finalized"
         );
     }
 
