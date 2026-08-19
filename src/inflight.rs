@@ -77,12 +77,18 @@ pub(crate) const UNLINK_WAIT: Duration = Duration::from_secs(900);
 /// startup to deal with, which is the same trade the merger makes.
 pub(crate) const RETENTION_UNLINK_WAIT: Duration = Duration::from_secs(30);
 
-/// How long a forced merge waits to claim inputs a reader is inside.
+/// The whole budget a forced merge gets: claim retries and unlink together.
 ///
 /// `save_final` is the caller: it folds the run into one snapshot and then
 /// uploads it, so "skipped because something was being read" is not an answer
-/// it can use.
-pub(crate) const FORCED_CLAIM_WAIT: Duration = Duration::from_secs(300);
+/// it can use. It also runs at process exit, where a scheduler's grace period
+/// is already counting — so this is **one** number covering both waits, not a
+/// claim budget with a fresh [`UNLINK_WAIT`] starting after it. Back to back
+/// the two came to twenty minutes of silence on a wedged reader.
+///
+/// Reaching it means a load has been stuck for five minutes, which is a
+/// reader that is not coming back.
+pub(crate) const FORCED_MERGE_WAIT: Duration = Duration::from_secs(300);
 
 #[derive(Default)]
 struct State {
@@ -322,7 +328,7 @@ mod tests {
         let retrier = {
             let registry = Arc::clone(&registry);
             std::thread::spawn(move || {
-                let deadline = Instant::now() + FORCED_CLAIM_WAIT;
+                let deadline = Instant::now() + FORCED_MERGE_WAIT;
                 loop {
                     if registry.claim(&[id]).is_some() {
                         return true;

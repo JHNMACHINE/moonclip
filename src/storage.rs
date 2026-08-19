@@ -149,7 +149,11 @@ fn create_dirs_recording_new(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
     let mut created = Vec::new();
     let mut cursor = Some(dir);
     while let Some(path) = cursor {
-        if path.exists() {
+        // The empty path is where `parent()` lands after the last component
+        // of a relative path. It is not a directory anyone created and
+        // `exists()` says false for it, so without this it joins the list and
+        // earns a `sync_dir("")` that can only fail.
+        if path.as_os_str().is_empty() || path.exists() {
             break;
         }
         created.push(path.to_path_buf());
@@ -207,12 +211,17 @@ impl StorageBackend for LocalStorage {
         if fsync_enabled() {
             sync_dir(dir);
             // Then the entries naming any directory this call had to create,
-            // deepest first: a synced pack inside a directory whose own entry
-            // never reached the device is still a lost checkpoint. Bottom-up
-            // so a crash part-way through leaves a shorter reachable chain
-            // rather than a directory nothing names. See
-            // `create_dirs_recording_new`, which returns them in that order.
-            for created in &new_dirs {
+            // shallowest first: a synced pack inside a directory whose own
+            // entry never reached the device is still a lost checkpoint.
+            //
+            // The order is the point. Each sync makes the entry *naming*
+            // `created` durable, so going from the root down means a crash
+            // part-way through leaves a shorter chain that is still reachable
+            // from the root. Deepest first — which is the order
+            // `create_dirs_recording_new` returns, hence the `rev()` — would
+            // make a deep entry durable inside a parent nothing names yet,
+            // which is the very thing this loop exists to prevent.
+            for created in new_dirs.iter().rev() {
                 if let Some(parent) = created.parent() {
                     sync_dir(parent);
                 }
