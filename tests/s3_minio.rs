@@ -199,3 +199,134 @@ s3_test!(handles_keys_with_awkward_characters, store, {
         assert_eq!(store.get(name).unwrap(), name.as_bytes(), "key {name}");
     }
 });
+
+
+// ─── multipart ──────────────────────────────────────────────────────
+
+/// Enough to make several parts at the 16 MiB floor, and not so much that the
+/// suite needs a gigabyte of memory to run.
+const MULTIPART_BYTES: usize = 40 * 1024 * 1024;
+
+fn noisy(len: usize) -> Vec<u8> {
+    // Not zeros: a run of zeros would survive a truncated part, an off-by-one
+    // in the chunking, and a part uploaded twice, all without the comparison
+    // noticing.
+    let mut seed = 0x9e3779b97f4a7c15u64;
+    (0..len)
+        .map(|_| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 24) as u8
+        })
+        .collect()
+}
+
+s3_test!(a_large_object_goes_up_in_parts_and_comes_back_whole, store, {
+    // The reason this exists: every write used to be one `PUT`, and S3 refuses
+    // a single `PUT` over 5 GiB. A gathered checkpoint of a 1B model with Adam
+    // is around 11 GiB, and `gather` is Ravex's default — so the ceiling was
+    // in the ordinary path, on the largest model, and MinIO could not show it
+    // because it accepts far larger single `PUT`s than S3 does.
+    let data = noisy(MULTIPART_BYTES);
+    store
+        .put_multipart("big.pack", &data)
+        .expect("multipart upload");
+
+    let back = store.get("big.pack").expect("reading it back");
+    assert_eq!(back.len(), data.len(), "the object came back a different size");
+    assert!(back == data, "the object came back with different bytes");
+});
+
+s3_test!(a_multipart_object_is_listed_and_deletable_like_any_other, store, {
+    // A completed multipart upload has to be an ordinary object afterwards.
+    // Parts left behind by an upload that never completed are invisible to
+    // `list`, which is exactly why retention would never reclaim them.
+    let data = noisy(MULTIPART_BYTES);
+    store
+        .put_multipart("listed.pack", &data)
+        .expect("multipart upload");
+
+    let keys = store.list("").expect("listing");
+    assert!(
+        keys.iter().any(|k| k.ends_with("listed.pack")),
+        "a completed upload is missing from the listing: {keys:?}"
+    );
+
+    store.delete("listed.pack").expect("deleting");
+    assert!(!store.exists("listed.pack").expect("checking"));
+});
+
+s3_test!(a_range_read_still_works_on_a_multipart_object, store, {
+    // Pack reads are ranged, and a multipart object is the case where the
+    // server assembled it from pieces. A range that straddles a part boundary
+    // is the one worth asking about.
+    let data = noisy(MULTIPART_BYTES);
+    store
+        .put_multipart("ranged.pack", &data)
+        .expect("multipart upload");
+
+    let boundary = 16 * 1024 * 1024;
+    let slice = store
+        .get_range("ranged.pack", (boundary - 8) as u64, 16)
+        .expect("ranged read across a part boundary");
+
+    assert_eq!(slice, &data[boundary - 8..boundary + 8]);
+});
+
+
+// ─── the way back ───────────────────────────────────────────────────
+
+s3_test!(a_store_can_be_pulled_back_from_the_bucket, store, {
+    use moonclip::storage::LocalStorage;
+    use std::sync::Arc;
+
+    // What a machine looks like after its disk is replaced: the bucket holds
+    // the checkpoint, the local store holds nothing. Until 2026-08-19 nothing
+    // could cross that gap — `sync_now` pushed and there was no pull — so a
+    // replaced node started from scratch and took every other rank with it.
+    let remote: Arc<dyn moonclip::storage::StorageBackend> = Arc::new(store);
+    remote.put("manifest.json", b"{\"snapshots\":[]}").expect("seeding");
+    remote
+        .put("snapshots/abc/rank_0.pack", b"payload")
+        .expect("seeding");
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let local: Arc<dyn moonclip::storage::StorageBackend> =
+        Arc::new(LocalStorage::new(dir.path()).expect("local store"));
+
+    let restored =
+        moonclip::remote_sync::restore_from_remote(&local, &remote).expect("restoring");
+
+    assert!(restored, "the manifest never arrived");
+
+    // Compared on the leading bytes, not the whole buffer: `LocalStorage`
+    // aligns what it writes to 4 KiB, so a short object read back is the
+    // payload followed by padding. That is why `load_manifest` trims trailing
+    // zeros, and it is a property of the local store rather than anything the
+    // restore did. In a real store the remote already holds aligned files, so
+    // the round trip does not change their length.
+    let pack = local.get("snapshots/abc/rank_0.pack").expect("pack");
+    assert_eq!(&pack[..7], b"payload");
+    assert!(
+        pack[7..].iter().all(|&b| b == 0),
+        "the restored pack came back with something other than padding after it"
+    );
+});
+
+s3_test!(an_empty_bucket_restores_nothing_and_says_so, store, {
+    use moonclip::storage::LocalStorage;
+    use std::sync::Arc;
+
+    // A first run must not be mistaken for a machine that lost its disk.
+    let remote: Arc<dyn moonclip::storage::StorageBackend> = Arc::new(store);
+    let dir = tempfile::tempdir().expect("temp dir");
+    let local: Arc<dyn moonclip::storage::StorageBackend> =
+        Arc::new(LocalStorage::new(dir.path()).expect("local store"));
+
+    let restored =
+        moonclip::remote_sync::restore_from_remote(&local, &remote).expect("restoring");
+
+    assert!(!restored);
+});
+

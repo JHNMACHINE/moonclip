@@ -264,23 +264,28 @@ fn apply_deletes(remote: &Arc<dyn StorageBackend>, deletes: &Arc<PendingDeletes>
     }
 }
 
-/// Sync all files under `prefix` from local to remote.
+/// Copy every file under `prefix` from one store to another.
 ///
-/// A file already present on the remote is skipped on **name alone** — size
-/// and content are never compared. That is sound for snapshot data, which is
-/// immutable and UUID-named, and it is why `manifest.json`, the one file that
-/// is rewritten every save, takes the single-file branch below and is always
-/// re-uploaded.
+/// Named `from`/`to` rather than local/remote because the direction is the
+/// caller's: pushing a checkpoint to a bucket and pulling one back onto a
+/// machine that lost its disk are the same walk with the arguments swapped.
+/// See [`restore_from_remote`].
+///
+/// A file already present at the destination is skipped on **name alone** —
+/// size and content are never compared. That is sound for snapshot data, which
+/// is immutable and UUID-named, and it is why `manifest.json`, the one file
+/// that is rewritten every save, takes the single-file branch below and is
+/// always copied again.
 fn sync_prefix(
-    local: &Arc<dyn StorageBackend>,
-    remote: &Arc<dyn StorageBackend>,
+    from: &Arc<dyn StorageBackend>,
+    to: &Arc<dyn StorageBackend>,
     prefix: &str,
 ) -> Result<()> {
     // Special case: single file (e.g. "manifest.json")
     if !prefix.is_empty() && !prefix.contains('/') && prefix.contains('.') {
-        match local.get(prefix) {
+        match from.get(prefix) {
             Ok(data) => {
-                remote.put(prefix, &data)?;
+                to.put(prefix, &data)?;
                 return Ok(());
             }
             Err(MoonclipError::NotFound(_)) => return Ok(()),
@@ -288,29 +293,28 @@ fn sync_prefix(
         }
     }
 
-    let local_files = local.list(prefix)?;
+    let files = from.list(prefix)?;
     let mut synced = 0u64;
     let mut skipped = 0u64;
 
-    for file in &local_files {
-        // Check if remote already has this file
-        match remote.exists(file) {
+    for file in &files {
+        match to.exists(file) {
             Ok(true) => {
                 skipped += 1;
                 continue;
             }
             Ok(false) => {}
-            Err(_) => {} // If we can't check, try to upload anyway
+            Err(_) => {} // If we cannot check, copy anyway
         }
 
-        let data = local.get(file)?;
-        remote.put(file, &data)?;
+        let data = from.get(file)?;
+        to.put(file, &data)?;
         synced += 1;
     }
 
     if synced > 0 {
         eprintln!(
-            "[Moonclip sync] Synced {} files, skipped {} (prefix: '{}')",
+            "[Moonclip sync] Copied {} files, skipped {} (prefix: '{}')",
             synced, skipped, prefix
         );
     }
@@ -626,4 +630,35 @@ mod tests {
 
         assert_eq!(dst.get("manifest.json").unwrap(), b"{\"snapshots\":[1]}");
     }
+}
+
+
+/// Pull a store back from the remote onto a machine that has none.
+///
+/// The remote was push-only until 2026-08-19, and the gap was not theoretical:
+/// measured on a six-node bench, a node whose disk was replaced started from
+/// scratch while its data sat in the bucket, and every other rank started over
+/// with it — `agree_on_step` takes the minimum. A plain reshuffle of which node
+/// hosts which rank did the same, with every disk intact. So the bucket was a
+/// backup and never a way back.
+///
+/// Returns whether a manifest arrived, which is what makes the local store
+/// readable at all. Deliberately **not** called from the constructor: pulling
+/// a whole checkpoint is not something a caller should discover by having
+/// started a manager, and only the caller knows whether this run wants to
+/// resume at all.
+pub fn restore_from_remote(
+    local: &Arc<dyn StorageBackend>,
+    remote: &Arc<dyn StorageBackend>,
+) -> Result<bool> {
+    // The manifest first and on its own: without it the snapshot files are
+    // bytes nothing names, and if it never arrives there is nothing to restore
+    // and no reason to pay for the rest.
+    sync_prefix(remote, local, "manifest.json")?;
+    if !local.exists("manifest.json").unwrap_or(false) {
+        return Ok(false);
+    }
+
+    sync_prefix(remote, local, "snapshots")?;
+    Ok(true)
 }

@@ -473,6 +473,16 @@ impl MoonclipManager {
     /// Raises if the data did not reach the remote, rather than logging and
     /// returning: a run whose checkpoints are not leaving the machine should
     /// find out while it can still do something about it.
+    /// Pull this store back from the remote. Returns whether anything came.
+    ///
+    /// For a machine that came up without the store it had — replaced after a
+    /// preemption, or simply given a different rank than last time. Until
+    /// 2026-08-19 the remote was push-only, so the bucket held the checkpoint
+    /// and no path led back to it.
+    fn restore_from_remote(&self, py: Python<'_>) -> PyResult<bool> {
+        Ok(py.detach(|| self.inner.restore_from_remote())?)
+    }
+
     fn sync_now(&self, py: Python<'_>) -> PyResult<()> {
         py.detach(|| self.inner.sync_now())?;
         Ok(())

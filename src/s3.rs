@@ -180,6 +180,33 @@ fn uri_encode(s: &str, encode_slash: bool) -> String {
     result
 }
 
+/// Above this, one `PUT` is not allowed and the upload has to be split.
+///
+/// S3 refuses a single `PUT` over 5 GiB. The threshold here is lower on
+/// purpose: nothing is gained by riding the limit, and a gathered checkpoint
+/// of a large model is well past it either way — 1B parameters with Adam is
+/// around 11 GiB, and `gather` is Ravex's default, so this is the ordinary
+/// path rather than an extreme one.
+const SINGLE_PUT_LIMIT: usize = 4 * 1024 * 1024 * 1024;
+
+/// Smallest part S3 accepts, except for the last one, is 5 MiB. Larger than
+/// that here: parts cost a request each, and 10000 of them is the ceiling.
+const MIN_PART_SIZE: usize = 16 * 1024 * 1024;
+
+/// S3's limit on parts per upload.
+const MAX_PARTS: usize = 10_000;
+
+/// Part size for an object of `total` bytes.
+///
+/// Grows with the object so the part count stays under [`MAX_PARTS`]: at the
+/// floor this tops out at 160 GiB, which a large enough gathered checkpoint
+/// would exceed. Some headroom is left rather than dividing exactly, because
+/// a part count that lands on the limit leaves nothing for a rounding error.
+fn part_size_for(total: usize) -> usize {
+    let spread = total.div_ceil(MAX_PARTS - 16);
+    MIN_PART_SIZE.max(spread)
+}
+
 struct SignedRequest {
     url: String,
     headers: Vec<(String, String)>,
@@ -403,6 +430,7 @@ impl S3Storage {
             "PUT" => self.agent.put(&signed.url),
             "DELETE" => self.agent.delete(&signed.url),
             "HEAD" => self.agent.head(&signed.url),
+            "POST" => self.agent.post(&signed.url),
             _ => return Err(MoonclipError::Storage(format!("Unknown method: {method}"))),
         };
 
@@ -417,6 +445,102 @@ impl S3Storage {
         };
 
         response.map_err(|e| status_error(key, e))
+    }
+
+    /// Upload an object in parts, because S3 will not take it in one.
+    ///
+    /// Public so the path can be exercised without a four-gigabyte fixture:
+    /// [`Self::put`] only reaches it past [`SINGLE_PUT_LIMIT`], and a test that
+    /// cannot run is not coverage. Callers should use `put` and let it choose.
+    ///
+    /// Three calls plus one per part: create, upload each, complete. The part
+    /// that is easy to get wrong is the fourth — **abort**. An upload that is
+    /// started and neither completed nor aborted leaves its parts in the
+    /// bucket, where `ListObjectsV2` does not show them, retention never sees
+    /// them, and the bill keeps counting. So every way out of here other than
+    /// success goes through `AbortMultipartUpload`.
+    pub fn put_multipart(&self, rel_path: &str, data: &[u8]) -> Result<()> {
+        let key = &self.config.object_key(rel_path);
+        let created = self.do_request("POST", key, None, &[("uploads", "")])?;
+        let body = created
+            .into_string()
+            .map_err(|e| MoonclipError::Storage(format!("S3 multipart start: {e}")))?;
+        let upload_id = extract_xml_value(&body, "UploadId").ok_or_else(|| {
+            MoonclipError::Storage("S3 multipart start returned no UploadId".into())
+        })?;
+
+        match self.upload_parts(key, data, &upload_id) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // Reported at most as a second line: the upload's failure is
+                // what the caller needs, and a failed cleanup must not hide it.
+                if let Err(cleanup) = self.do_request(
+                    "DELETE",
+                    key,
+                    None,
+                    &[("uploadId", upload_id.as_str())],
+                ) {
+                    eprintln!(
+                        "[Moonclip] could not abort the multipart upload of {key}:                          {cleanup}. Its parts are still in the bucket, invisible                          to a listing and still billed."
+                    );
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// The parts themselves, and the completion that makes them an object.
+    ///
+    /// Split out so [`Self::put_multipart`] has exactly one place to abort
+    /// from: every error in here leaves the upload started.
+    fn upload_parts(&self, key: &str, data: &[u8], upload_id: &str) -> Result<()> {
+        let size = part_size_for(data.len());
+        let mut completed = String::from("<CompleteMultipartUpload>");
+
+        for (index, chunk) in data.chunks(size).enumerate() {
+            let number = index + 1;
+            let response = self.do_request(
+                "PUT",
+                key,
+                Some(chunk),
+                &[
+                    ("partNumber", number.to_string().as_str()),
+                    ("uploadId", upload_id),
+                ],
+            )?;
+
+            // The ETag identifies the part in the completion, and S3 rejects
+            // the whole upload if one is missing or wrong.
+            let etag = response.header("ETag").ok_or_else(|| {
+                MoonclipError::Storage(format!("S3 part {number} came back without an ETag"))
+            })?;
+            let _ = write!(
+                completed,
+                "<Part><PartNumber>{number}</PartNumber><ETag>{etag}</ETag></Part>"
+            );
+        }
+        completed.push_str("</CompleteMultipartUpload>");
+
+        let response = self.do_request(
+            "POST",
+            key,
+            Some(completed.as_bytes()),
+            &[("uploadId", upload_id)],
+        )?;
+
+        // S3 answers 200 and then reports the failure in the body, so the
+        // status code alone is not the answer here — it is the one place in
+        // this module where a success code can mean a failed request.
+        let body = response
+            .into_string()
+            .map_err(|e| MoonclipError::Storage(format!("S3 multipart complete: {e}")))?;
+        if body.contains("<Error>") {
+            let code = extract_xml_value(&body, "Code").unwrap_or_else(|| "unknown".into());
+            return Err(MoonclipError::Storage(format!(
+                "S3 refused to complete the multipart upload of {key}: {code}"
+            )));
+        }
+        Ok(())
     }
 
     /// GET with a byte range, which is what a pack read wants.
@@ -529,6 +653,9 @@ fn is_retryable(e: &MoonclipError) -> bool {
 impl StorageBackend for S3Storage {
     fn put(&self, rel_path: &str, data: &[u8]) -> Result<()> {
         let key = self.config.object_key(rel_path);
+        if data.len() > SINGLE_PUT_LIMIT {
+            return self.put_multipart(rel_path, data);
+        }
         self.do_request("PUT", &key, Some(data), &[])?;
         Ok(())
     }

@@ -762,6 +762,21 @@ class CheckpointManager:
     def merge_now(self):
         self._mgr.merge_now()
 
+    def restore_from_remote(self) -> bool:
+        """Pull this store back from the remote. Returns whether anything came.
+
+        For a machine that came up without the store it had — replaced after a
+        preemption, or simply handed a different rank than last time. The
+        remote was push-only until 2026-08-19: measured on a six-node bench, a
+        replaced node started from scratch while its data sat in the bucket,
+        and the ranks that *did* have their stores started over with it,
+        because a resume is agreed at the oldest step everyone holds.
+
+        Call it before reading anything: it replaces the manifest this manager
+        loaded when the store was still empty.
+        """
+        return self._mgr.restore_from_remote()
+
     def sync_now(self):
         """Push all local data to remote storage and wait for it.
 

@@ -320,6 +320,59 @@ struct RetainedBase {
 
 /// Shared state + save/load logic. Owned via Arc by the Coordinator and
 /// (when async saving is enabled) by the background save thread.
+/// Read the manifest off a store, or start a fresh one shaped by the config.
+///
+/// Shared by construction and by [`Core::restore_from_remote`], which needs
+/// exactly the same reading after it has pulled the file down: a restore that
+/// left the in-memory manifest as it found it would put the snapshots on disk
+/// and leave the manager still believing there are none.
+fn load_manifest(storage: &dyn StorageBackend, config: &CoordinatorConfig) -> Result<Manifest> {
+    match storage.get("manifest.json") {
+        Ok(data) => {
+            // Trailing zeros: a manifest is rewritten in place, so a shorter
+            // one can leave the tail of a longer one behind it.
+            let end = data
+                .iter()
+                .rposition(|&b| b != 0)
+                .map(|i| i + 1)
+                .unwrap_or(0);
+            serde_json::from_slice(&data[..end])
+                .map_err(|e| MoonclipError::Serialization(e.to_string()))
+        }
+        Err(MoonclipError::NotFound(_)) => Ok(Manifest {
+            world_size: config.world_size,
+            retention: config.retention.clone(),
+            lineage: config.lineage.clone(),
+            ..Default::default()
+        }),
+        Err(e) => Err(e),
+    }
+}
+
+/// Whether every file a snapshot names is actually here.
+///
+/// Used after a restore from remote, where the manifest and the data it points
+/// at travel separately and can arrive out of step. A snapshot that is missing
+/// a pack is not a degraded snapshot, it is an unloadable one, and leaving it
+/// in the manifest turns a resume into a failure at the first read.
+fn snapshot_is_whole(storage: &dyn StorageBackend, snapshot: &Snapshot) -> bool {
+    for rank in snapshot.ranks.values() {
+        if let Some(ref pack) = rank.pack_file {
+            if !storage.exists(pack).unwrap_or(false) {
+                return false;
+            }
+        }
+        for tensor in &rank.tensors {
+            if let Some(ref file) = tensor.filename {
+                if !storage.exists(file).unwrap_or(false) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
 pub(crate) struct Core {
     pub(crate) storage: Arc<dyn StorageBackend>,
     pub(crate) manifest: Arc<Mutex<Manifest>>,
@@ -351,25 +404,7 @@ pub struct Coordinator {
 
 impl Coordinator {
     pub fn new(storage: Arc<dyn StorageBackend>, config: CoordinatorConfig) -> Result<Self> {
-        // Load or create manifest
-        let manifest = match storage.get("manifest.json") {
-            Ok(data) => {
-                let end = data
-                    .iter()
-                    .rposition(|&b| b != 0)
-                    .map(|i| i + 1)
-                    .unwrap_or(0);
-                serde_json::from_slice(&data[..end])
-                    .map_err(|e| MoonclipError::Serialization(e.to_string()))?
-            }
-            Err(MoonclipError::NotFound(_)) => Manifest {
-                world_size: config.world_size,
-                retention: config.retention.clone(),
-                lineage: config.lineage.clone(),
-                ..Default::default()
-            },
-            Err(e) => return Err(e),
-        };
+        let manifest = load_manifest(storage.as_ref(), &config)?;
 
         // Rank 0 only, for the same reason only rank 0 finalises: every rank
         // shares one storage root, and ranks 1..N write into directories rank 0
@@ -557,6 +592,19 @@ impl Coordinator {
     pub fn sync_now(&self) -> Result<()> {
         self.wait_idle();
         self.core.sync_now()
+    }
+
+    /// Pull this store back from the remote, for a machine that has none.
+    ///
+    /// Returns whether anything was restored. The caller decides when: only it
+    /// knows whether this run means to resume, and a whole checkpoint coming
+    /// down the wire is not something to discover by having built a manager.
+    ///
+    /// See [`crate::remote_sync::restore_from_remote`] for what the gap cost
+    /// before this existed.
+    pub fn restore_from_remote(&self) -> Result<bool> {
+        self.wait_idle();
+        self.core.restore_from_remote()
     }
 }
 
@@ -1071,6 +1119,47 @@ impl Core {
             Some(ref syncer) => syncer.sync_now(),
             None => Ok(()),
         }
+    }
+
+    fn restore_from_remote(&self) -> Result<bool> {
+        let Some(remote) = self.config.remote_storage.as_ref() else {
+            return Ok(false);
+        };
+        if !crate::remote_sync::restore_from_remote(&self.storage, remote)? {
+            return Ok(false);
+        }
+        // The manifest in memory was read at construction, when the store was
+        // empty. Everything downstream asks it, not the disk.
+        let mut fresh = load_manifest(self.storage.as_ref(), &self.config)?;
+
+        // And it is not to be trusted as it stands. `manifest.json` is
+        // rewritten and re-uploaded on its own, while snapshot data goes up
+        // separately, so a bucket can hold a manifest naming snapshots whose
+        // packs never made it. Seen on a six-node bench on 2026-08-19: the
+        // restore succeeded and the first `load` then failed on a pack that
+        // was in no bucket at all.
+        //
+        // Dropping the entries whose files did not arrive turns that into a
+        // resume from an older step, which is the difference between losing
+        // some progress and losing the run.
+        let before = fresh.snapshots.len();
+        let storage = Arc::clone(&self.storage);
+        fresh
+            .snapshots
+            .retain(|snapshot| snapshot_is_whole(storage.as_ref(), snapshot));
+        let dropped = before - fresh.snapshots.len();
+        if dropped > 0 {
+            eprintln!(
+                "[Moonclip] {dropped} snapshot(s) named by the remote manifest                  did not arrive with it and were left out; resuming from what did."
+            );
+            if let Ok(json) = serde_json::to_vec_pretty(&fresh) {
+                let _ = self.storage.put("manifest.json", &json);
+            }
+        }
+
+        let usable = !fresh.snapshots.is_empty();
+        *self.manifest.lock().unwrap() = fresh;
+        Ok(usable)
     }
 
     // ── Internal ─────────────────────────────────────────────────────
