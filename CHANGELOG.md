@@ -1,5 +1,61 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **Very large objects reach S3.** Every write was a single `PUT`, and S3
+  refuses one over 5 GiB — the size an ordinary gathered checkpoint reaches on
+  its own, since a 1B model with Adam is around 11 GiB. Past a threshold a
+  write now becomes a multipart upload: create, one request per part, complete,
+  and — the part that is easy to leave out — `AbortMultipartUpload` on every
+  way out other than success, because parts belonging to an upload that was
+  neither completed nor aborted stay in the bucket, invisible to a listing and
+  still billed. The part size grows with the object so the count stays under
+  S3's ceiling of 10000. Not caught earlier because the integration tests run
+  against MinIO, which accepts single `PUT`s far larger than S3 does.
+- **A store can be pulled back from the remote.** Remote support was push-only:
+  `sync_now()` sent local to remote and nothing read the other way, so the step
+  to resume from came from the *local* manifest and a bucket was a backup you
+  could not resume from. Measured on a six-node bench: a node whose disk had
+  been replaced started from scratch with its own data sitting in the bucket,
+  and took every other rank with it. `restore_from_remote` fills an empty store
+  from the remote, and brings back the whole store rather than only its
+  snapshots — a caller's sidecar files come back with it.
+
+### Fixed — data loss
+
+- **A merge could unlink a base a rank was still writing against.**
+  `do_full_merge` correctly keeps unfinalized snapshots out of the fold — they
+  belong to other ranks to finish — and then unlinked the base regardless. What
+  survived was a delta naming a base no longer on disk: `load` answered
+  NotFound and startup recovery discarded a checkpoint that was whole. The
+  window is real between `create_snapshot` and the first rank reaching
+  `save_rank_in_pool`, since no pin exists yet — and pins would not close it
+  anyway, being per-process while co-located ranks are not.
+- **The base pin was released too early.** It now covers the push, or a merge
+  is free to fold the base away between the last byte of a pack and the
+  snapshot appearing in the manifest. It is still released before retention,
+  because a pin held there is one the same thread would wait on itself.
+
+### Fixed
+
+- **A forced merge could go quiet for twenty minutes.** The claim retries and
+  the unlink each had their own 300-second budget, taken back to back, and this
+  path also runs at process exit — where a scheduler's grace period is already
+  counting. They are now **one** budget covering both, with the unlink coming
+  out of whatever the claim left.
+- **A forced sync could leave the bucket holding a checkpoint that does not
+  load.** The manifest names snapshots by id, and `sync_now()` handed the whole
+  store to one walk, so the backend's listing order decided what went up first.
+  A manifest that arrived before the packs it named made the bucket present
+  itself as a checkpoint and fail on the first read — seen on the bench as
+  `Checkpoint not found: snapshots/cdc000df-.../rank_0.pack`. The manifest now
+  goes last, always, which makes an interrupted sync leave the remote *behind*
+  rather than *inconsistent*: an older checkpoint costs some progress, a
+  manifest naming absent data costs the run. The periodic path already had this
+  order; the forced one did not.
+
 ## 0.0.7 — 2026-08-18
 
 Retention and merging stopped being able to pull a snapshot out from under a

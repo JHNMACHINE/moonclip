@@ -84,6 +84,14 @@ impl Default for RemoteSyncConfig {
     }
 }
 
+/// The one file that must never reach a destination ahead of the data it
+/// names.
+///
+/// Everything else in a store is immutable and UUID-named, so its arrival
+/// order carries no meaning. The manifest is rewritten on every save and is
+/// the only file whose arrival changes what the destination claims to hold.
+const MANIFEST: &str = "manifest.json";
+
 enum SyncCommand {
     /// Sync all files under the given prefix to remote.
     SyncPrefix(String),
@@ -134,7 +142,7 @@ impl RemoteSyncer {
                             apply_deletes(&remote, &deletes);
                         }
                         SyncCommand::SyncAll(reply) => {
-                            let outcome = match sync_prefix(&local, &remote, "") {
+                            let outcome = match sync_store(&local, &remote) {
                                 Ok(()) => None,
                                 Err(e) => Some(e.to_string()),
                             };
@@ -178,7 +186,7 @@ impl RemoteSyncer {
                 let tx = tx.lock().unwrap();
                 // Sync snapshots and manifest
                 let _ = tx.send(SyncCommand::SyncPrefix("snapshots".into()));
-                let _ = tx.send(SyncCommand::SyncPrefix("manifest.json".into()));
+                let _ = tx.send(SyncCommand::SyncPrefix(MANIFEST.into()));
             }
         }
     }
@@ -264,6 +272,29 @@ fn apply_deletes(remote: &Arc<dyn StorageBackend>, deletes: &Arc<PendingDeletes>
     }
 }
 
+/// Copy a whole store from one side to the other, manifest last.
+///
+/// The manifest names snapshots by id, so a destination holding the manifest
+/// but not the packs it names presents itself as a checkpoint and then fails
+/// the first read. Seen on the six-node bench on 2026-08-19: a rank pulled a
+/// store back from the bucket and died on `Checkpoint not found:
+/// snapshots/cdc000df-.../rank_0.pack`, a snapshot no prefix held.
+///
+/// The periodic path in [`RemoteSyncer::notify_save`] already queues the two
+/// in this order. This is the forced path behind [`RemoteSyncer::sync_now`],
+/// which used to hand the whole store to a single walk and let the backend's
+/// `list("")` order decide what went up first — so the manifest could, and
+/// did, arrive alone.
+///
+/// Ordering makes an interrupted sync leave the destination *behind* rather
+/// than *inconsistent*: a manifest that never arrived is an older checkpoint,
+/// which costs some progress, while a manifest that arrived early is a
+/// checkpoint that does not load at all.
+fn sync_store(from: &Arc<dyn StorageBackend>, to: &Arc<dyn StorageBackend>) -> Result<()> {
+    sync_prefix_skipping(from, to, "", &[MANIFEST])?;
+    sync_prefix(from, to, MANIFEST)
+}
+
 /// Copy every file under `prefix` from one store to another.
 ///
 /// Named `from`/`to` rather than local/remote because the direction is the
@@ -280,6 +311,19 @@ fn sync_prefix(
     from: &Arc<dyn StorageBackend>,
     to: &Arc<dyn StorageBackend>,
     prefix: &str,
+) -> Result<()> {
+    sync_prefix_skipping(from, to, prefix, &[])
+}
+
+/// [`sync_prefix`], with names the walk must leave where they are.
+///
+/// One caller needs this: [`sync_store`] copies a whole store in two passes so
+/// that the manifest lands last, and the first pass must not carry it along.
+fn sync_prefix_skipping(
+    from: &Arc<dyn StorageBackend>,
+    to: &Arc<dyn StorageBackend>,
+    prefix: &str,
+    skip: &[&str],
 ) -> Result<()> {
     // Special case: single file (e.g. "manifest.json")
     if !prefix.is_empty() && !prefix.contains('/') && prefix.contains('.') {
@@ -298,6 +342,10 @@ fn sync_prefix(
     let mut skipped = 0u64;
 
     for file in &files {
+        if skip.contains(&file.as_str()) {
+            continue;
+        }
+
         match to.exists(file) {
             Ok(true) => {
                 skipped += 1;
@@ -320,6 +368,41 @@ fn sync_prefix(
     }
 
     Ok(())
+}
+
+/// Pull a store back from the remote onto a machine that has none.
+///
+/// The remote was push-only until 2026-08-19, and the gap was not theoretical:
+/// measured on a six-node bench, a node whose disk was replaced started from
+/// scratch while its data sat in the bucket, and every other rank started over
+/// with it — `agree_on_step` takes the minimum. A plain reshuffle of which node
+/// hosts which rank did the same, with every disk intact. So the bucket was a
+/// backup and never a way back.
+///
+/// Returns whether a manifest arrived, which is what makes the local store
+/// readable at all. Deliberately **not** called from the constructor: pulling
+/// a whole checkpoint is not something a caller should discover by having
+/// started a manager, and only the caller knows whether this run wants to
+/// resume at all.
+pub fn restore_from_remote(
+    local: &Arc<dyn StorageBackend>,
+    remote: &Arc<dyn StorageBackend>,
+) -> Result<bool> {
+    // The manifest first and on its own: without it the snapshot files are
+    // bytes nothing names, and if it never arrives there is nothing to restore
+    // and no reason to pay for the rest.
+    sync_prefix(remote, local, MANIFEST)?;
+    if !local.exists(MANIFEST).unwrap_or(false) {
+        return Ok(false);
+    }
+
+    // Everything else, not just `snapshots`: a store can hold sidecar files a
+    // caller put there — Ravex keeps its owner record beside the manifest —
+    // and leaving them behind makes a restored store subtly different from the
+    // one that was pushed. What they mean is the caller's business; that they
+    // come back is not.
+    sync_prefix_skipping(remote, local, "", &[MANIFEST])?;
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -630,35 +713,159 @@ mod tests {
 
         assert_eq!(dst.get("manifest.json").unwrap(), b"{\"snapshots\":[1]}");
     }
-}
 
-
-/// Pull a store back from the remote onto a machine that has none.
-///
-/// The remote was push-only until 2026-08-19, and the gap was not theoretical:
-/// measured on a six-node bench, a node whose disk was replaced started from
-/// scratch while its data sat in the bucket, and every other rank started over
-/// with it — `agree_on_step` takes the minimum. A plain reshuffle of which node
-/// hosts which rank did the same, with every disk intact. So the bucket was a
-/// backup and never a way back.
-///
-/// Returns whether a manifest arrived, which is what makes the local store
-/// readable at all. Deliberately **not** called from the constructor: pulling
-/// a whole checkpoint is not something a caller should discover by having
-/// started a manager, and only the caller knows whether this run wants to
-/// resume at all.
-pub fn restore_from_remote(
-    local: &Arc<dyn StorageBackend>,
-    remote: &Arc<dyn StorageBackend>,
-) -> Result<bool> {
-    // The manifest first and on its own: without it the snapshot files are
-    // bytes nothing names, and if it never arrives there is nothing to restore
-    // and no reason to pay for the rest.
-    sync_prefix(remote, local, "manifest.json")?;
-    if !local.exists("manifest.json").unwrap_or(false) {
-        return Ok(false);
+    /// A destination that records the order writes arrived in.
+    struct RecordingRemote {
+        inner: Arc<dyn StorageBackend>,
+        writes: Mutex<Vec<String>>,
+        refuse: Option<String>,
     }
 
-    sync_prefix(remote, local, "snapshots")?;
-    Ok(true)
+    impl RecordingRemote {
+        fn new(inner: Arc<dyn StorageBackend>) -> Self {
+            RecordingRemote {
+                inner,
+                writes: Mutex::new(Vec::new()),
+                refuse: None,
+            }
+        }
+
+        fn refusing(inner: Arc<dyn StorageBackend>, key: &str) -> Self {
+            RecordingRemote {
+                inner,
+                writes: Mutex::new(Vec::new()),
+                refuse: Some(key.to_string()),
+            }
+        }
+    }
+
+    impl StorageBackend for RecordingRemote {
+        fn put(&self, rel_path: &str, data: &[u8]) -> Result<()> {
+            if self.refuse.as_deref() == Some(rel_path) {
+                return Err(MoonclipError::Storage(format!("refused {rel_path}")));
+            }
+            self.writes.lock().unwrap().push(rel_path.to_string());
+            self.inner.put(rel_path, data)
+        }
+        fn get(&self, rel_path: &str) -> Result<Vec<u8>> {
+            self.inner.get(rel_path)
+        }
+        fn exists(&self, rel_path: &str) -> Result<bool> {
+            self.inner.exists(rel_path)
+        }
+        fn delete(&self, rel_path: &str) -> Result<()> {
+            self.inner.delete(rel_path)
+        }
+        fn list(&self, prefix: &str) -> Result<Vec<String>> {
+            self.inner.list(prefix)
+        }
+    }
+
+    /// The manifest names snapshots by id. If it reaches the bucket before the
+    /// packs it names, the bucket presents itself as a checkpoint and fails on
+    /// the first read — reproduced on the six-node bench on 2026-08-19, where
+    /// a restored rank died on a snapshot no prefix held.
+    ///
+    /// The forced sync used to be one walk over `list("")`, so the order was
+    /// the backend's to choose.
+    #[test]
+    fn the_manifest_is_the_last_thing_a_forced_sync_writes() {
+        let (_s, _d, src, dst) = two_stores();
+
+        // Named so that a plain lexicographic walk would put the manifest
+        // first: this test would pass by luck if the order were still the
+        // backend's.
+        src.put("snapshots/aaa/rank_0.pack", b"pack").unwrap();
+        src.put("snapshots/zzz/rank_0.pack", b"pack").unwrap();
+        src.put(".ravex-owner", b"{}").unwrap();
+        src.put("manifest.json", b"{\"snapshots\":[\"aaa\",\"zzz\"]}")
+            .unwrap();
+
+        let remote = Arc::new(RecordingRemote::new(Arc::clone(&dst)));
+        let remote_dyn: Arc<dyn StorageBackend> = Arc::clone(&remote) as Arc<dyn StorageBackend>;
+
+        sync_store(&src, &remote_dyn).unwrap();
+
+        let writes = remote.writes.lock().unwrap().clone();
+        assert_eq!(
+            writes.last().map(String::as_str),
+            Some(MANIFEST),
+            "the manifest must go up last, got {writes:?}"
+        );
+        assert!(
+            writes.contains(&".ravex-owner".to_string()),
+            "a root file that is not the manifest still has to be pushed, got {writes:?}"
+        );
+        assert_eq!(
+            writes.iter().filter(|w| w.as_str() == MANIFEST).count(),
+            1,
+            "the manifest goes up once, not once per pass: {writes:?}"
+        );
+    }
+
+    /// A sync can die at any point. Ordering is what decides whether the
+    /// destination is then *behind* or *broken*: without a manifest the bucket
+    /// holds no checkpoint, which costs progress; with one that names absent
+    /// packs it holds a checkpoint that does not load.
+    #[test]
+    fn a_sync_cut_short_leaves_no_manifest_rather_than_a_broken_one() {
+        let (_s, _d, src, dst) = two_stores();
+
+        src.put("snapshots/aaa/rank_0.pack", b"pack").unwrap();
+        src.put("manifest.json", b"{\"snapshots\":[\"aaa\"]}").unwrap();
+
+        let remote = Arc::new(RecordingRemote::refusing(Arc::clone(&dst), MANIFEST));
+        let remote_dyn: Arc<dyn StorageBackend> = Arc::clone(&remote) as Arc<dyn StorageBackend>;
+
+        assert!(
+            sync_store(&src, &remote_dyn).is_err(),
+            "a refused manifest is a failed sync and has to be reported"
+        );
+        assert!(
+            dst.exists("snapshots/aaa/rank_0.pack").unwrap(),
+            "the data that did make it stays"
+        );
+        assert!(
+            !dst.exists(MANIFEST).unwrap_or(false),
+            "nothing claims the destination holds a checkpoint"
+        );
+    }
+
+    /// A store is not only its manifest and its snapshots. Ravex writes an
+    /// owner record beside them — which run wrote this store, and on which
+    /// machine — and that record is the only thing able to tell a store
+    /// belonging to this history from one left by an earlier run at the same
+    /// prefix. A restore that dropped it would hand back a store nobody can
+    /// attribute, which is the situation the record exists to end.
+    #[test]
+    fn a_restore_brings_back_the_whole_store_not_only_the_snapshots() {
+        let (_s, _d, remote, local) = two_stores();
+
+        remote.put(MANIFEST, b"{\"snapshots\":[\"aaa\"]}").unwrap();
+        remote.put("snapshots/aaa/rank_0.pack", b"pack").unwrap();
+        remote.put(".ravex-owner", b"{\"run_id\":\"run-abc\"}").unwrap();
+
+        assert!(restore_from_remote(&local, &remote).unwrap());
+
+        assert_eq!(local.get(".ravex-owner").unwrap(), b"{\"run_id\":\"run-abc\"}");
+        assert_eq!(local.get("snapshots/aaa/rank_0.pack").unwrap(), b"pack");
+        assert_eq!(local.get(MANIFEST).unwrap(), b"{\"snapshots\":[\"aaa\"]}");
+    }
+
+    /// Nothing in the bucket means nothing to restore, and in particular no
+    /// half-store left on the local disk for the resume to trip over.
+    #[test]
+    fn a_restore_from_an_empty_remote_reports_nothing_and_writes_nothing() {
+        let (_s, _d, remote, local) = two_stores();
+        remote.put("snapshots/aaa/rank_0.pack", b"orphan").unwrap();
+
+        assert!(
+            !restore_from_remote(&local, &remote).unwrap(),
+            "without a manifest there is no checkpoint to claim"
+        );
+        assert!(
+            !local.exists("snapshots/aaa/rank_0.pack").unwrap_or(false),
+            "and no reason to have paid for the download"
+        );
+    }
 }

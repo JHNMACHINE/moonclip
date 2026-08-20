@@ -19,10 +19,13 @@
 //!   `x-amz-security-token` header is signed or sent, so anything issuing
 //!   session credentials — `AssumeRole`, EC2 instance profiles, IRSA on EKS,
 //!   any OIDC federation — cannot be used. The credentials have to be static.
-//! * **Objects above the single-`PUT` ceiling.** Every write is one `PUT`, and
-//!   S3 refuses a single `PUT` over 5 GiB; multipart upload is not
-//!   implemented. A gathered checkpoint of a large model reaches that on its
-//!   own. See the tracking issue.
+//! * **Very large objects.** Handled, but by a second path worth knowing
+//!   about: past `SINGLE_PUT_LIMIT` a write becomes a multipart upload rather
+//!   than one `PUT`, because S3 refuses a single `PUT` over 5 GiB and a
+//!   gathered checkpoint of a large model reaches that on its own. The
+//!   multipart path is the one the integration tests exercise least — MinIO
+//!   accepts far larger single `PUT`s than S3 does, so the threshold that
+//!   matters in production is one the suite never crosses on its own.
 //! * **Clock skew.** The signature is stamped with the local clock and a
 //!   `RequestTimeTooSkewed` is treated as any other error. A host more than
 //!   fifteen minutes off signs requests that will never be accepted, and the
@@ -481,7 +484,7 @@ impl S3Storage {
                     &[("uploadId", upload_id.as_str())],
                 ) {
                     eprintln!(
-                        "[Moonclip] could not abort the multipart upload of {key}:                          {cleanup}. Its parts are still in the bucket, invisible                          to a listing and still billed."
+                        "[Moonclip] could not abort the multipart upload of                          {key}: {cleanup}. Its parts are still in the bucket,                          invisible to a listing and still billed."
                     );
                 }
                 Err(e)
@@ -839,6 +842,47 @@ mod tests {
 
         config.prefix = "solo".into();
         assert_eq!(config.normalized_prefix(), "solo/");
+    }
+
+    /// The part count is the thing that fails silently: S3 refuses an upload
+    /// of more than 10000 parts, and the refusal arrives at completion, after
+    /// every part has already been paid for and sent.
+    ///
+    /// Checked against sizes no test will ever upload, because that is exactly
+    /// the point — the integration suite runs against MinIO, which accepts
+    /// single `PUT`s far larger than S3 does, so nothing else here crosses the
+    /// threshold this arithmetic exists for.
+    #[test]
+    fn no_object_size_produces_more_parts_than_s3_accepts() {
+        let gib = 1024 * 1024 * 1024usize;
+        for total in [
+            SINGLE_PUT_LIMIT + 1,
+            11 * gib,   // 1B parameters with Adam, gathered
+            160 * gib,  // where the floor part size stops sufficing
+            1024 * gib, // a 70B model, well past anything measured
+            8 * 1024 * gib,
+        ] {
+            let size = part_size_for(total);
+            let parts = total.div_ceil(size);
+            assert!(
+                parts <= MAX_PARTS,
+                "{total} bytes at {size} per part is {parts} parts, over the {MAX_PARTS} ceiling"
+            );
+            assert!(
+                size >= MIN_PART_SIZE,
+                "{size} is below the 5 MiB S3 accepts for a non-final part"
+            );
+        }
+    }
+
+    /// Small objects must not pay for a part size that scales: below the
+    /// single-`PUT` limit this function is not consulted at all, and at the
+    /// bottom of its range it has to stay at the floor.
+    #[test]
+    fn a_small_object_gets_the_floor_part_size() {
+        assert_eq!(part_size_for(0), MIN_PART_SIZE);
+        assert_eq!(part_size_for(MIN_PART_SIZE), MIN_PART_SIZE);
+        assert_eq!(part_size_for(SINGLE_PUT_LIMIT), MIN_PART_SIZE);
     }
 
     #[test]
