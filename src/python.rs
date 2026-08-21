@@ -322,6 +322,7 @@ impl MoonclipManager {
                     secret_key: sk.into(),
                     path_style: s3_path_style,
                     timeout_secs: 30,
+                    single_put_limit: crate::s3::SINGLE_PUT_LIMIT,
                 }
                 .with_auto_path_style(),
             )?);

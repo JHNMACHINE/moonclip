@@ -75,6 +75,16 @@ pub struct S3Config {
     pub path_style: bool,
     /// Connection timeout in seconds.
     pub timeout_secs: u64,
+    /// Above this many bytes, a write becomes a multipart upload instead of
+    /// one `PUT`. Defaults to [`SINGLE_PUT_LIMIT`].
+    ///
+    /// Configurable for one reason: at the default, the only way to exercise
+    /// the choice is to actually move four gigabytes, which on an ordinary
+    /// connection is over an hour. Lowering it lets a test watch `put` take
+    /// the multipart path for the price of a few megabytes. That the ceiling
+    /// itself is real is the service's business, and documented; that we
+    /// dispatch on it is ours.
+    pub single_put_limit: usize,
 }
 
 impl S3Config {
@@ -84,6 +94,12 @@ impl S3Config {
         if self.endpoint.is_some() {
             self.path_style = true;
         }
+        self
+    }
+
+    /// Move the multipart threshold. See [`Self::single_put_limit`].
+    pub fn with_single_put_limit(mut self, bytes: usize) -> Self {
+        self.single_put_limit = bytes;
         self
     }
 
@@ -190,7 +206,7 @@ fn uri_encode(s: &str, encode_slash: bool) -> String {
 /// of a large model is well past it either way — 1B parameters with Adam is
 /// around 11 GiB, and `gather` is Ravex's default, so this is the ordinary
 /// path rather than an extreme one.
-const SINGLE_PUT_LIMIT: usize = 4 * 1024 * 1024 * 1024;
+pub const SINGLE_PUT_LIMIT: usize = 4 * 1024 * 1024 * 1024;
 
 /// Smallest part S3 accepts, except for the last one, is 5 MiB. Larger than
 /// that here: parts cost a request each, and 10000 of them is the ceiling.
@@ -492,6 +508,89 @@ impl S3Storage {
         }
     }
 
+    /// Multipart uploads that were started and never finished, as the service
+    /// sees them: `(key, upload id)`.
+    ///
+    /// Nothing else can find them. The parts of an unfinished upload do not
+    /// appear in `ListObjectsV2`, so `list` cannot see them, retention never
+    /// reclaims them, and the bill counts them the whole time. That is the
+    /// reason [`Self::put_multipart`] aborts on every way out other than
+    /// success — and until this existed, nothing could check that it did.
+    ///
+    /// Paginated the same way `list` is. Truncation here is not the ordinary
+    /// case: a bucket with more than a thousand abandoned uploads has a
+    /// problem this function is only reporting.
+    pub fn list_multipart_uploads(&self, prefix: &str) -> Result<Vec<(String, String)>> {
+        let full_prefix = self.config.object_key(prefix);
+        let mut found = Vec::new();
+        let mut markers: Option<(String, String)> = None;
+
+        loop {
+            let mut params: Vec<(&str, &str)> = vec![("uploads", ""), ("prefix", &full_prefix)];
+            let held;
+            if let Some(ref pair) = markers {
+                held = pair.clone();
+                params.push(("key-marker", &held.0));
+                params.push(("upload-id-marker", &held.1));
+            }
+
+            let response = self.do_request("GET", "", None, &params)?;
+            let body = response.into_string().map_err(|e| {
+                MoonclipError::Storage(format!("S3 multipart listing parse error: {e}"))
+            })?;
+
+            // Split on the element rather than pulling two flat lists of Key
+            // and UploadId: a response that omitted one field for one entry
+            // would otherwise pair every later id with the wrong key.
+            for chunk in body.split("<Upload>").skip(1) {
+                let entry = chunk.split("</Upload>").next().unwrap_or("");
+                if let (Some(key), Some(id)) = (
+                    extract_xml_value(entry, "Key"),
+                    extract_xml_value(entry, "UploadId"),
+                ) {
+                    found.push((key, id));
+                }
+            }
+
+            if !body.contains("<IsTruncated>true</IsTruncated>") {
+                break;
+            }
+            match (
+                extract_xml_value(&body, "NextKeyMarker"),
+                extract_xml_value(&body, "NextUploadIdMarker"),
+            ) {
+                (Some(key), Some(id)) => markers = Some((key, id)),
+                _ => break,
+            }
+        }
+
+        Ok(found)
+    }
+
+    /// Abandon a multipart upload, releasing the parts it is holding.
+    ///
+    /// Public because the internal abort only covers uploads this process
+    /// started. One that was interrupted by a machine going away is nobody's
+    /// to clean up otherwise, and it is being paid for.
+    pub fn abort_multipart_upload(&self, key: &str, upload_id: &str) -> Result<()> {
+        self.do_request("DELETE", key, None, &[("uploadId", upload_id)])?;
+        Ok(())
+    }
+
+    /// The ETag the service reports for an object, unquoted, or None.
+    ///
+    /// The one cheap way to tell *how* an object was written: a multipart
+    /// upload's ETag ends in `-<part count>`, a single `PUT`'s does not. S3
+    /// and R2 both follow that shape while computing the hash differently —
+    /// which is why callers should read the suffix and never the value.
+    pub fn etag(&self, rel_path: &str) -> Result<Option<String>> {
+        let key = self.config.object_key(rel_path);
+        let response = self.do_request("HEAD", &key, None, &[])?;
+        Ok(response
+            .header("ETag")
+            .map(|value| value.trim_matches('"').to_string()))
+    }
+
     /// The parts themselves, and the completion that makes them an object.
     ///
     /// Split out so [`Self::put_multipart`] has exactly one place to abort
@@ -656,7 +755,7 @@ fn is_retryable(e: &MoonclipError) -> bool {
 impl StorageBackend for S3Storage {
     fn put(&self, rel_path: &str, data: &[u8]) -> Result<()> {
         let key = self.config.object_key(rel_path);
-        if data.len() > SINGLE_PUT_LIMIT {
+        if data.len() > self.config.single_put_limit {
             return self.put_multipart(rel_path, data);
         }
         self.do_request("PUT", &key, Some(data), &[])?;
@@ -815,6 +914,7 @@ mod tests {
             secret_key: "SK".into(),
             path_style: false,
             timeout_secs: 30,
+            single_put_limit: SINGLE_PUT_LIMIT,
         };
 
         assert_eq!(
@@ -834,6 +934,7 @@ mod tests {
             secret_key: "SK".into(),
             path_style: false,
             timeout_secs: 30,
+            single_put_limit: SINGLE_PUT_LIMIT,
         };
         assert_eq!(config.normalized_prefix(), "foo/bar/");
 
@@ -871,6 +972,42 @@ mod tests {
             assert!(
                 size >= MIN_PART_SIZE,
                 "{size} is below the 5 MiB S3 accepts for a non-final part"
+            );
+        }
+    }
+
+    /// R2 enforces a rule S3 does not, and rejects the whole upload for it:
+    /// **every part but the last must be exactly the same size** — error
+    /// 10048, `InvalidPart`, "All non-trailing parts must have the same size".
+    ///
+    /// `data.chunks(size)` satisfies it by construction, giving equal parts
+    /// with a smaller remainder at the end. That is worth a test rather than a
+    /// comment, because the obvious future change — sizing the last few parts
+    /// differently to smooth out a tail — would keep every S3 test green and
+    /// break R2 alone.
+    ///
+    /// The other three bounds are R2's documented limits, which for parts are
+    /// the same numbers S3 uses: 5 MiB minimum, 5 GiB maximum, 10000 parts.
+    #[test]
+    fn the_part_layout_satisfies_r2_as_well_as_s3() {
+        const R2_MIN_PART: usize = 5 * 1024 * 1024;
+        const R2_MAX_PART: usize = 5 * 1024 * 1024 * 1024;
+        let gib = 1024 * 1024 * 1024usize;
+
+        for total in [
+            SINGLE_PUT_LIMIT + 1,
+            11 * gib,        // 1B parameters with Adam, gathered
+            1024 * gib,      // 1 TiB
+            5 * 1024 * gib,  // 5 TiB, R2's ceiling for an object
+        ] {
+            let size = part_size_for(total);
+            let last = total % size;
+
+            assert!((R2_MIN_PART..=R2_MAX_PART).contains(&size));
+            assert!(total.div_ceil(size) <= MAX_PARTS);
+            assert!(
+                last == 0 || last < size,
+                "the last part may differ, and only by being smaller: {total} bytes at {size} leaves {last}"
             );
         }
     }
@@ -974,6 +1111,7 @@ mod tests {
             secret_key: "SK".into(),
             path_style: false,
             timeout_secs: 30,
+            single_put_limit: SINGLE_PUT_LIMIT,
         };
 
         // Virtual-hosted style (AWS default)
@@ -1004,6 +1142,7 @@ mod tests {
             secret_key: "SK".into(),
             path_style: false,
             timeout_secs: 30,
+            single_put_limit: SINGLE_PUT_LIMIT,
         }
         .with_auto_path_style();
         assert!(!config.path_style);
@@ -1018,6 +1157,7 @@ mod tests {
             secret_key: "SK".into(),
             path_style: false,
             timeout_secs: 30,
+            single_put_limit: SINGLE_PUT_LIMIT,
         }
         .with_auto_path_style();
         assert!(config.path_style);
@@ -1032,6 +1172,7 @@ mod tests {
             secret_key: "SK".into(),
             path_style: true,
             timeout_secs: 30,
+            single_put_limit: SINGLE_PUT_LIMIT,
         }
         .with_auto_path_style();
         assert!(config.path_style);

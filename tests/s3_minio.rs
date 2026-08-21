@@ -20,6 +20,18 @@
 //! MOONCLIP_S3_SECRET_KEY=minioadmin \
 //!   cargo test --test s3_minio
 //! ```
+//!
+//! MinIO is the convenient target, not the honest one: it accepts single
+//! `PUT`s far larger than S3 does. Cloudflare R2 shares S3's 5 GiB
+//! single-`PUT` ceiling and adds a rule of its own — every part but the last
+//! must be the same size — so it is the cheaper way to be told the truth:
+//!
+//! ```sh
+//! MOONCLIP_S3_ENDPOINT=https://<ACCOUNT_ID>.r2.cloudflarestorage.com
+//! MOONCLIP_S3_REGION=auto
+//! MOONCLIP_S3_BUCKET=moonclip-s3-tests
+//! MOONCLIP_S3_ACCESS_KEY=...  MOONCLIP_S3_SECRET_KEY=...
+//! ```
 
 use moonclip::s3::{S3Config, S3Storage};
 use moonclip::storage::StorageBackend;
@@ -28,19 +40,43 @@ use moonclip::storage::StorageBackend;
 /// suite is not set up — the tests then pass trivially rather than failing on
 /// a machine that never asked to run them.
 fn backend(prefix: &str) -> Option<S3Storage> {
+    let config = backend_config(prefix)?;
+    Some(S3Storage::new(config).expect("building the S3 backend"))
+}
+
+fn backend_config(prefix: &str) -> Option<S3Config> {
     let endpoint = std::env::var("MOONCLIP_S3_ENDPOINT").ok()?;
     let config = S3Config {
         bucket: std::env::var("MOONCLIP_S3_BUCKET").unwrap_or_else(|_| "moonclip-test".into()),
         prefix: prefix.into(),
-        region: "us-east-1".into(),
+        // R2 wants `auto`; MinIO does not care. The region goes into the
+        // SigV4 credential scope, so a service that checks it rejects the
+        // signature outright rather than saying the region was wrong.
+        region: std::env::var("MOONCLIP_S3_REGION").unwrap_or_else(|_| "us-east-1".into()),
         endpoint: Some(endpoint),
         access_key: std::env::var("MOONCLIP_S3_ACCESS_KEY").unwrap_or_else(|_| "minioadmin".into()),
         secret_key: std::env::var("MOONCLIP_S3_SECRET_KEY").unwrap_or_else(|_| "minioadmin".into()),
         path_style: true,
         timeout_secs: 30,
+        // Overridable so one test can watch `put` choose the multipart path
+        // without moving four gigabytes to do it.
+        single_put_limit: std::env::var("MOONCLIP_S3_SINGLE_PUT_LIMIT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(moonclip::s3::SINGLE_PUT_LIMIT),
     }
     .with_auto_path_style();
 
+    Some(config)
+}
+
+/// The same backend with the multipart threshold moved.
+///
+/// Lowering it is how the dispatch below gets tested at all: at the real
+/// threshold the only way to see `put` choose multipart is to move four
+/// gigabytes, which on an ordinary uplink is over an hour.
+fn backend_with_limit(prefix: &str, limit: usize) -> Option<S3Storage> {
+    let config = backend_config(prefix)?.with_single_put_limit(limit);
     Some(S3Storage::new(config).expect("building the S3 backend"))
 }
 
@@ -257,6 +293,91 @@ s3_test!(a_multipart_object_is_listed_and_deletable_like_any_other, store, {
     assert!(!store.exists("listed.pack").expect("checking"));
 });
 
+/// Two parts at the 16 MiB floor, and a quarter of the time of the 40 MiB one.
+const DISPATCH_BYTES: usize = 20 * 1024 * 1024;
+
+/// `put` has to *choose* the multipart path, and until now nothing watched it
+/// choose: the multipart tests above all call `put_multipart` directly, so the
+/// three lines that decide were the one part of the path no test touched.
+///
+/// The service is what tells them apart. A multipart upload's ETag ends in
+/// `-<part count>`; a single `PUT`'s does not. Reading the suffix rather than
+/// the value is deliberate — S3 and R2 both use that shape and compute the
+/// hash differently.
+#[test]
+fn put_takes_the_multipart_path_once_the_object_is_over_the_threshold() {
+    let Some(store) = backend_with_limit("it/dispatch_over", 1024 * 1024) else {
+        eprintln!("skipped: MOONCLIP_S3_ENDPOINT is not set");
+        return;
+    };
+
+    let data = noisy(DISPATCH_BYTES);
+    store.put("over.pack", &data).expect("put");
+
+    let etag = store.etag("over.pack").expect("head").expect("an ETag");
+    assert!(
+        etag.contains('-'),
+        "a plain PUT was used for an object over the threshold: ETag {etag}"
+    );
+
+    let back = store.get("over.pack").expect("reading it back");
+    assert!(back == data, "the object came back with different bytes");
+}
+
+/// The other side of the same branch, and the one that would catch an
+/// inverted comparison: under the threshold nothing should be split.
+#[test]
+fn put_stays_a_single_request_under_the_threshold() {
+    let Some(store) = backend_with_limit("it/dispatch_under", 64 * 1024 * 1024) else {
+        eprintln!("skipped: MOONCLIP_S3_ENDPOINT is not set");
+        return;
+    };
+
+    let data = noisy(DISPATCH_BYTES);
+    store.put("under.pack", &data).expect("put");
+
+    let etag = store.etag("under.pack").expect("head").expect("an ETag");
+    assert!(
+        !etag.contains('-'),
+        "an object under the threshold was split anyway: ETag {etag}"
+    );
+}
+
+s3_test!(a_finished_upload_leaves_nothing_holding_storage, store, {
+    // Parts belonging to an unfinished multipart upload are invisible to
+    // `ListObjectsV2`: `list` cannot see them, retention never reclaims them,
+    // and the bill counts them for as long as they sit there. So "the upload
+    // succeeded and the object is correct" is not the whole claim — the claim
+    // is also that nothing was left holding storage behind it. Until
+    // `list_multipart_uploads` existed there was no way to ask.
+    let data = noisy(DISPATCH_BYTES);
+    store
+        .put_multipart("tidy.pack", &data)
+        .expect("multipart upload");
+
+    let dangling = store
+        .list_multipart_uploads("")
+        .expect("listing multipart uploads");
+
+    assert!(
+        dangling.is_empty(),
+        "the upload completed and still left parts behind: {dangling:?}"
+    );
+
+    store.delete("tidy.pack").expect("deleting");
+});
+
+s3_test!(abandoning_an_upload_that_does_not_exist_is_an_error, store, {
+    // Abandoning an upload that is not there has to be reported, not shrugged
+    // off. This is the call the cleanup path depends on, and a silent success
+    // would mean a caller believing it had reclaimed storage it had not.
+    let outcome = store.abort_multipart_upload("nothing.pack", "an-upload-id-that-never-was");
+    assert!(
+        outcome.is_err(),
+        "aborting an unknown upload reported success"
+    );
+});
+
 s3_test!(a_range_read_still_works_on_a_multipart_object, store, {
     // Pack reads are ranged, and a multipart object is the case where the
     // server assembled it from pieces. A range that straddles a part boundary
@@ -330,3 +451,47 @@ s3_test!(an_empty_bucket_restores_nothing_and_says_so, store, {
     assert!(!restored);
 });
 
+
+// ─── housekeeping ───────────────────────────────────────────────────
+
+/// Empty the test bucket, objects and abandoned uploads alike.
+///
+///     cargo test --test s3_minio -- --ignored cleanup
+///
+/// Ignored by default because it deletes: running it as part of the suite
+/// would race the tests it shares a bucket with. It exists because the two
+/// kinds of leftover need different calls — objects come from `list`, and
+/// unfinished uploads are invisible to it — so "the bucket is empty" is not
+/// something a single listing can tell you.
+#[test]
+#[ignore]
+fn cleanup_the_bucket() {
+    let Some(store) = backend("") else {
+        eprintln!("skipped: MOONCLIP_S3_ENDPOINT is not set");
+        return;
+    };
+
+    let uploads = store
+        .list_multipart_uploads("")
+        .expect("listing multipart uploads");
+    for (key, id) in &uploads {
+        match store.abort_multipart_upload(key, id) {
+            Ok(()) => eprintln!("abandoned upload {id} on {key}"),
+            Err(e) => eprintln!("could not abandon {id} on {key}: {e}"),
+        }
+    }
+
+    let keys = store.list("").expect("listing");
+    for key in &keys {
+        match store.delete(key) {
+            Ok(()) => eprintln!("deleted {key}"),
+            Err(e) => eprintln!("could not delete {key}: {e}"),
+        }
+    }
+
+    eprintln!(
+        "removed {} object(s) and {} abandoned upload(s)",
+        keys.len(),
+        uploads.len()
+    );
+}

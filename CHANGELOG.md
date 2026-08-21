@@ -23,6 +23,23 @@
   from the remote, and brings back the whole store rather than only its
   snapshots — a caller's sidecar files come back with it.
 
+- **The multipart threshold is configurable**, `S3Config::single_put_limit`,
+  defaulting to `SINGLE_PUT_LIMIT` as before. It exists so the choice can be
+  tested: at the default, the only way to watch `put` take the multipart path
+  is to actually move four gigabytes, which on an ordinary uplink is over an
+  hour. That the ceiling is real is the service's business and documented;
+  that we dispatch on it is ours, and now a test says so for a few megabytes.
+- **`list_multipart_uploads` and `abort_multipart_upload`.** Parts belonging
+  to an unfinished upload do not appear in `ListObjectsV2`, so `list` cannot
+  see them, retention never reclaims them, and the bill counts them the whole
+  time. `put_multipart` has always aborted on every way out other than
+  success — but nothing could check that it did, and an upload interrupted by
+  a machine going away was nobody's to clean up. Now both are possible.
+- **`etag`**, which reports what the service says about an object. The cheap
+  way to tell how one was written: a multipart upload's ETag ends in
+  `-<part count>` and a single `PUT`'s does not, on S3 and R2 alike, though
+  the two compute the hash differently.
+
 ### Fixed — data loss
 
 - **A merge could unlink a base a rank was still writing against.**
