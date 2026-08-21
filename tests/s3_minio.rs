@@ -33,6 +33,7 @@
 //! MOONCLIP_S3_ACCESS_KEY=...  MOONCLIP_S3_SECRET_KEY=...
 //! ```
 
+use moonclip::error::MoonclipError;
 use moonclip::s3::{S3Config, S3Storage};
 use moonclip::storage::StorageBackend;
 
@@ -367,15 +368,37 @@ s3_test!(a_finished_upload_leaves_nothing_holding_storage, store, {
     store.delete("tidy.pack").expect("deleting");
 });
 
-s3_test!(abandoning_an_upload_that_does_not_exist_is_an_error, store, {
-    // Abandoning an upload that is not there has to be reported, not shrugged
-    // off. This is the call the cleanup path depends on, and a silent success
-    // would mean a caller believing it had reclaimed storage it had not.
+s3_test!(abandoning_an_upload_that_does_not_exist_is_answered, store, {
+    // What this pins is that the request is well-formed — signed, with the
+    // `uploadId` where the service expects it — and comes back rather than
+    // hanging or failing at the transport.
+    //
+    // It deliberately does **not** pin which answer. The services disagree,
+    // and finding that out cost a red CI job: R2 and S3 report `NoSuchUpload`,
+    // MinIO reports success. An earlier version of this test asserted the
+    // error, passed against R2, and failed against the MinIO the branch guard
+    // runs on.
+    //
+    // The divergence has a consequence worth writing down: **an error from
+    // this call does not mean "already gone", and success does not mean "there
+    // was something there"**. Cleanup code that reads either as proof of the
+    // upload's state would be wrong on one of the two. `put_multipart` is
+    // safe on that count — it only reports a failed abort — and
+    // `cleanup_the_bucket` acts on what `list_multipart_uploads` returns
+    // rather than on what abort says.
     let outcome = store.abort_multipart_upload("nothing.pack", "an-upload-id-that-never-was");
-    assert!(
-        outcome.is_err(),
-        "aborting an unknown upload reported success"
-    );
+
+    match outcome {
+        Ok(()) => {}
+        Err(MoonclipError::NotFound(_)) => {}
+        Err(MoonclipError::Storage(message)) => {
+            assert!(
+                message.contains("404") || message.to_lowercase().contains("nosuchupload"),
+                "the service refused for some reason other than the upload being absent: {message}"
+            );
+        }
+        Err(other) => panic!("the abort request itself did not get through: {other}"),
+    }
 });
 
 s3_test!(a_range_read_still_works_on_a_multipart_object, store, {
