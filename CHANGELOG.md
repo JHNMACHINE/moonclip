@@ -1,6 +1,13 @@
 # Changelog
 
-## Unreleased
+## 0.0.8 — 2026-08-21
+
+S3 stopped being a one-way street. A gathered checkpoint of a 1B model with
+Adam is around 11 GiB, and every write was a single `PUT` — which S3 refuses
+over 5 GiB. What did arrive could not be read back either, because the remote
+support only ever pushed. Both were found on a six-node bench rather than in
+the tests, which run against MinIO: it accepts what S3 does not, and that is
+the whole reason neither showed up in 0.0.7.
 
 ### Added
 
@@ -22,7 +29,6 @@
   and took every other rank with it. `restore_from_remote` fills an empty store
   from the remote, and brings back the whole store rather than only its
   snapshots — a caller's sidecar files come back with it.
-
 - **The multipart threshold is configurable**, `S3Config::single_put_limit`,
   defaulting to `SINGLE_PUT_LIMIT` as before. It exists so the choice can be
   tested: at the default, the only way to watch `put` take the multipart path
