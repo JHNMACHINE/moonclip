@@ -48,9 +48,11 @@ def main():
     rank = dist.get_rank()
     world_size = dist.get_world_size()
 
-    # 1. The manager reads the topology out of the environment, the way it
-    #    would under torchrun.
-    manager = CheckpointManager(storage_root=args.dir)
+    # 1. The manager takes the topology from the environment, the way it would
+    #    under torchrun. Asked for by name since 0.0.9: it used to happen on
+    #    its own, which meant the same code behaved differently depending on
+    #    the launcher, and nothing said so.
+    manager = CheckpointManager(storage_root=args.dir, world_size="auto", rank="auto")
     assert manager.world_size == world_size, (
         f"world_size: got {manager.world_size}, expected {world_size}"
     )
@@ -79,7 +81,7 @@ def main():
         for param in model.parameters():
             param.zero_()
 
-    reloaded = CheckpointManager(storage_root=args.dir)
+    reloaded = CheckpointManager(storage_root=args.dir, world_size="auto", rank="auto")
     reloaded.load_latest(model=ddp_model, optimizer=optimizer)
     dist.barrier()
 

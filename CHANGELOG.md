@@ -10,7 +10,23 @@ parameter back to bf16 by hand. That is a bug, and the fix is lossless.
 `save_dtype="fp8"` is the other half, and it is a trade: a quarter of the size
 for four significant bits.
 
+Alongside it, two pieces of the Python surface stop being surprising:
+`CheckpointManager` no longer works out its own topology from the launcher's
+environment variables, and `flatten_state_dict` finally has a public inverse.
+The first is a behaviour change and the migration is one line — see below.
+
 ### Added
+
+- **`unflatten_state_dict`**, the inverse of `flatten_state_dict` and public
+  for the same reason it is. A caller that flattened its own state and handed
+  the result to `save_tensors` had no supported way back: the only
+  implementation lived inside `CheckpointManager._apply_loaded`, welded to the
+  step that calls `load_state_dict` on live objects. Anything holding the
+  bytes but no objects — a converter, a checkpoint inspector, Ravex — had to
+  either reimplement it or accept the applying it did not want. It reads both
+  shapes that get written, `<prefix>._blob` and `<prefix>._metadata`, and
+  `_apply_loaded` is now that function plus the loop that applies.
+
 
 - **Float8 tensors can be stored.** `torch.float8_e4m3fn`, `torch.float8_e5m2`
   and the four variants this torch exposes (`e4m3fnuz`, `e5m2fnuz`, `e8m0fnu`,
@@ -59,10 +75,44 @@ for four significant bits.
 
 ### Changed
 
+- **`CheckpointManager` no longer decides its own topology.** It used to read
+  `RANK`/`WORLD_SIZE` from the environment whenever it was not told, and adopt
+  them. That looked like a convenience and behaved like a trap, because
+  adopting a detected world size can only ever take capability away: `save()`
+  refuses outright when `world_size != 1`, directing the caller to the
+  explicit `create_snapshot`/`save_rank`/`finalize_snapshot` flow. So the same
+  code saved fine under `python train.py` and raised under `torchrun`, decided
+  by nothing the code could see.
+
+  Ravex is where that bill came due. It builds a manager per rank against a
+  directory per rank — every store single-rank by construction — caught the
+  refusal in the `except` around backend construction, and fell back to
+  `torch.save` with a single log line. Every distributed run quietly lost
+  Moonclip checkpointing and kept training.
+
+  The environment is now consulted only to decide whether the question is
+  ambiguous. **A single process is unaffected**: nothing to disagree with is
+  still `(1, 0)`, no configuration, exactly as before. Under a launcher saying
+  otherwise, with nothing stated, construction raises and the message names
+  both detected numbers and all three ways forward. `world_size="auto",
+  rank="auto"` is the old behaviour, still available and now asked for by
+  name.
+
+  Migration is one line, and there is no silent path: any run affected gets an
+  error telling it what to write.
+
+- `_env.py` claimed "No PyTorch dependency" while importing
+  `torch.distributed` in its first detection step. The import was always
+  optional and local, and the module only ever loads under `moonclip.pytorch`
+  — which is the layer allowed to know about torch — so the code was fine and
+  the sentence was not.
+
+
 - `TensorEntry` gained `quant_scale`, optional and defaulted. Manifests
   written before this deserialize unchanged — they hold no float8 entries, so
   the absent value is the correct one rather than a missing one. The format
   version is unmoved at 2.
+
 
 ## 0.0.8 — 2026-08-21
 

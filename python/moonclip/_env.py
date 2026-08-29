@@ -1,6 +1,14 @@
 """
 Auto-detection of distributed training environment.
-No PyTorch dependency — uses only env vars and optional torch.distributed.
+
+Imports of torch are optional and local, so this module is safe to reach from
+anywhere in the package; it lives under `moonclip.pytorch` regardless, which
+is the layer allowed to know about torch. `import moonclip` does not pull in
+either.
+
+Detecting is not the same as adopting. Since 0.0.9 `CheckpointManager` calls
+this to decide whether the topology question is ambiguous, and adopts the
+answer only when asked to — see `_resolve_topology`.
 """
 
 from __future__ import annotations

@@ -232,3 +232,13 @@ class MoonclipManager:
         Force sync all local data to remote S3 storage immediately.
         """
         ...
+
+    def restore_from_remote(self) -> bool:
+        """
+        Fill an empty store from the remote. Returns whether anything came.
+
+        For a machine that came up without the store it had. Call it before
+        reading anything: it replaces the manifest this manager loaded when
+        the store was still empty.
+        """
+        ...

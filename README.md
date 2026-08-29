@@ -120,17 +120,32 @@ mgr = CheckpointManager(
 
 ## Multi-GPU (FSDP / DDP)
 
-Moonclip auto-detects `torchrun` environment variables. No configuration needed:
+Say which topology the manager is for. Under `torchrun`, `"auto"` takes it
+from the launcher:
 
 ```bash
 torchrun --nproc_per_node=8 train.py
 ```
 
 ```python
-mgr = CheckpointManager("./checkpoints")
-# mgr.rank == 3, mgr.world_size == 8  (auto-detected)
+mgr = CheckpointManager("./checkpoints", world_size="auto", rank="auto")
+# mgr.rank == 3, mgr.world_size == 8
 start_step = mgr.resume(model=model, optimizer=optimizer)
 ```
+
+The ranks then share one store, through the explicit
+`create_snapshot` / `save_rank` / `finalize_snapshot` flow. If instead each
+rank writes to a directory of its own — one store per process, no coordination
+— then every one of them is single-rank and should say so:
+
+```python
+mgr = CheckpointManager(f"./checkpoints/rank_{rank}", world_size=1, rank=0)
+```
+
+Until 0.0.9 the launcher's variables were adopted whenever nothing was stated.
+That is no longer the default: leaving it unsaid under a multi-rank launcher
+is an error naming both numbers and the ways forward. A single process is
+unaffected and still needs no configuration.
 
 ## Tuning
 

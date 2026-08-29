@@ -84,11 +84,16 @@ class TestCheckpointManagerAutoDetect:
         pytest.importorskip("torch")
 
     def test_auto_detect_from_env(self, tmp_path, monkeypatch):
+        """Detection happens when it is asked for. Since 0.0.9 leaving this
+        unsaid under a multi-rank launcher is an error rather than a guess —
+        covered in test_pytorch.py::TestTopologyIsStated."""
         monkeypatch.setenv("RANK", "2")
         monkeypatch.setenv("WORLD_SIZE", "4")
 
         from moonclip import CheckpointManager
-        mgr = CheckpointManager(storage_root=str(tmp_path))
+        mgr = CheckpointManager(
+            storage_root=str(tmp_path), world_size="auto", rank="auto"
+        )
         assert mgr.world_size == 4
         assert mgr.rank == 2
 

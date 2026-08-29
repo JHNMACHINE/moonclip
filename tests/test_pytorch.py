@@ -482,3 +482,143 @@ class TestFloat8:
 
         with pytest.raises(Exception, match="fp8"):
             MoonclipManager(storage_root=str(tmp_path), save_dtype="fp8_e3m4")
+
+
+class TestTopologyIsStated:
+    """Which topology a manager is for is answered by the caller, not guessed.
+
+    It used to be guessed, and guessing could only ever take capability away:
+    `Coordinator::save` refuses when `world_size != 1`, so adopting a detected
+    world size turned the single-rank `save()` into an error decided by how
+    the process happened to be launched. Nothing in the code said so.
+    """
+
+    @staticmethod
+    def _launcher(monkeypatch, rank, world_size):
+        monkeypatch.setenv("RANK", str(rank))
+        monkeypatch.setenv("WORLD_SIZE", str(world_size))
+
+    def test_one_process_is_still_one_store(self, tmp_path, monkeypatch):
+        """The unchanged case, and the common one: nothing to disagree with."""
+        monkeypatch.delenv("RANK", raising=False)
+        monkeypatch.delenv("WORLD_SIZE", raising=False)
+
+        mgr = CheckpointManager(storage_root=str(tmp_path))
+        assert (mgr.world_size, mgr.rank) == (1, 0)
+
+    def test_an_unanswered_launcher_is_refused_not_adopted(self, tmp_path, monkeypatch):
+        self._launcher(monkeypatch, 3, 8)
+
+        with pytest.raises(ValueError) as caught:
+            CheckpointManager(storage_root=str(tmp_path))
+
+        message = str(caught.value)
+        # The numbers it saw, so nobody has to go looking for them.
+        assert "rank 3 of 8" in message
+        # And every way out, because an error that only says "no" makes the
+        # reader guess, which is what this whole change is against.
+        assert "world_size=1, rank=0" in message
+        assert "world_size=8, rank=3" in message
+        assert 'world_size="auto"' in message
+
+    def test_auto_still_reads_the_launcher(self, tmp_path, monkeypatch):
+        """The old behaviour is still reachable — it just has to be asked for."""
+        self._launcher(monkeypatch, 3, 8)
+
+        mgr = CheckpointManager(
+            storage_root=str(tmp_path), world_size="auto", rank="auto"
+        )
+        assert (mgr.world_size, mgr.rank) == (8, 3)
+
+    def test_stated_values_beat_the_launcher(self, tmp_path, monkeypatch):
+        """The case Ravex depends on: every rank writes to its own directory,
+        so each store is single-rank however many processes there are."""
+        self._launcher(monkeypatch, 3, 8)
+
+        mgr = CheckpointManager(storage_root=str(tmp_path), world_size=1, rank=0)
+        assert (mgr.world_size, mgr.rank) == (1, 0)
+
+        # And the single-rank save API works, which is the whole point: under
+        # the old detection this raised "Multi-rank save requires explicit
+        # create_snapshot/save_rank/finalize flow".
+        mgr.save(step=0, model=torch.nn.Linear(8, 4))
+        mgr.flush()
+        assert mgr.list_snapshots()
+
+    def test_half_an_answer_is_still_an_answer(self, tmp_path, monkeypatch):
+        """Stating one and detecting the other is legal; it is stating neither
+        that is ambiguous."""
+        self._launcher(monkeypatch, 3, 8)
+
+        mgr = CheckpointManager(storage_root=str(tmp_path), world_size="auto", rank=0)
+        assert (mgr.world_size, mgr.rank) == (8, 0)
+
+
+class TestUnflattenStateDict:
+    """`flatten_state_dict` is public; until 0.0.9 its inverse was not.
+
+    The only implementation lived inside `CheckpointManager._apply_loaded`,
+    welded to the step that calls `load_state_dict` on live objects — so a
+    caller holding the bytes but no objects had to reimplement it or take the
+    applying it did not want.
+    """
+
+    def _trained(self):
+        torch.manual_seed(0)
+        model = torch.nn.Linear(16, 8)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        model(torch.randn(4, 16)).sum().backward()
+        optimizer.step()
+        return model, optimizer
+
+    def test_it_is_reachable_from_the_package(self):
+        import moonclip
+
+        assert callable(moonclip.unflatten_state_dict)
+        assert "unflatten_state_dict" in moonclip.__all__
+
+    def test_it_undoes_a_save_without_touching_any_object(self, tmp_path):
+        from moonclip import MoonclipManager, unflatten_state_dict
+
+        model, optimizer = self._trained()
+        mgr = CheckpointManager(storage_root=str(tmp_path), async_save=False)
+        mgr.save(step=1, model=model, optimizer=optimizer)
+        mgr.flush()
+
+        # Read through the low-level manager, which returns the flat map and
+        # applies nothing — the position Ravex is in.
+        raw = MoonclipManager(storage_root=str(tmp_path)).load_latest()[1]
+        rebuilt = unflatten_state_dict(raw)
+
+        assert set(rebuilt) == {"model", "optimizer"}
+        for name, value in model.state_dict().items():
+            assert torch.equal(rebuilt["model"][name], value), name
+        # The optimizer travels as one pickled blob rather than per-tensor, so
+        # this also covers the second of the two shapes that get written.
+        assert rebuilt["optimizer"]["param_groups"][0]["lr"] == 1e-3
+
+    def test_it_agrees_with_the_applying_path(self, tmp_path):
+        """Same bytes, same answer, whether or not objects were handed over.
+        The applying path is the one everything else already trusts."""
+        from moonclip import MoonclipManager, unflatten_state_dict
+
+        model, optimizer = self._trained()
+        mgr = CheckpointManager(storage_root=str(tmp_path), async_save=False)
+        mgr.save(step=1, model=model, optimizer=optimizer)
+        mgr.flush()
+
+        _, applied = CheckpointManager(storage_root=str(tmp_path)).load_latest()
+        raw = MoonclipManager(storage_root=str(tmp_path)).load_latest()[1]
+        rebuilt = unflatten_state_dict(raw)
+
+        assert set(applied) == set(rebuilt)
+        for name, value in applied["model"].items():
+            assert torch.equal(rebuilt["model"][name], value), name
+
+    def test_names_it_cannot_rebuild_are_left_out(self):
+        """Not guessed at, and not an exception either: a store may hold
+        tensors this never wrote, and reporting on them is not its job."""
+        from moonclip import unflatten_state_dict
+
+        assert unflatten_state_dict({}) == {}
+        assert unflatten_state_dict({"loose/tensor": b"\x00\x01"}) == {}

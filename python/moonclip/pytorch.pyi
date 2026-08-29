@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 def flatten_state_dict(
     state_dict: dict,
@@ -8,8 +8,17 @@ def flatten_state_dict(
     """Flatten a PyTorch state_dict into individual tensors."""
     ...
 
+def unflatten_state_dict(raw: dict) -> Dict[str, Any]:
+    """Rebuild the state dicts that flatten_state_dict took apart.
+
+    Takes the flat {name: bytes} map as MoonclipManager.load returns it, and
+    gives back {prefix: state_dict}. Applies to nothing — for a caller that
+    wants the objects loaded as well, that is CheckpointManager.load.
+    """
+    ...
+
 class CheckpointManager:
-    """PyTorch-aware checkpoint manager with auto-detection of torchrun environment."""
+    """PyTorch-aware checkpoint manager."""
 
     world_size: int
     rank: int
@@ -26,8 +35,8 @@ class CheckpointManager:
         max_deltas_per_full: int = 10,
         full_every_steps: int = 5000,
         delta_max_ratio: float = 0.95,
-        world_size: Optional[int] = None,
-        rank: Optional[int] = None,
+        world_size: Union[int, str, None] = None,
+        rank: Union[int, str, None] = None,
         merge_stride: int = 0,
         merge_max_chain: int = 10,
         save_dtype: str = "none",

@@ -15,7 +15,7 @@ import ctypes
 import os
 import pickle
 import sys
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
 
@@ -448,6 +448,116 @@ def flatten_state_dict(
     return tensors_out, metadata
 
 
+def _resolve_topology(world_size, rank) -> Tuple[int, int]:
+    """Settle what topology this manager is for, or refuse to guess.
+
+    Until 0.0.9 an unstated topology was read out of the environment and
+    adopted silently. That looked like a convenience and behaved like a trap,
+    because adopting it can only ever take capability away: `Coordinator::save`
+    refuses outright when `world_size != 1`, directing the caller to the
+    explicit create_snapshot/save_rank/finalize flow. So the same code saved
+    fine under `python train.py` and raised under `torchrun`, decided by
+    nothing the code could see.
+
+    Ravex is where that bill came due. It builds this manager per rank, caught
+    the refusal in the `except` around backend construction, and fell back to
+    `torch.save` with a single log line — so every distributed run quietly
+    lost Moonclip checkpointing and kept training.
+
+    Now the environment is consulted only to decide whether the question is
+    ambiguous. One process and nothing to disagree with is still (1, 0), so
+    single-process callers see no change at all. A launcher that says
+    otherwise, with nothing stated here, is an error naming both numbers and
+    the ways forward — including `"auto"`, which is the old behaviour, still
+    available and now asked for.
+    """
+    if world_size == "auto" or rank == "auto":
+        detected_world_size, detected_rank = _detect_distributed_env()
+        if world_size == "auto":
+            world_size = detected_world_size
+        if rank == "auto":
+            rank = detected_rank
+
+    if world_size is not None and rank is not None:
+        return int(world_size), int(rank)
+
+    detected_world_size, detected_rank = _detect_distributed_env()
+    if detected_world_size <= 1:
+        # Nothing to disagree with: one process, one store.
+        return (
+            1 if world_size is None else int(world_size),
+            0 if rank is None else int(rank),
+        )
+
+    raise ValueError(
+        "\n".join(
+            [
+                "the launcher says this is rank %d of %d, and CheckpointManager "
+                "was not told which topology to use. Until 0.0.9 it adopted "
+                "those numbers silently, which turned save() into an error "
+                "decided by how the process was started. Say which you want:"
+                % (detected_rank, detected_world_size),
+                "  world_size=1, rank=0            one store per process, which "
+                "is what you want when each rank writes to its own directory",
+                "  world_size=%d, rank=%d            these ranks share one "
+                "store, through create_snapshot/save_rank/finalize"
+                % (detected_world_size, detected_rank),
+                '  world_size="auto", rank="auto"  whatever the launcher says, '
+                "which is what happened before 0.0.9",
+            ]
+        )
+    )
+
+
+def unflatten_state_dict(raw: dict) -> Dict[str, Any]:
+    """Rebuild the state dicts that :func:`flatten_state_dict` took apart.
+
+    The inverse, and public because the forward direction is: a caller that
+    flattens its own state and hands the result to ``save_tensors`` had no
+    supported way back, and the only implementation lived inside
+    ``CheckpointManager._apply_loaded`` welded to the step that calls
+    ``load_state_dict`` on live objects. Anything holding the bytes but no
+    objects — a converter, a checkpoint inspector, Ravex — had to either
+    reimplement this or take the applying it did not want.
+
+    Args:
+        raw: ``{name: bytes}`` exactly as ``MoonclipManager.load`` and
+            ``load_latest`` return it.
+
+    Returns:
+        ``{prefix: state_dict}``, one entry per prefix that was flattened —
+        ``"model"``, ``"optimizer"``, and whatever else the caller named.
+        Prefixes with no recoverable structure are left out rather than
+        guessed at.
+
+    Two shapes are read, because two were written. A ``<prefix>._blob`` entry
+    is a whole pickled state dict, which is what optimizer and scheduler state
+    became once storing their scalars as individual tensors turned out to cost
+    more in manifest entries than it saved. A ``<prefix>._metadata`` entry is
+    the older per-tensor form, still what model weights use, where the pickle
+    holds the tree with placeholders and the tensors are separate entries —
+    which is the form that makes per-tensor delta tracking possible at all.
+
+    A prefix carrying both is read as a blob: that is the newer writer, and it
+    is self-contained.
+    """
+    result: Dict[str, Any] = {}
+
+    for key, value in raw.items():
+        if key.endswith("._blob"):
+            result[key[: -len("._blob")]] = pickle.loads(value)
+
+    for key, value in raw.items():
+        if not key.endswith("._metadata"):
+            continue
+        prefix = key[: -len("._metadata")]
+        if prefix in result:
+            continue
+        result[prefix] = _reconstruct_from_tensors(pickle.loads(value), raw)
+
+    return result
+
+
 class CheckpointManager:
     """
     PyTorch-aware wrapper around MoonclipManager.
@@ -464,8 +574,8 @@ class CheckpointManager:
         max_deltas_per_full: int = 10,
         full_every_steps: int = 5000,
         delta_max_ratio: float = 0.95,
-        world_size: Optional[int] = None,
-        rank: Optional[int] = None,
+        world_size: Union[int, str, None] = None,
+        rank: Union[int, str, None] = None,
         merge_stride: int = 0,
         merge_max_chain: int = 10,
         save_dtype: str = "none",
@@ -487,13 +597,7 @@ class CheckpointManager:
                 "take the default (0.95), or set delta_max_ratio explicitly."
             )
 
-        # Auto-detect from torchrun / torch.distributed environment
-        if world_size is None or rank is None:
-            detected_world_size, detected_rank = _detect_distributed_env()
-            if world_size is None:
-                world_size = detected_world_size
-            if rank is None:
-                rank = detected_rank
+        world_size, rank = _resolve_topology(world_size, rank)
 
         self.world_size = world_size
         self.rank = rank
@@ -673,13 +777,12 @@ class CheckpointManager:
             return snap_id, state_dicts
 
     def _apply_loaded(self, raw, model, optimizer, scheduler, scaler):
-        """Group loaded tensors by prefix and apply to objects.
+        """Rebuild the state dicts in `raw`, then load them into the objects.
 
-        Supports two formats:
-        - Blob: prefix._blob → single pickled state_dict (new, for optimizer/scheduler)
-        - Per-tensor: prefix._metadata + individual tensors (original, for model weights)
+        The rebuilding is `unflatten_state_dict`; everything left here is the
+        applying, which is the half a caller holding no objects does not want.
         """
-        result = {}
+        result = unflatten_state_dict(raw)
 
         prefix_to_obj = {}
         if model is not None:
@@ -691,28 +794,10 @@ class CheckpointManager:
         if scaler is not None:
             prefix_to_obj["scaler"] = scaler
 
-        # First pass: load blobs (optimizer/scheduler/scaler)
-        for key, value in raw.items():
-            if key.endswith("._blob"):
-                prefix = key[:-6]  # strip "._blob"
-                sd = pickle.loads(value)
-                obj = prefix_to_obj.get(prefix)
-                if obj is not None and hasattr(obj, "load_state_dict"):
-                    obj.load_state_dict(sd)
-                result[prefix] = sd
-
-        # Second pass: load per-tensor (model weights, or old-format optimizer)
-        for key, value in raw.items():
-            if key.endswith("._metadata"):
-                prefix = key[:-10]  # strip "._metadata"
-                if prefix in result:
-                    continue  # already loaded via blob
-                meta = pickle.loads(value)
-                sd = _reconstruct_from_tensors(meta, raw)
-                obj = prefix_to_obj.get(prefix)
-                if obj is not None and hasattr(obj, "load_state_dict"):
-                    obj.load_state_dict(sd)
-                result[prefix] = sd
+        for prefix, state in result.items():
+            obj = prefix_to_obj.get(prefix)
+            if obj is not None and hasattr(obj, "load_state_dict"):
+                obj.load_state_dict(state)
 
         return result
 
