@@ -33,6 +33,19 @@ pub struct TensorEntry {
     /// If None, dtype == original dtype (no cast was applied).
     #[serde(default)]
     pub original_dtype: Option<String>,
+    /// Dequantization multiplier for a tensor stored in a float8 `dtype`:
+    /// `original ≈ stored × quant_scale`, elementwise.
+    ///
+    /// `None` for every other dtype, which needs no side channel to be read
+    /// back. Optional and defaulted so manifests written before float8
+    /// existed still deserialize — they carry no float8 entries, so `None` is
+    /// not a missing value there but the correct one.
+    ///
+    /// A tensor that arrives *already* float8 stores no scale either: it is
+    /// copied byte for byte and `original_dtype` stays `None`, so nothing on
+    /// the load path tries to undo a cast that never happened.
+    #[serde(default)]
+    pub quant_scale: Option<f32>,
     /// How this tensor is stored.
     pub storage: TensorStorage,
     /// For `Alias`: the name of the tensor in this same snapshot that

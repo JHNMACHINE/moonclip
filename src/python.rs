@@ -38,6 +38,23 @@ fn get_element_size(dtype: &str) -> PyResult<usize> {
         // difference between two routes to the same bytes.
         "torch.complex64" => Ok(8),
         "torch.complex128" => Ok(16),
+        // Float8, one byte each. Until 0.0.9 these fell to the arm below, so
+        // a model doing FSDP2 or torchao float8 training could not checkpoint
+        // through the direct tensor path at all — it got "unsupported dtype
+        // torch.float8_e4m3fn" and no way forward but converting every
+        // parameter back to bf16 by hand. Nothing else was needed to store
+        // them: Moonclip reads the tensor's buffer, and the buffer is bytes.
+        //
+        // All six are listed rather than the two anyone uses, because the
+        // cost of a name is one match arm and the cost of a missing one is
+        // that same hard failure, on the day someone runs on AMD (`fnuz`) or
+        // turns on MX scaling (`e8m0fnu`).
+        "torch.float8_e4m3fn"
+        | "torch.float8_e5m2"
+        | "torch.float8_e4m3fnuz"
+        | "torch.float8_e5m2fnuz"
+        | "torch.float8_e8m0fnu"
+        | "torch.float8_e4m3b11fnuz" => Ok(1),
         _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
             "unsupported dtype {}",
             dtype

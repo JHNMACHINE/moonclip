@@ -61,6 +61,7 @@ Resume integrity verified: max weight diff 0.0 after save → load.
 - **Per-tensor delta tracking** — unchanged tensors are skipped entirely (zero I/O), changed tensors use XOR delta compression; a cheap sampled density check bails out early when everything changed
 - **Parallel zstd** — large tensors are compressed/decompressed as concatenated zstd frames across all cores
 - **Rust-native dtype casting** — `save_dtype="bf16"` casts fp32→bf16 in parallel Rust threads before compression, auto-uncasts on load
+- **Float8** — tensors that arrive as `float8_e4m3fn`/`float8_e5m2` (FSDP2, torchao) are stored bit-exact with no configuration. `save_dtype="fp8"` additionally quantizes fp32/bf16 down to one byte per element against a per-tensor scale — a quarter the size, four significant bits, so for archived copies rather than checkpoints you resume from
 - **4KB page-aligned writes** — eliminates SSD write amplification, extends drive lifespan
 - **Rank-aware distributed saves** — each rank saves its own shard independently, auto-detects `torchrun` env vars
 - **Hierarchical delta merging** — background thread consolidates deltas to keep load times fast
@@ -155,7 +156,7 @@ same time.
 
 ```
 src/
-├── cast.rs          # Rust-native fp32↔bf16/fp16 casting (rayon parallel)
+├── cast.rs          # Rust-native fp32↔bf16/fp16/float8 casting (rayon parallel)
 ├── coordinator.rs   # Rank-aware snapshot lifecycle
 ├── tensor.rs        # Per-tensor delta tracking and storage
 ├── manifest.rs      # Manifest v2: per-rank, per-tensor, lineage

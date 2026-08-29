@@ -185,12 +185,20 @@ pub fn dedup_plan(tensors: &[TensorData]) -> Vec<Option<String>> {
 /// Build the entry for a tensor whose bytes live under another name.
 /// Metadata is inherited from the tensor that was actually stored, so the
 /// two agree on dtype, cast and hash; only name and shape are its own.
+///
+/// Inheriting `quant_scale` is safe for the same reason the rest is: aliasing
+/// is decided by [`dedup_plan`] on the *pre-cast* bytes, so two aliased
+/// tensors held the same values before quantization, hence the same amax,
+/// hence the same scale. Were aliasing ever moved onto the quantized bytes,
+/// this line would become a silent scale error on every tensor that happens
+/// to be an exact multiple of another.
 pub fn make_alias_entry(tensor: &TensorData, target: &TensorEntry) -> TensorEntry {
     TensorEntry {
         name: tensor.name.clone(),
         shape: tensor.shape.clone(),
         dtype: target.dtype.clone(),
         original_dtype: target.original_dtype.clone(),
+        quant_scale: target.quant_scale,
         storage: TensorStorage::Alias,
         alias_of: Some(target.name.clone()),
         filename: None,
@@ -218,12 +226,12 @@ pub fn process_tensor(
     use std::borrow::Cow;
 
     // Cast if requested and applicable — otherwise borrow without cloning
-    let (working_data, working_dtype): (Cow<[u8]>, Cow<str>) =
+    let (working_data, working_dtype, quant_scale): (Cow<[u8]>, Cow<str>, Option<f32>) =
         if *save_dtype != DType::None && is_castable_float(&tensor.dtype) {
-            let (d, t) = cast::cast_tensor(&tensor.data, &tensor.dtype, save_dtype)?;
-            (Cow::Owned(d), Cow::Owned(t))
+            let (d, t, s) = cast::cast_tensor(&tensor.data, &tensor.dtype, save_dtype)?;
+            (Cow::Owned(d), Cow::Owned(t), s)
         } else {
-            (Cow::Borrowed(&tensor.data), Cow::Borrowed(&tensor.dtype))
+            (Cow::Borrowed(&tensor.data), Cow::Borrowed(&tensor.dtype), None)
         };
 
     let raw_hash = profile::time(profile::Phase::RawHash, || hash_hex(&working_data));
@@ -245,6 +253,7 @@ pub fn process_tensor(
                         shape: tensor.shape.clone(),
                         dtype: working_dtype.to_string(),
                         original_dtype: orig_dtype.clone(),
+                        quant_scale,
                         storage: TensorStorage::Skipped,
                         alias_of: None,
                         filename: None,
@@ -345,6 +354,7 @@ pub fn process_tensor(
                                     shape: tensor.shape.clone(),
                                     dtype: working_dtype.to_string(),
                                     original_dtype: orig_dtype.clone(),
+                                    quant_scale,
                                     storage: TensorStorage::DeltaXor,
                                     alias_of: None,
                                     filename: None, // Set by coordinator after packing
@@ -365,7 +375,15 @@ pub fn process_tensor(
     }
 
     // Full save
-    make_full_entry(tensor, &working_data, &working_dtype, &orig_dtype, &raw_hash, compression)
+    make_full_entry(
+        tensor,
+        &working_data,
+        &working_dtype,
+        &orig_dtype,
+        quant_scale,
+        &raw_hash,
+        compression,
+    )
 }
 
 fn make_full_entry(
@@ -373,6 +391,7 @@ fn make_full_entry(
     working_data: &[u8],
     working_dtype: &str,
     original_dtype: &Option<String>,
+    quant_scale: Option<f32>,
     raw_hash: &str,
     compression: &CompressionAlgo,
 ) -> Result<ProcessedTensor> {
@@ -387,6 +406,7 @@ fn make_full_entry(
             shape: tensor.shape.clone(),
             dtype: working_dtype.to_string(),
             original_dtype: original_dtype.clone(),
+            quant_scale,
             storage: TensorStorage::Full,
             alias_of: None,
             filename: None, // Set by coordinator after packing
@@ -428,7 +448,7 @@ pub fn load_tensor(
     // Uncast if needed (e.g. bf16 on disk → fp32 for training)
     if let Some(ref orig_dtype) = entry.original_dtype {
         if orig_dtype != &entry.dtype {
-            return cast::uncast_tensor(&raw, &entry.dtype, orig_dtype);
+            return cast::uncast_tensor(&raw, &entry.dtype, orig_dtype, entry.quant_scale);
         }
     }
 
@@ -754,6 +774,7 @@ mod tests {
             hash_compressed: None,
             shuffled: false,
             original_dtype: None,
+            quant_scale: None,
         };
 
         let cache = make_base_cache(Arc::clone(&storage), vec![base_entry], &compression);
@@ -804,6 +825,7 @@ mod tests {
             hash_compressed: None,
             shuffled: false,
             original_dtype: None,
+            quant_scale: None,
         };
 
         let cache = make_base_cache(Arc::clone(&storage), vec![base_entry], &compression);
@@ -859,6 +881,7 @@ mod tests {
             hash_compressed: None,
             shuffled: false,
             original_dtype: None,
+            quant_scale: None,
         };
 
         let cache = make_base_cache(Arc::clone(&storage), vec![base_entry], &compression);
@@ -1030,6 +1053,7 @@ mod tests {
             shape: vec![40_000],
             dtype: "float32".into(),
             original_dtype: None,
+            quant_scale: None,
             storage: TensorStorage::Full,
             alias_of: None,
             filename: Some("nowhere/w.bin".into()),
@@ -1241,6 +1265,164 @@ mod tests {
             got.len(),
             data.len(),
             "load must uncast back to fp32 width, not hand back bf16"
+        );
+    }
+
+    /// The float8 equivalent of `a_cast_tensor_comes_back_in_its_original_dtype`,
+    /// and the one that proves the scale survives the manifest: the value is
+    /// carried on the entry, not alongside the bytes, so a save path that
+    /// computed it correctly and a load path that never read it would both
+    /// look right in isolation.
+    #[test]
+    fn a_float8_tensor_comes_back_scaled_and_in_its_original_dtype() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(dir.path()).unwrap());
+        let compression = CompressionAlgo::Zstd { level: 1 };
+
+        // Weight-shaped values well outside float8's own ±448: without the
+        // scale being applied on both sides, nothing here can come back.
+        let values: Vec<f32> = (0..8192).map(|i| ((i as f32) * 0.013).sin() * 3000.0).collect();
+        let data: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+        let tensor = td("w", data.clone(), "float32");
+        let processed =
+            process_tensor(&tensor, None, &compression, 0.95, &DType::Float8E4M3).unwrap();
+
+        assert_eq!(processed.entry.dtype, "float8_e4m3fn");
+        assert_eq!(processed.entry.original_dtype.as_deref(), Some("float32"));
+        assert_eq!(
+            processed.entry.raw_size as usize,
+            data.len() / 4,
+            "float8 is a quarter of fp32 on disk"
+        );
+        let scale = processed
+            .entry
+            .quant_scale
+            .expect("a float8 entry must record the scale its bytes mean nothing without");
+        assert!(scale > 0.0 && scale.is_finite(), "scale was {scale}");
+
+        let entry = persist(storage.as_ref(), processed.entry, processed.write_data, "w.bin");
+        let resolve = base_resolver(vec![], compression.clone());
+        let got =
+            load_tensor(&entry, None, storage.as_ref(), &compression, None, &resolve).unwrap();
+        assert_eq!(got.len(), data.len(), "load must uncast back to fp32 width");
+
+        let back: Vec<f32> = got
+            .chunks_exact(4)
+            .map(|q| f32::from_le_bytes([q[0], q[1], q[2], q[3]]))
+            .collect();
+        let amax = values.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let worst = values
+            .iter()
+            .zip(&back)
+            .map(|(a, b)| (a - b).abs() / amax)
+            .fold(0f32, f32::max);
+        assert!(
+            worst < 0.05,
+            "values came back off by {worst} of amax — the scale did not survive"
+        );
+    }
+
+    /// A tensor that arrives already float8 is stored as it is: no cast, no
+    /// scale, no `original_dtype`, and the same bytes back. This is the half
+    /// of float8 support that is genuinely lossless, and it must stay that
+    /// way even with a `save_dtype` set — casting it up to bf16 to honour the
+    /// setting would double the size of the one dtype chosen to shrink it.
+    #[test]
+    fn a_native_float8_tensor_is_stored_untouched_whatever_save_dtype_says() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(dir.path()).unwrap());
+        let compression = CompressionAlgo::Zstd { level: 1 };
+
+        let data = noise(40_000, 0x5e);
+        for save_dtype in [DType::None, DType::BFloat16, DType::Float32] {
+            let tensor = td("w8", data.clone(), "float8_e4m3fn");
+            let processed =
+                process_tensor(&tensor, None, &compression, 0.95, &save_dtype).unwrap();
+
+            assert_eq!(processed.entry.dtype, "float8_e4m3fn", "{save_dtype:?}");
+            assert_eq!(processed.entry.original_dtype, None, "{save_dtype:?}");
+            assert_eq!(processed.entry.quant_scale, None, "{save_dtype:?}");
+            assert_eq!(processed.entry.raw_size as usize, data.len(), "{save_dtype:?}");
+
+            let entry = persist(
+                storage.as_ref(),
+                processed.entry,
+                processed.write_data,
+                &format!("w8_{save_dtype:?}.bin"),
+            );
+            let resolve = base_resolver(vec![], compression.clone());
+            let got =
+                load_tensor(&entry, None, storage.as_ref(), &compression, None, &resolve).unwrap();
+            assert_eq!(got, data, "{save_dtype:?}: float8 bytes must be bit-exact");
+        }
+    }
+
+    /// An unchanged tensor is stored once and referenced afterwards. The
+    /// reference has to carry its own scale: the skip is decided on the
+    /// *quantized* bytes, so a later step whose values are an exact multiple
+    /// of an earlier one's produces identical bytes under a different scale,
+    /// and reusing the base's scale would hand back the wrong magnitudes with
+    /// nothing to show for it.
+    #[test]
+    fn a_skipped_float8_tensor_keeps_its_own_scale() {
+        let values: Vec<f32> = (0..4096).map(|i| ((i as f32) * 0.11).sin()).collect();
+        let data: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let compression = CompressionAlgo::Zstd { level: 1 };
+
+        let first = process_tensor(
+            &td("w", data.clone(), "float32"),
+            None,
+            &compression,
+            0.95,
+            &DType::Float8E4M3,
+        )
+        .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(dir.path()).unwrap());
+        let base_entry = persist(
+            storage.as_ref(),
+            first.entry.clone(),
+            first.write_data,
+            "w.bin",
+        );
+
+        let cache = BaseCache {
+            storage: Arc::clone(&storage),
+            pack_file: None,
+            entries: HashMap::from([("w".to_string(), base_entry)]),
+            compression: compression.clone(),
+            raw: None,
+        };
+
+        // Same values scaled by 4: the quantized bytes are identical, so the
+        // hash matches and the tensor is skipped — but it is four times as
+        // large, and only the entry's own scale says so.
+        let scaled: Vec<u8> = values
+            .iter()
+            .flat_map(|v| (v * 4.0).to_le_bytes())
+            .collect();
+        let second = process_tensor(
+            &td("w", scaled, "float32"),
+            Some(&cache),
+            &compression,
+            0.95,
+            &DType::Float8E4M3,
+        )
+        .unwrap();
+
+        assert_eq!(
+            second.entry.storage,
+            TensorStorage::Skipped,
+            "identical quantized bytes should still skip"
+        );
+        let base_scale = first.entry.quant_scale.unwrap();
+        let skip_scale = second.entry.quant_scale.unwrap();
+        assert!(
+            (skip_scale / base_scale - 4.0).abs() < 1e-3,
+            "the skipped entry kept the base's scale ({base_scale}) instead of its own \
+             ({skip_scale})"
         );
     }
 }

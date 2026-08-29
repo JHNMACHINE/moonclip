@@ -338,3 +338,147 @@ class TestReportingNeverKillsTheRun:
         out = self._text(stream)
         assert "[Moonclip] Exported to" in out
         assert "model.pt" in out
+
+
+class TestFloat8:
+    """Float8 arrives two ways and they are not the same thing.
+
+    A tensor that is *already* float8 — which is what FSDP2 and torchao hand
+    over — is stored byte for byte and comes back byte for byte. Until 0.0.9
+    it could not be stored at all: `save_tensors` raised
+    `ValueError: unsupported dtype torch.float8_e4m3fn`, and the only way
+    forward was converting every parameter back to bf16 by hand.
+
+    `save_dtype="fp8"` is the other way, and is lossy on purpose: fp32 goes in
+    and one byte per element comes out, against a per-tensor scale.
+    """
+
+    FORMATS = ["float8_e4m3fn", "float8_e5m2"]
+
+    @pytest.mark.parametrize("dtype_name", FORMATS)
+    def test_a_native_float8_tensor_round_trips_bit_exact(self, tmp_path, dtype_name):
+        from moonclip import MoonclipManager
+
+        dtype = getattr(torch, dtype_name, None)
+        if dtype is None:
+            pytest.skip(f"this torch has no {dtype_name}")
+
+        torch.manual_seed(0)
+        # Scaled past ±1 so the exponent range is exercised, not just the
+        # mantissa around 1.0.
+        original = (torch.randn(128, 64) * 12).to(dtype)
+
+        mgr = MoonclipManager(storage_root=str(tmp_path), async_save=False)
+        snap_id = mgr.save_tensors(step=0, tensors={"w": original})
+        loaded = mgr.load(snap_id)
+
+        assert len(loaded["w"]) == original.numel(), "float8 is one byte per element"
+        back = torch.frombuffer(bytes(loaded["w"]), dtype=dtype).reshape(original.shape)
+        assert torch.equal(back.view(torch.uint8), original.view(torch.uint8)), (
+            "a float8 tensor must come back with the identical bits — nothing "
+            "on this path is allowed to reinterpret it"
+        )
+
+    @pytest.mark.parametrize("dtype_name", FORMATS)
+    def test_a_native_float8_tensor_ignores_save_dtype(self, tmp_path, dtype_name):
+        """`save_dtype` names what fp32 is cast *down* to. Applying it to a
+        tensor that is already float8 would cast it back *up* — doubling the
+        size of the one dtype chosen to make things smaller."""
+        from moonclip import MoonclipManager
+
+        dtype = getattr(torch, dtype_name, None)
+        if dtype is None:
+            pytest.skip(f"this torch has no {dtype_name}")
+
+        original = (torch.randn(128, 64) * 12).to(dtype)
+        mgr = MoonclipManager(
+            storage_root=str(tmp_path), async_save=False, save_dtype="bf16"
+        )
+        snap_id = mgr.save_tensors(step=0, tensors={"w": original})
+        loaded = mgr.load(snap_id)
+
+        assert len(loaded["w"]) == original.numel(), "stored at bf16 width, not float8"
+        back = torch.frombuffer(bytes(loaded["w"]), dtype=dtype).reshape(original.shape)
+        assert torch.equal(back.view(torch.uint8), original.view(torch.uint8))
+
+    def test_every_float8_dtype_this_torch_has_can_be_stored(self, tmp_path):
+        """The list in `get_element_size` is the gate. A name missing from it
+        is not a degraded save, it is a hard `ValueError` in the middle of a
+        training run — so the test enumerates whatever this torch actually
+        exposes rather than the two anyone uses."""
+        from moonclip import MoonclipManager
+
+        names = [n for n in dir(torch) if n.startswith("float8_")]
+        assert names, "this torch exposes no float8 dtypes at all"
+
+        mgr = MoonclipManager(storage_root=str(tmp_path), async_save=False)
+        for name in names:
+            dtype = getattr(torch, name)
+            if not isinstance(dtype, torch.dtype):
+                continue
+            raw = torch.zeros(64, dtype=torch.uint8).view(dtype)
+            snap_id = mgr.save_tensors(step=0, tensors={name: raw})
+            assert len(mgr.load(snap_id)[name]) == 64, name
+
+    def test_fp8_save_dtype_quantizes_and_hands_back_the_original_dtype(self, tmp_path):
+        """Training gets fp32 buffers back whatever the checkpoint holds, or
+        `load_state_dict` fails on dtype — the same contract bf16 has."""
+        from moonclip import MoonclipManager
+
+        torch.manual_seed(0)
+        # Well outside float8's own ±448: only a correctly applied scale
+        # brings these back at all.
+        original = torch.randn(256, 128) * 3000
+
+        mgr = MoonclipManager(
+            storage_root=str(tmp_path), async_save=False, save_dtype="fp8"
+        )
+        snap_id = mgr.save_tensors(step=0, tensors={"w": original})
+        loaded = mgr.load(snap_id)
+
+        assert len(loaded["w"]) == original.numel() * 4, "fp32 width on the way out"
+        back = torch.frombuffer(bytes(loaded["w"]), dtype=torch.float32).reshape(
+            original.shape
+        )
+
+        amax = original.abs().max().item()
+        worst = (back - original).abs().max().item() / amax
+        # e4m3 keeps four significant bits. Bounded on both sides: a test that
+        # only checked the error was small would still pass if quantization
+        # silently stopped happening.
+        assert worst < 0.05, f"relative-to-amax error {worst} is too large for e4m3"
+        assert worst > 0.0, "nothing was quantized"
+
+    def test_fp8_is_a_quarter_of_fp32_on_disk(self, tmp_path):
+        """The reason to accept the precision loss. Measured on the pack file,
+        because that is what the disk bill is."""
+        from moonclip import MoonclipManager
+
+        torch.manual_seed(0)
+        # Incompressible, so the comparison is the dtype and not zstd.
+        original = torch.randn(512, 512)
+
+        sizes = {}
+        for label, save_dtype in (("fp32", "none"), ("fp8", "fp8")):
+            root = tmp_path / label
+            mgr = MoonclipManager(
+                storage_root=str(root), async_save=False, save_dtype=save_dtype
+            )
+            mgr.save_tensors(step=0, tensors={"w": original})
+            mgr.flush()
+            sizes[label] = sum(
+                p.stat().st_size for p in root.rglob("*.pack")
+            )
+
+        assert sizes["fp32"] > 0 and sizes["fp8"] > 0, sizes
+        ratio = sizes["fp8"] / sizes["fp32"]
+        assert ratio < 0.35, f"fp8 pack is {ratio:.2f} of the fp32 one: {sizes}"
+
+    def test_an_unknown_float8_spelling_is_still_refused(self, tmp_path):
+        """Adding float8 to `save_dtype` must not have turned the setting into
+        one that accepts anything: a typo there used to produce checkpoints at
+        twice the expected size and say nothing."""
+        from moonclip import MoonclipManager
+
+        with pytest.raises(Exception, match="fp8"):
+            MoonclipManager(storage_root=str(tmp_path), save_dtype="fp8_e3m4")

@@ -113,6 +113,7 @@ mod tests {
                 shape: vec![8],
                 dtype: "float32".into(),
                 original_dtype: None,
+                quant_scale: None,
                 storage: TensorStorage::Full,
                 alias_of: None,
                 filename: None,

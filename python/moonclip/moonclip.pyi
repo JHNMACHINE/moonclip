@@ -79,9 +79,19 @@ class MoonclipManager:
             s3_path_style: Use path-style S3 URLs instead of virtual hosting.
                 Automatically forced to True when s3_endpoint is set.
             sync_every_n_saves: Sync local data to remote S3 every N saves.
-            save_dtype: Target dtype for saving float tensors ("none", "bf16", "fp16").
+            save_dtype: Target dtype for saving float tensors — one of "none",
+                "bf16", "fp16", "fp32", "fp8" (= "fp8_e4m3") or "fp8_e5m2".
                 If set, float tensors are cast in Rust before compression, and
                 auto-uncast back to original dtype on load.
+
+                The float8 targets quantize against a per-tensor scale kept in
+                the manifest, so they are a quarter the size of fp32 but keep
+                only four significant bits: expect a few percent of relative
+                error on every element. That is fine for an archived copy or
+                for analysis, and it is not fine for a checkpoint a run will
+                resume from — optimizer moments in particular do not survive
+                it. Tensors that are *already* float8 are stored bit-exact
+                whatever this is set to, and need no setting at all.
             async_save: Run single-rank saves on a background thread.
                 save_tensors() returns as soon as the tensor data has been
                 copied; hashing, compression and the disk write overlap with

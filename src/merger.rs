@@ -676,6 +676,10 @@ pub(crate) fn do_full_merge_within(
                 hash_compressed: Some(compressed_hash),
                 shuffled: false,
                 original_dtype: entry.original_dtype.clone(),
+                // A merge resolves delta chains but never undoes a cast: what
+                // it rewrites are the stored bytes, so the scale that
+                // describes them carries through with the dtype it belongs to.
+                quant_scale: entry.quant_scale,
             });
 
             offset += compressed.len() as u64;
@@ -1006,6 +1010,7 @@ mod tests {
                 shape: vec![raw.len()],
                 dtype: "uint8".into(),
                 original_dtype: None,
+                quant_scale: None,
                 storage: kind.clone(),
                 alias_of: None,
                 filename: None,

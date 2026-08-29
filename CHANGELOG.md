@@ -1,5 +1,69 @@
 # Changelog
 
+## 0.0.9 — unreleased
+
+Float8, which turned out to be two features wearing one name. A tensor that
+arrives already float8 could not be stored at all — `save_tensors` raised
+`ValueError: unsupported dtype torch.float8_e4m3fn`, so a run doing FSDP2 or
+torchao float8 training had no way to checkpoint but converting every
+parameter back to bf16 by hand. That is a bug, and the fix is lossless.
+`save_dtype="fp8"` is the other half, and it is a trade: a quarter of the size
+for four significant bits.
+
+### Added
+
+- **Float8 tensors can be stored.** `torch.float8_e4m3fn`, `torch.float8_e5m2`
+  and the four variants this torch exposes (`e4m3fnuz`, `e5m2fnuz`, `e8m0fnu`,
+  `e4m3b11fnuz`) are accepted on the direct tensor path and come back with the
+  identical bits. Nothing else was needed to store them — Moonclip reads the
+  tensor's own buffer, and the buffer is bytes — only for `get_element_size`
+  to know they are one byte wide. It did not, and the failure was a hard
+  `ValueError` in the middle of a training run rather than a degraded save.
+  No configuration: a float8 tensor is stored as float8 whatever `save_dtype`
+  says, because that setting names what fp32 is cast *down* to and applying it
+  here would have cast it back *up*, doubling the size of the one dtype chosen
+  to make things smaller.
+- **`save_dtype="fp8"` and `save_dtype="fp8_e5m2"`.** fp32, fp16, bf16 and
+  fp64 quantize to one byte per element against a per-tensor scale, recorded
+  as `quant_scale` on the manifest entry and multiplied back in on load, so
+  training gets its original dtype back the same way `save_dtype="bf16"`
+  already worked. Bare `"fp8"` means e4m3, matching torchao and Transformer
+  Engine.
+
+  **This one is lossy, and more so than it looks.** e4m3 keeps four
+  significant bits, which is a few percent of relative error on every element
+  — twenty times what bf16 costs. It is a reasonable trade for an archived
+  copy or for analysis, and a poor one for a checkpoint a run will resume
+  from; optimizer moments in particular do not survive it. The manifest
+  records the scale per tensor, so a quantized checkpoint says what it is
+  rather than looking like a full-precision one that went wrong.
+
+  The conversion agrees with torch bit for bit. Checked on torch 2.12 across
+  all 256 patterns of both formats and roughly 22000 values chosen to sit on
+  the rounding ties, the subnormals and the specials: every in-range value
+  encodes to the identical byte, and the decode tables match
+  `.view(torch.float8_*).float()` exactly. The one deliberate difference is at
+  the top of the range, where a value pushed past `max_finite` by rounding
+  saturates instead of becoming a NaN — turning the largest weight of every
+  tensor into a NaN would be a poor price for matching torch there. A real
+  infinity still becomes a NaN in e4m3fn, which has no infinity to put it in,
+  and stays an infinity in e5m2, which does.
+
+  A tensor whose finite values are all zero, or so small that the scale would
+  not be a normal float, is stored against a scale of 1.0 rather than dividing
+  by nothing. Non-finite elements are left out of the scale entirely: with one
+  infinity counted, the scale is infinite and every other value in the tensor
+  quantizes to zero, so a single diverged element would erase the tensor
+  around it. The infinity itself still survives as a NaN, so nothing is
+  hidden.
+
+### Changed
+
+- `TensorEntry` gained `quant_scale`, optional and defaulted. Manifests
+  written before this deserialize unchanged — they hold no float8 entries, so
+  the absent value is the correct one rather than a missing one. The format
+  version is unmoved at 2.
+
 ## 0.0.8 — 2026-08-21
 
 S3 stopped being a one-way street. A gathered checkpoint of a 1B model with
