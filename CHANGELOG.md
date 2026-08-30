@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.0.9 — unreleased
+## 0.0.9 — 2026-08-30
 
 Float8, which turned out to be two features wearing one name. A tensor that
 arrives already float8 could not be stored at all — `save_tensors` raised
