@@ -84,12 +84,30 @@ pub fn unshuffle(data: &[u8], itemsize: usize) -> Vec<u8> {
 ///
 /// Unknown dtypes return 1, which makes the shuffle a no-op rather than a
 /// corruption: a filter that cannot be inverted must never be applied.
+///
+/// That default is safe but not free, and the cost is invisible: a dtype
+/// missing from this table loses the filter and compresses worse, with
+/// nothing anywhere to say so. `complex128` was in exactly that position —
+/// stored correctly, at 16 bytes an element, shuffled as if it were bytes.
+///
+/// **Extending this table is safe for checkpoints already written**, and the
+/// reason is `TensorEntry::shuffled`, not luck. A delta written when a dtype
+/// mapped to 1 recorded `shuffled: false`, because the save path only sets
+/// the flag when `itemsize > 1`; the load path unshuffles only when the flag
+/// is set, so it never applies a transform the writer did not. A new width
+/// here changes what future deltas do and nothing about old ones.
 pub fn element_size(dtype: &str) -> usize {
     match dtype {
+        "complex128" => 16,
         "float64" | "int64" | "uint64" | "complex64" => 8,
-        "float32" | "int32" | "uint32" => 4,
+        "float32" | "int32" | "uint32" | "complex32" => 4,
         "float16" | "bfloat16" | "int16" | "uint16" => 2,
+        // Named rather than left to the default so the table reads as a
+        // complete answer instead of a partial one. One-byte elements have
+        // no planes to transpose: `shuffle` returns early on `itemsize <= 1`.
         "int8" | "uint8" | "bool" => 1,
+        "float8_e4m3fn" | "float8_e5m2" | "float8_e4m3fnuz" | "float8_e5m2fnuz"
+        | "float8_e8m0fnu" | "float8_e4m3b11fnuz" => 1,
         _ => 1,
     }
 }
@@ -177,5 +195,40 @@ mod tests {
         assert_eq!(element_size("bfloat16"), 2);
         // A dtype nobody taught it about must disable the filter, not guess.
         assert_eq!(element_size("float8_e4m3"), 1);
+    }
+
+    /// The dtypes the table used to miss, and the one it still deliberately
+    /// answers with 1.
+    #[test]
+    fn the_table_covers_the_dtypes_torch_actually_produces() {
+        assert_eq!(element_size("complex128"), 16);
+        assert_eq!(element_size("complex64"), 8);
+        assert_eq!(element_size("complex32"), 4);
+        assert_eq!(element_size("uint32"), 4);
+        assert_eq!(element_size("uint64"), 8);
+        // One byte per element: there are no planes to transpose, so 1 is
+        // the right answer here and not a fallback.
+        for fp8 in [
+            "float8_e4m3fn",
+            "float8_e5m2",
+            "float8_e4m3fnuz",
+            "float8_e5m2fnuz",
+            "float8_e8m0fnu",
+            "float8_e4m3b11fnuz",
+        ] {
+            assert_eq!(element_size(fp8), 1, "{fp8}");
+        }
+    }
+
+    /// complex128 was the case that cost something: 16 bytes an element,
+    /// shuffled as if it were bytes, so the filter did nothing and nothing
+    /// said so. The transform has to round-trip at that width like any other.
+    #[test]
+    fn a_sixteen_byte_element_round_trips() {
+        for len in [0, 15, 16, 17, 16 * UNSHUFFLE_BLOCK, 16 * UNSHUFFLE_BLOCK + 17] {
+            let data = noise(len, len as u64);
+            let there = shuffle(&data, 16);
+            assert_eq!(unshuffle(&there, 16), data, "len {len}");
+        }
     }
 }

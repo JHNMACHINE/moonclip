@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-use crate::cast::DType;
+use crate::cast::DTypePolicy;
 use crate::error::{Result, MoonclipError};
 use crate::inflight::InFlight;
 use crate::manifest::*;
@@ -31,8 +31,9 @@ pub struct CoordinatorConfig {
     pub merger: Option<MergerConfig>,
     pub remote_storage: Option<Arc<dyn StorageBackend>>,
     pub remote_sync: Option<RemoteSyncConfig>,
-    /// Target dtype for saving float tensors. DType::None = keep original.
-    pub save_dtype: DType,
+    /// Target dtype for saving float tensors, chosen per tensor name.
+    /// An empty policy keeps every tensor as it arrives.
+    pub save_dtype: DTypePolicy,
     /// Run single-rank saves on a background thread (bound-1 queue).
     /// `save()` returns as soon as the tensor data is handed off; any
     /// error surfaces on the next save/load/flush call. Loads, listing
@@ -54,8 +55,9 @@ pub struct CoordinatorConfig {
     /// **That is the reason to turn it off**, on a box whose memory is the
     /// binding constraint. Set it false to trade the CPU back.
     ///
-    /// Ignored when `save_dtype` casts: a later delta is computed against the
-    /// post-cast bytes on disk, which are not what arrives here.
+    /// Applied per tensor: a tensor `save_dtype` casts is not retained,
+    /// because a later delta is computed against the post-cast bytes on disk
+    /// and those are not what arrives here. The rest of the snapshot still is.
     pub keep_base_in_memory: bool,
 }
 
@@ -71,7 +73,7 @@ impl Default for CoordinatorConfig {
             merger: None,
             remote_storage: None,
             remote_sync: None,
-            save_dtype: DType::None,
+            save_dtype: DTypePolicy::none(),
             async_save: true,
             keep_base_in_memory: true,
         }
@@ -389,6 +391,11 @@ pub(crate) struct Core {
     pending_deletes: Arc<PendingDeletes>,
     /// See [`CoordinatorConfig::keep_base_in_memory`].
     retained_base: Mutex<Option<RetainedBase>>,
+    /// Whether the `save_dtype` patterns have already been checked against a
+    /// real set of tensor names. Once per process: the answer cannot change
+    /// between steps, and a run checkpointing every hundred steps would
+    /// otherwise print the same complaint for a week.
+    dtype_patterns_checked: AtomicBool,
 }
 
 /// The main checkpoint coordinator.
@@ -469,6 +476,7 @@ impl Coordinator {
             in_flight,
             pending_deletes,
             retained_base: Mutex::new(None),
+            dtype_patterns_checked: AtomicBool::new(false),
         });
 
         let saver = if use_async {
@@ -1200,6 +1208,8 @@ impl Core {
         // ── 1. Build lazy base cache (no upfront disk read) ──────────
         let base_cache = self.build_base_cache(base_snap);
 
+        self.check_dtype_patterns(&tensors);
+
         // ── 2. Deduplicate, then process the survivors in parallel ───
         // Tied embeddings and repeated buffers hold identical bytes under
         // several names; store them once and point the rest at the copy.
@@ -1384,24 +1394,82 @@ impl Core {
     /// these are the buffers that would otherwise be dropped at the end of
     /// the save, so retaining them allocates nothing.
     ///
-    /// Skipped when a cast is configured: what a later delta is computed
-    /// against is the post-cast bytes stored on disk, and those are not what
-    /// arrives here. Getting that wrong would corrupt every delta, so the
-    /// cast path keeps reading the base from storage.
+    /// Report `save_dtype` patterns that match none of this rank's tensors.
+    ///
+    /// A pattern that fires on nothing is this feature's quiet failure:
+    /// `{"weight": "bf16"}` reads as if it did something, matches no tensor —
+    /// the names arrive with their prefix, `model/weight` — and writes a full-precision
+    /// checkpoint without a word. It is the same shape as the `save_dtype`
+    /// typo that [`crate::cast::DType::parse`] refuses, and it gets the same
+    /// treatment rather than a different one because it is harder to catch.
+    ///
+    /// A complaint, not a refusal: on a sharded save a pattern that matches
+    /// nothing *on this rank* is legitimate, and a rank that stops the run
+    /// over it would be worse than the checkpoint it was trying to protect.
+    fn check_dtype_patterns(&self, tensors: &[TensorData]) {
+        if self.dtype_patterns_checked.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let names: Vec<&str> = tensors.iter().map(|t| t.name.as_str()).collect();
+        let dead = self.config.save_dtype.dead_patterns(&names);
+        if dead.is_empty() {
+            return;
+        }
+        eprintln!(
+            "[Moonclip] save_dtype pattern(s) {} matched none of this rank's \
+             {} tensors, so they cast nothing. Patterns are globs over the \
+             full tensor name (e.g. '{}'); '*' matches any run of characters.",
+            dead.join(", "),
+            names.len(),
+            names.first().copied().unwrap_or("model/weight"),
+        );
+    }
+
+    /// Decided per tensor, because `save_dtype` is. What a later delta is
+    /// computed against is the bytes on disk; for a tensor that was cast,
+    /// those are not the bytes that arrived here, and retaining them would
+    /// XOR the next delta against the wrong base. So the test is
+    /// `original_dtype.is_none()`, which is set by
+    /// [`tensor::process_tensor`] exactly when the stored bytes and the
+    /// incoming bytes are the same bytes.
+    ///
+    /// The damage is not silent corruption, and it is worth being accurate
+    /// about which it is. A wrong base is caught three times over: a cast
+    /// that changes the width fails the length check in
+    /// [`crate::delta::compute_delta`], a cast that keeps it produces a
+    /// high-entropy XOR that [`crate::delta::pays_off`] rejects, and
+    /// anything that survives both fails the hash the load path verifies
+    /// after applying the delta. What it costs is the optimization it was
+    /// meant to provide — a full save where a delta belonged — or, in the
+    /// worst case, a checkpoint that refuses to load at resume. Two of those
+    /// three guards are heuristics about size, which is not what a
+    /// correctness argument should rest on; this is.
+    ///
+    /// Under the old all-or-nothing rule a single cast turned the whole
+    /// optimization off. Per tensor, the ordinary configuration — moments to
+    /// bf16, weights untouched — keeps the weights in memory, which is the
+    /// third of the state where the delta actually pays.
+    ///
+    /// A partial map needs no special handling downstream: `BaseCache` looks
+    /// each tensor up by name and falls back to storage on a miss, so a
+    /// tensor left out here simply takes the path it took before.
     fn retain_base(
         &self,
         snap_id: Uuid,
         tensors: Vec<TensorData>,
         processed: &[tensor::ProcessedTensor],
     ) {
-        if !self.config.keep_base_in_memory || self.config.save_dtype != DType::None {
+        if !self.config.keep_base_in_memory {
             return;
         }
 
-        // Only tensors actually stored in full can be delta'd against later.
+        // Only tensors stored in full, and uncast, can be delta'd against
+        // later from memory.
         let full: std::collections::HashSet<&str> = processed
             .iter()
-            .filter(|pt| pt.entry.storage == TensorStorage::Full)
+            .filter(|pt| {
+                pt.entry.storage == TensorStorage::Full && pt.entry.original_dtype.is_none()
+            })
             .map(|pt| pt.entry.name.as_str())
             .collect();
 
@@ -3299,5 +3367,282 @@ mod tests {
             .load_latest()
             .unwrap_or_else(|e| panic!("the newest checkpoint is unreadable after merging: {e}"));
         assert_eq!(loaded["w"][0], 3, "the newest checkpoint is not step 3");
+    }
+
+    /// Deterministic float32 bytes that actually differ between steps.
+    ///
+    /// Constant runs compress to nothing and delta against anything, so a
+    /// test built on them proves nothing about the delta path.
+    fn fp32_noise(n: usize, seed: u64) -> Vec<u8> {
+        let mut s = seed | 1;
+        (0..n)
+            .flat_map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                // Keep the exponent sane so the bf16 cast is a real cast and
+                // not a parade of NaNs.
+                let v = ((s >> 40) as f32 / 1.0e5) - 5.0;
+                v.to_le_bytes()
+            })
+            .collect()
+    }
+
+    fn cast_coordinator(dir: &std::path::Path, policy: DTypePolicy) -> Coordinator {
+        let storage: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(dir).unwrap());
+        let config = CoordinatorConfig {
+            compression: CompressionAlgo::Zstd { level: 1 },
+            async_save: false,
+            keep_base_in_memory: true,
+            save_dtype: policy,
+            ..Default::default()
+        };
+        Coordinator::new(storage, config).unwrap()
+    }
+
+    fn two_component_state(seed: u64) -> Vec<TensorData> {
+        vec![
+            TensorData {
+                name: "ravex/models/layer.weight".into(),
+                shape: vec![4096],
+                dtype: "float32".into(),
+                data: fp32_noise(4096, seed),
+            },
+            TensorData {
+                name: "ravex/optimizers/exp_avg".into(),
+                shape: vec![4096],
+                dtype: "float32".into(),
+                data: fp32_noise(4096, seed + 977),
+            },
+        ]
+    }
+
+    /// The failure this feature could have introduced, and the reason
+    /// `retain_base` is decided per tensor.
+    ///
+    /// With one component cast and the other not, the in-memory base is
+    /// partial: it holds the weights, whose stored bytes are the incoming
+    /// bytes, and not the moments, whose stored bytes are bf16. If the
+    /// retention were still all-or-nothing in either direction, the next
+    /// delta would be XOR-ed against the wrong base for one of the two — and
+    /// every tensor would still pass its own hash check on the way back,
+    /// because the hash is of what was written, not of what should have
+    /// been. So the assertion has to be on the reconstructed values.
+    #[test]
+    fn a_per_component_cast_keeps_the_next_delta_correct() {
+        let dir = tempfile::tempdir().unwrap();
+        let coord = cast_coordinator(
+            dir.path(),
+            DTypePolicy::from_rules([("ravex/optimizers/*", "bf16")]).unwrap(),
+        );
+
+        coord.save(1, two_component_state(1), HashMap::new()).unwrap();
+
+        // A second step, close to the first: this is what produces a delta
+        // rather than a full, which is the case under test.
+        let mut next = two_component_state(1);
+        next[0].data[..64].copy_from_slice(&fp32_noise(16, 31));
+        next[1].data[..64].copy_from_slice(&fp32_noise(16, 32));
+        let snap = coord.save(2, next.clone(), HashMap::new()).unwrap();
+
+        let loaded = coord.load(snap).unwrap();
+
+        // The weights were not cast, so they come back byte for byte.
+        assert_eq!(
+            loaded["ravex/models/layer.weight"], next[0].data,
+            "uncast weights must survive the delta exactly"
+        );
+
+        // The moments were cast to bf16 and back, so they come back rounded,
+        // not equal. What must hold is that they are the *right* numbers:
+        // bf16 keeps 8 significant bits, so a relative error over 1% means
+        // the delta was applied against the wrong base, not that it rounded.
+        let got = &loaded["ravex/optimizers/exp_avg"];
+        assert_eq!(got.len(), next[1].data.len());
+        for (i, (g, w)) in got
+            .chunks_exact(4)
+            .zip(next[1].data.chunks_exact(4))
+            .enumerate()
+        {
+            let g = f32::from_le_bytes(g.try_into().unwrap());
+            let w = f32::from_le_bytes(w.try_into().unwrap());
+            let tol = w.abs() * 0.01 + 1e-6;
+            assert!(
+                (g - w).abs() <= tol,
+                "element {i}: got {g}, wanted {w} within {tol} — a bf16 round \
+                 trip cannot be this far off, so the base was wrong"
+            );
+        }
+    }
+
+    /// Under the old rule any cast turned the in-memory base off for the
+    /// whole snapshot. The uncast third of the state has no reason to lose it.
+    #[test]
+    fn an_uncast_tensor_is_still_retained_when_another_is_cast() {
+        let dir = tempfile::tempdir().unwrap();
+        let coord = cast_coordinator(
+            dir.path(),
+            DTypePolicy::from_rules([("ravex/optimizers/*", "bf16")]).unwrap(),
+        );
+        coord.save(1, two_component_state(5), HashMap::new()).unwrap();
+
+        let retained = coord.core.retained_base.lock().unwrap();
+        let retained = retained.as_ref().expect("a full save must retain a base");
+        assert!(
+            retained.tensors.contains_key("ravex/models/layer.weight"),
+            "the uncast component must stay in memory"
+        );
+        assert!(
+            !retained.tensors.contains_key("ravex/optimizers/exp_avg"),
+            "the cast component must not: what is on disk is bf16, and these \
+             bytes are fp32"
+        );
+    }
+
+    /// A uniform cast still has to reconstruct, and this is the case that
+    /// used to be covered by switching retention off entirely.
+    #[test]
+    fn a_uniform_cast_still_round_trips_across_a_delta() {
+        let dir = tempfile::tempdir().unwrap();
+        let coord = cast_coordinator(dir.path(), DTypePolicy::parse("bf16").unwrap());
+
+        coord.save(1, two_component_state(9), HashMap::new()).unwrap();
+        let mut next = two_component_state(9);
+        next[0].data[..64].copy_from_slice(&fp32_noise(16, 77));
+        let snap = coord.save(2, next.clone(), HashMap::new()).unwrap();
+
+        let loaded = coord.load(snap).unwrap();
+        for t in &next {
+            let got = &loaded[&t.name];
+            assert_eq!(got.len(), t.data.len(), "{}", t.name);
+            for (g, w) in got.chunks_exact(4).zip(t.data.chunks_exact(4)) {
+                let g = f32::from_le_bytes(g.try_into().unwrap());
+                let w = f32::from_le_bytes(w.try_into().unwrap());
+                assert!((g - w).abs() <= w.abs() * 0.01 + 1e-6, "{}", t.name);
+            }
+        }
+    }
+
+    /// Integer and bool state travels through a float cast untouched — this
+    /// is the half of the dtype question that is about transport, not
+    /// conversion. `save_dtype` names a target for floats; a step counter and
+    /// a causal mask are not floats and have no business being reinterpreted
+    /// because one was set.
+    #[test]
+    fn non_float_state_is_untouched_by_any_save_dtype() {
+        let dir = tempfile::tempdir().unwrap();
+        let coord = cast_coordinator(dir.path(), DTypePolicy::parse("bf16").unwrap());
+
+        let step: Vec<u8> = (0..8192u32).flat_map(|i| (i as i64).to_le_bytes()).collect();
+        let mask: Vec<u8> = (0..8192).map(|i| (i % 2) as u8).collect();
+        let tensors = vec![
+            TensorData {
+                name: "ravex/optimizers/step".into(),
+                shape: vec![8192],
+                dtype: "int64".into(),
+                data: step.clone(),
+            },
+            TensorData {
+                name: "ravex/models/causal_mask".into(),
+                shape: vec![8192],
+                dtype: "bool".into(),
+                data: mask.clone(),
+            },
+        ];
+        let snap = coord.save(1, tensors, HashMap::new()).unwrap();
+        let loaded = coord.load(snap).unwrap();
+        assert_eq!(loaded["ravex/optimizers/step"], step);
+        assert_eq!(loaded["ravex/models/causal_mask"], mask);
+    }
+
+    /// bfloat16 bytes: the top half of a float32, which is what the cast
+    /// does. Values stay well inside float16 range on purpose — see the test
+    /// that uses them.
+    fn bf16_noise(n: usize, seed: u64) -> Vec<u8> {
+        fp32_noise(n, seed)
+            .chunks_exact(4)
+            .flat_map(|c| [c[2], c[3]])
+            .collect()
+    }
+
+    /// How every tensor of a snapshot was stored, by name.
+    fn storage_of(coord: &Coordinator, snap: Uuid) -> HashMap<String, TensorStorage> {
+        let manifest = coord.core.manifest.lock().unwrap();
+        manifest
+            .find_snapshot(snap)
+            .expect("snapshot must be in the manifest")
+            .ranks[&0]
+            .tensors
+            .iter()
+            .map(|t| (t.name.clone(), t.storage.clone()))
+            .collect()
+    }
+
+    /// The corruption a per-tensor `retain_base` has to avoid, in the one
+    /// shape where nothing else would catch it: a cast that does not change
+    /// the width.
+    ///
+    /// A tensor arriving as bfloat16 and stored as float16 is the same number
+    /// of bytes before and after, so the length check in
+    /// [`crate::delta::compute_delta`] — which quietly saves the fp32→bf16
+    /// and fp32→fp8 cases by falling back to a full save — does not fire.
+    /// Retaining the incoming bytes would XOR the next delta against bfloat16
+    /// while the base on disk is float16, and the two are different bytes for
+    /// the same value.
+    ///
+    /// bf16 → fp16 → bf16 is bit-exact for these values: float16 has ten
+    /// mantissa bits to bfloat16's seven and the exponents are in range, so
+    /// the round trip is lossless and the assertion can be on equality rather
+    /// than on a tolerance. That matters — a tolerance is what lets a wrong
+    /// base slip through as rounding.
+    #[test]
+    fn an_equal_width_cast_does_not_poison_the_retained_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let coord = cast_coordinator(
+            dir.path(),
+            DTypePolicy::from_rules([("ravex/optimizers/*", "fp16")]).unwrap(),
+        );
+
+        let state = |seed: u64| {
+            vec![
+                TensorData {
+                    name: "ravex/models/layer.weight".into(),
+                    shape: vec![8192],
+                    dtype: "float32".into(),
+                    data: fp32_noise(8192, seed),
+                },
+                TensorData {
+                    name: "ravex/optimizers/exp_avg".into(),
+                    shape: vec![8192],
+                    dtype: "bfloat16".into(),
+                    data: bf16_noise(8192, seed + 977),
+                },
+            ]
+        };
+
+        coord.save(1, state(3), HashMap::new()).unwrap();
+
+        let mut next = state(3);
+        next[0].data[..64].copy_from_slice(&fp32_noise(16, 41));
+        next[1].data[..64].copy_from_slice(&bf16_noise(32, 42));
+        let snap = coord.save(2, next.clone(), HashMap::new()).unwrap();
+
+        // Without this the test is vacuous: a full save reconstructs
+        // correctly no matter what the retained base held.
+        let stored = storage_of(&coord, snap);
+        assert_eq!(
+            stored["ravex/optimizers/exp_avg"],
+            TensorStorage::DeltaXor,
+            "the cast component must be stored as a delta for this test to \
+             be about deltas at all"
+        );
+
+        let loaded = coord.load(snap).unwrap();
+        assert_eq!(loaded["ravex/models/layer.weight"], next[0].data);
+        assert_eq!(
+            loaded["ravex/optimizers/exp_avg"], next[1].data,
+            "bf16 → fp16 → bf16 is lossless here, so anything but equality \
+             means the delta was applied to the wrong base"
+        );
     }
 }

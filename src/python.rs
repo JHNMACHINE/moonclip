@@ -3,7 +3,7 @@ use pyo3::types::{PyByteArray, PyBytes, PyDict, PyString, PyTuple};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::cast::DType;
+use crate::cast::DTypePolicy;
 use crate::coordinator::{Coordinator, CoordinatorConfig};
 use crate::manifest::{CompressionAlgo, LineageConfig, RetentionPolicy};
 use crate::merger::MergerConfig;
@@ -25,17 +25,68 @@ fn extract_metadata(metadata: Option<Bound<'_, PyDict>>) -> PyResult<HashMap<Str
     }
 }
 
+/// Turn the `save_dtype` argument into a policy.
+///
+/// A string is the uniform form and keeps meaning exactly what it always
+/// meant: cast everything. A mapping is `{pattern: dtype}`, ordered — and
+/// ordered is not incidental, because the first matching rule is the one that
+/// applies. Python dicts have preserved insertion order since 3.7, and
+/// iterating the `PyDict` here is what carries that order across, so
+/// `{"model/*": "none", "*": "bf16"}` means what it reads as.
+///
+/// Anything else is refused rather than coerced: `save_dtype=torch.bfloat16`
+/// is the plausible mistake, and it has a `__str__` that would parse.
+fn parse_save_dtype(value: Option<&Bound<'_, PyAny>>) -> PyResult<DTypePolicy> {
+    // Absent and `None` both mean "cast nothing", which is what the old
+    // default string `"none"` meant. `Py_None` reaches here as a value, so it
+    // is answered here rather than falling through to the type error.
+    let Some(value) = value.filter(|v| !v.is_none()) else {
+        return Ok(DTypePolicy::none());
+    };
+    if let Ok(s) = value.cast::<PyString>() {
+        return Ok(DTypePolicy::parse(&s.extract::<String>()?)?);
+    }
+    if let Ok(d) = value.cast::<PyDict>() {
+        let mut rules: Vec<(String, String)> = Vec::with_capacity(d.len());
+        for (k, v) in d.iter() {
+            let pattern = k.cast::<PyString>().map_err(|_| {
+                pyo3::exceptions::PyTypeError::new_err(
+                    "save_dtype keys must be strings: they are glob patterns \
+                     matched against tensor names, e.g. 'optimizer/*'",
+                )
+            })?;
+            let dtype = v.cast::<PyString>().map_err(|_| {
+                pyo3::exceptions::PyTypeError::new_err(format!(
+                    "save_dtype['{}'] must be a string such as 'bf16' or \
+                     'none', not a torch.dtype",
+                    pattern
+                ))
+            })?;
+            rules.push((pattern.extract()?, dtype.extract()?));
+        }
+        return Ok(DTypePolicy::from_rules(rules)?);
+    }
+    Err(pyo3::exceptions::PyTypeError::new_err(format!(
+        "save_dtype must be a string ('bf16') or a dict of glob pattern to \
+         dtype ({{'optimizer/*': 'bf16'}}), not {}",
+        value.get_type().name()?
+    )))
+}
+
 fn get_element_size(dtype: &str) -> PyResult<usize> {
     match dtype {
         "torch.float32" | "torch.int32" => Ok(4),
         "torch.float64" | "torch.int64" => Ok(8),
         "torch.float16" | "torch.bfloat16" => Ok(2),
         "torch.int16" | "torch.uint16" => Ok(2),
+        "torch.uint32" => Ok(4),
+        "torch.uint64" => Ok(8),
         "torch.int8" | "torch.uint8" => Ok(1),
         "torch.bool" => Ok(1),
         // The byte path stores these fine — it reads the tensor's own buffer
         // — so refusing them only on the direct path would be an arbitrary
         // difference between two routes to the same bytes.
+        "torch.complex32" => Ok(4),
         "torch.complex64" => Ok(8),
         "torch.complex128" => Ok(16),
         // Float8, one byte each. Until 0.0.9 these fell to the arm below, so
@@ -55,6 +106,14 @@ fn get_element_size(dtype: &str) -> PyResult<usize> {
         | "torch.float8_e5m2fnuz"
         | "torch.float8_e8m0fnu"
         | "torch.float8_e4m3b11fnuz" => Ok(1),
+        // The quantized dtypes (`qint8`, `quint8`, `qint32`, `quint4x2`,
+        // `quint2x4`) are absent on purpose, and unlike the float8 case that
+        // absence is not an oversight waiting to be filled in. Their scale
+        // and zero-point are properties of the *tensor*, not of the buffer,
+        // and a `TensorEntry` has nowhere to put them. Storing the bytes
+        // would produce a checkpoint that loads without complaint and holds
+        // integers nobody can turn back into numbers. The refusal below is
+        // the honest answer; dequantize before saving.
         _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
             "unsupported dtype {}",
             dtype
@@ -249,7 +308,7 @@ impl MoonclipManager {
         s3_secret_key = None,
         s3_path_style = false,
         sync_every_n_saves = 100,
-        save_dtype = "none",
+        save_dtype = None,
         async_save = true,
         keep_base_in_memory = true,
     ))]
@@ -275,7 +334,7 @@ impl MoonclipManager {
         s3_secret_key: Option<&str>,
         s3_path_style: bool,
         sync_every_n_saves: u64,
-        save_dtype: &str,
+        save_dtype: Option<&Bound<'_, PyAny>>,
         async_save: bool,
         keep_base_in_memory: bool,
     ) -> PyResult<Self> {
@@ -312,7 +371,7 @@ impl MoonclipManager {
             },
             remote_storage: None,
             remote_sync: None,
-            save_dtype: DType::parse(save_dtype)?,
+            save_dtype: parse_save_dtype(save_dtype)?,
             async_save,
             keep_base_in_memory,
         };

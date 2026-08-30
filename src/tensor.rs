@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::cast::{self, DType, is_castable_float};
+use crate::cast::{self, DType, DTypePolicy, is_castable_float};
 use crate::compression;
 use crate::delta;
 use crate::error::{Result, MoonclipError};
@@ -216,14 +216,19 @@ pub fn make_alias_entry(tensor: &TensorData, target: &TensorEntry) -> TensorEntr
 ///
 /// `base_cache`: lazy handle to the base snapshot (None for first save).
 /// `delta_max_ratio`: see [`crate::delta::pays_off`].
+/// `save_dtype`: resolved per tensor name; see [`crate::cast::DTypePolicy`].
 pub fn process_tensor(
     tensor: &TensorData,
     base_cache: Option<&BaseCache>,
     compression: &CompressionAlgo,
     delta_max_ratio: f64,
-    save_dtype: &DType,
+    save_dtype: &DTypePolicy,
 ) -> Result<ProcessedTensor> {
     use std::borrow::Cow;
+
+    // The target is this tensor's, not the snapshot's: the weights and the
+    // optimizer moments routinely want different ones.
+    let save_dtype = save_dtype.for_tensor(&tensor.name);
 
     // Cast if requested and applicable — otherwise borrow without cloning
     let (working_data, working_dtype, quant_scale): (Cow<[u8]>, Cow<str>, Option<f32>) =
@@ -628,7 +633,7 @@ pub fn process_tensors_parallel(
     base_cache: Option<&BaseCache>,
     compression: &CompressionAlgo,
     delta_max_ratio: f64,
-    save_dtype: &DType,
+    save_dtype: &DTypePolicy,
 ) -> Result<Vec<ProcessedTensor>> {
     use rayon::prelude::*;
 
@@ -650,7 +655,7 @@ pub fn process_tensors_parallel(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cast::DType;
+    use crate::cast::{DType, DTypePolicy};
     use crate::storage::LocalStorage;
 
     /// Deterministic pseudo-random bytes.
@@ -792,7 +797,7 @@ mod tests {
             Some(&cache),
             &compression,
             0.5,
-            &DType::None,
+            &DTypePolicy::none(),
         )
         .unwrap();
 
@@ -847,7 +852,7 @@ mod tests {
             Some(&cache),
             &compression,
             0.95,
-            &DType::None,
+            &DTypePolicy::none(),
         )
         .unwrap();
 
@@ -896,7 +901,7 @@ mod tests {
             data: data_v2,
         };
 
-        let result = process_tensor(&tensor, Some(&cache), &compression, 0.95, &DType::None).unwrap();
+        let result = process_tensor(&tensor, Some(&cache), &compression, 0.95, &DTypePolicy::none()).unwrap();
         assert_eq!(result.entry.storage, TensorStorage::Full);
         assert!(result.write_data.is_some());
     }
@@ -917,7 +922,7 @@ mod tests {
             None,
             &compression,
             0.5,
-            &DType::None,
+            &DTypePolicy::none(),
         )
         .unwrap();
 
@@ -974,7 +979,7 @@ mod tests {
         compression: &CompressionAlgo,
     ) -> TensorEntry {
         let tensor = td(name, data.to_vec(), dtype);
-        let processed = process_tensor(&tensor, None, compression, 0.95, &DType::None).unwrap();
+        let processed = process_tensor(&tensor, None, compression, 0.95, &DTypePolicy::none()).unwrap();
         assert_eq!(processed.entry.storage, TensorStorage::Full);
         persist(
             storage.as_ref(),
@@ -1010,7 +1015,7 @@ mod tests {
             )),
             &compression,
             0.95,
-            &DType::None,
+            &DTypePolicy::none(),
         )
         .unwrap();
 
@@ -1024,7 +1029,7 @@ mod tests {
             )),
             &compression,
             0.95,
-            &DType::None,
+            &DTypePolicy::none(),
         )
         .unwrap();
 
@@ -1079,7 +1084,7 @@ mod tests {
             Some(&cache),
             &compression,
             0.95,
-            &DType::None,
+            &DTypePolicy::none(),
         )
         .unwrap();
 
@@ -1128,7 +1133,7 @@ mod tests {
             &compression,
         );
         let tensor = td("w", v2.clone(), "float32");
-        let processed = process_tensor(&tensor, Some(&cache), &compression, 0.95, &DType::None)
+        let processed = process_tensor(&tensor, Some(&cache), &compression, 0.95, &DTypePolicy::none())
             .unwrap();
 
         assert_eq!(processed.entry.storage, TensorStorage::DeltaXor);
@@ -1172,7 +1177,7 @@ mod tests {
             &compression,
         );
         let tensor = td("w", data.clone(), "float32");
-        let processed = process_tensor(&tensor, Some(&cache), &compression, 0.95, &DType::None)
+        let processed = process_tensor(&tensor, Some(&cache), &compression, 0.95, &DTypePolicy::none())
             .unwrap();
         assert_eq!(processed.entry.storage, TensorStorage::Skipped);
         assert!(processed.write_data.is_none(), "a skip writes no bytes");
@@ -1247,7 +1252,7 @@ mod tests {
         let data = noise(40_000, 0xbb);
         let tensor = td("w", data.clone(), "float32");
         let processed =
-            process_tensor(&tensor, None, &compression, 0.95, &DType::BFloat16).unwrap();
+            process_tensor(&tensor, None, &compression, 0.95, &DTypePolicy::uniform(DType::BFloat16)).unwrap();
 
         assert_eq!(processed.entry.dtype, "bfloat16");
         assert_eq!(processed.entry.original_dtype.as_deref(), Some("float32"));
@@ -1286,7 +1291,7 @@ mod tests {
 
         let tensor = td("w", data.clone(), "float32");
         let processed =
-            process_tensor(&tensor, None, &compression, 0.95, &DType::Float8E4M3).unwrap();
+            process_tensor(&tensor, None, &compression, 0.95, &DTypePolicy::uniform(DType::Float8E4M3)).unwrap();
 
         assert_eq!(processed.entry.dtype, "float8_e4m3fn");
         assert_eq!(processed.entry.original_dtype.as_deref(), Some("float32"));
@@ -1338,7 +1343,14 @@ mod tests {
         for save_dtype in [DType::None, DType::BFloat16, DType::Float32] {
             let tensor = td("w8", data.clone(), "float8_e4m3fn");
             let processed =
-                process_tensor(&tensor, None, &compression, 0.95, &save_dtype).unwrap();
+                process_tensor(
+                    &tensor,
+                    None,
+                    &compression,
+                    0.95,
+                    &DTypePolicy::uniform(save_dtype.clone()),
+                )
+                .unwrap();
 
             assert_eq!(processed.entry.dtype, "float8_e4m3fn", "{save_dtype:?}");
             assert_eq!(processed.entry.original_dtype, None, "{save_dtype:?}");
@@ -1375,7 +1387,7 @@ mod tests {
             None,
             &compression,
             0.95,
-            &DType::Float8E4M3,
+            &DTypePolicy::uniform(DType::Float8E4M3),
         )
         .unwrap();
 
@@ -1408,7 +1420,7 @@ mod tests {
             Some(&cache),
             &compression,
             0.95,
-            &DType::Float8E4M3,
+            &DTypePolicy::uniform(DType::Float8E4M3),
         )
         .unwrap();
 

@@ -7,6 +7,14 @@ use crate::error::{Result, MoonclipError};
 /// Supported storage dtypes for casting.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DType {
+    /// `float64`. A widening target, and the only one: it never recovers a
+    /// bit that the source did not have, it only writes twice as many. It is
+    /// here because reference runs and numerical bisection want the whole
+    /// snapshot in one width to diff against a reference implementation, and
+    /// doing that by hand outside Moonclip means a second full copy of the
+    /// state. A tensor that is *already* float64 is not touched — the
+    /// source-equals-target arm in [`cast_tensor`] returns first.
+    Float64,
     Float32,
     BFloat16,
     Float16,
@@ -33,23 +41,37 @@ impl DType {
     /// for weights, because three mantissa bits beat the extra exponent range
     /// on values that have already been scaled into range. e5m2 is reachable
     /// by name for gradient-shaped data, where the range is what runs out.
+    ///
+    /// The set of *targets* is deliberately shorter than the set of dtypes
+    /// Moonclip stores. Everything PyTorch produces travels through — ints,
+    /// `bool`, complex, the float8 family — because a tensor that is not a
+    /// castable float is stored byte for byte by [`cast_tensor`], whatever
+    /// this setting says. But only floats are destinations: casting weights
+    /// to `int8` is quantization, which needs a scale and a zero-point that
+    /// have nowhere to live on a `TensorEntry`, and silently accepting the
+    /// name would produce a checkpoint whose numbers are wrong rather than
+    /// merely small.
     pub fn parse(s: &str) -> Result<Self> {
         match s.to_lowercase().as_str() {
             "bf16" | "bfloat16" => Ok(DType::BFloat16),
             "fp16" | "float16" => Ok(DType::Float16),
             "fp32" | "float32" => Ok(DType::Float32),
+            "fp64" | "float64" | "double" => Ok(DType::Float64),
             "fp8" | "float8" | "fp8_e4m3" | "float8_e4m3fn" => Ok(DType::Float8E4M3),
             "fp8_e5m2" | "float8_e5m2" => Ok(DType::Float8E5M2),
             "none" | "" => Ok(DType::None),
             other => Err(MoonclipError::Config(format!(
                 "unknown save_dtype '{other}'. Use one of: none, bf16, fp16, \
-                 fp32, fp8 (= fp8_e4m3), fp8_e5m2"
+                 fp32, fp64, fp8 (= fp8_e4m3), fp8_e5m2. Integer, bool and \
+                 complex tensors are stored unchanged and need no setting; \
+                 they are not cast targets."
             ))),
         }
     }
 
     pub fn to_str(&self) -> &'static str {
         match self {
+            DType::Float64 => "float64",
             DType::Float32 => "float32",
             DType::BFloat16 => "bfloat16",
             DType::Float16 => "float16",
@@ -64,6 +86,7 @@ impl DType {
     /// Bytes per element for this dtype.
     pub fn element_size(&self) -> usize {
         match self {
+            DType::Float64 => 8,
             DType::Float32 => 4,
             DType::BFloat16 => 2,
             DType::Float16 => 2,
@@ -81,6 +104,169 @@ impl DType {
             _ => None,
         }
     }
+}
+
+/// Which dtype each tensor is stored as, chosen by its name.
+///
+/// One `save_dtype` for the whole snapshot is the wrong shape for a
+/// checkpoint, because the parts of one do not have the same requirements.
+/// Measured on 2026-08-18, 1.5B FSDP2 per rank: the model weights are about a
+/// third of the bytes and delta well (−70%), while `exp_avg` and `exp_avg_sq`
+/// are the other two thirds and delta barely at all (−1.1% and −4.0%). Two
+/// consecutive optimizer moments differ across nearly every mantissa bit —
+/// with β₁ = 0.9 a tenth of the value is replaced each step — so the XOR is
+/// high-entropy and there is nothing for the compressor to find.
+///
+/// So **85% of the bytes written are the part that does not compress, and it
+/// is also the part that tolerates the least precision.** `exp_avg_sq` enters
+/// Adam through `sqrt(v)`, which halves the relative error; 8-bit optimizers
+/// are current practice for this reason. The weights are the model and are
+/// left alone. Casting only the moments to bf16 halves 85% of the volume.
+///
+/// # Matching
+///
+/// A rule is a glob over the tensor name, where `*` matches any run of
+/// characters and everything else is literal. **The first matching rule
+/// wins**, in the order given — the same rule a routing table follows, and
+/// the one someone writing an ordered mapping expects. A name that matches
+/// nothing is stored as it arrived.
+///
+/// ```text
+/// optimizer/*  → bf16      model/*  → (no rule) → unchanged
+/// ```
+///
+/// Nothing here knows what an optimizer is, and that is deliberate: the
+/// structure that separates the components already exists in the names the
+/// caller passes, so inventing a second channel to carry it would only add a
+/// way for the two to disagree. `model/` and `optimizer/` above are the
+/// prefixes Moonclip's own PyTorch layer writes; a caller that names its
+/// tensors differently — Ravex prefixes them `ravex/models/…` — writes its
+/// own patterns and needs nothing changed here.
+///
+/// A bare string stays what it always was — `"bf16"` casts everything — so
+/// existing configurations keep their meaning exactly.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DTypePolicy {
+    /// Ordered; first match wins. Empty means "cast nothing".
+    rules: Vec<(String, DType)>,
+}
+
+impl DTypePolicy {
+    /// Cast nothing — every tensor stored as it arrives.
+    pub fn none() -> Self {
+        DTypePolicy { rules: Vec::new() }
+    }
+
+    /// One target for every tensor.
+    pub fn uniform(dtype: DType) -> Self {
+        if dtype == DType::None {
+            return Self::none();
+        }
+        DTypePolicy {
+            rules: vec![("*".to_string(), dtype)],
+        }
+    }
+
+    /// Parse the scalar form: `"bf16"` and friends, applied to everything.
+    pub fn parse(s: &str) -> Result<Self> {
+        Ok(Self::uniform(DType::parse(s)?))
+    }
+
+    /// Build from ordered `(pattern, dtype)` pairs.
+    ///
+    /// A rule whose target is `none` is kept rather than dropped: it is how
+    /// an exception is written. `[("model/*", "none"), ("*", "bf16")]`
+    /// means "everything to bf16 except the weights", and it only reads that
+    /// way because the earlier rule shadows the later one.
+    pub fn from_rules<I, P, D>(rules: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = (P, D)>,
+        P: Into<String>,
+        D: AsRef<str>,
+    {
+        let rules = rules
+            .into_iter()
+            .map(|(pattern, dtype)| {
+                let pattern: String = pattern.into();
+                if pattern.is_empty() {
+                    return Err(MoonclipError::Config(
+                        "save_dtype has an empty pattern; use \"*\" to mean \
+                         every tensor"
+                            .to_string(),
+                    ));
+                }
+                Ok((pattern, DType::parse(dtype.as_ref())?))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(DTypePolicy { rules })
+    }
+
+    /// The target for one tensor. `DType::None` when no rule matches.
+    pub fn for_tensor(&self, name: &str) -> &DType {
+        for (pattern, dtype) in &self.rules {
+            if glob_match(pattern, name) {
+                return dtype;
+            }
+        }
+        &DType::None
+    }
+
+    /// Whether any rule could cast anything.
+    ///
+    /// A policy built only from `none` targets is indistinguishable from no
+    /// policy at all, and callers that want to skip the cast machinery
+    /// entirely should ask this rather than compare against `None`.
+    pub fn casts_anything(&self) -> bool {
+        self.rules.iter().any(|(_, d)| *d != DType::None)
+    }
+
+    /// Patterns that matched none of `names`.
+    ///
+    /// A rule that fires on nothing is the failure mode this design has, and
+    /// it is silent: `{"model": "bf16"}` looks right, matches no tensor —
+    /// names arrive as `model/…` — and produces a checkpoint at full
+    /// size with no complaint. That is the same shape as the `save_dtype`
+    /// typo that `DType::parse` refuses, so it gets the same treatment: it is
+    /// reported. Refusing it outright is not open here, because a pattern
+    /// that legitimately matches nothing on *this* rank is normal.
+    pub fn dead_patterns<'a>(&'a self, names: &[&str]) -> Vec<&'a str> {
+        self.rules
+            .iter()
+            .map(|(pattern, _)| pattern.as_str())
+            .filter(|pattern| !names.iter().any(|name| glob_match(pattern, name)))
+            .collect()
+    }
+}
+
+/// Glob match with `*` as the only metacharacter.
+///
+/// Iterative with backtracking rather than recursive: the pattern comes from
+/// a user's config and `*a*a*a*...` against a long tensor name is the input
+/// that turns a naive recursion into an exponential one.
+fn glob_match(pattern: &str, name: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let n: Vec<char> = name.chars().collect();
+    let (mut pi, mut ni) = (0usize, 0usize);
+    // Where to resume if the current `*` turns out to have eaten too little.
+    let (mut star, mut resume) = (None, 0usize);
+
+    while ni < n.len() {
+        if pi < p.len() && p[pi] == '*' {
+            star = Some(pi);
+            pi += 1;
+            resume = ni;
+        } else if pi < p.len() && p[pi] == n[ni] {
+            pi += 1;
+            ni += 1;
+        } else if let Some(s) = star {
+            pi = s + 1;
+            resume += 1;
+            ni = resume;
+        } else {
+            return false;
+        }
+    }
+    p[pi..].iter().all(|c| *c == '*')
 }
 
 /// Determine if a tensor dtype string represents a float type that can be cast.
@@ -1404,5 +1590,179 @@ mod tests {
             let as_fp32 = floats_of(&widen_to_fp32(&back, src).unwrap());
             assert_eq!(as_fp32, vec![0.25, -0.5, 1.0, 0.125], "source {src}");
         }
+    }
+
+    #[test]
+    fn fp64_is_a_target_and_reachable_by_both_names() {
+        assert_eq!(DType::parse("fp64").unwrap(), DType::Float64);
+        assert_eq!(DType::parse("float64").unwrap(), DType::Float64);
+        assert_eq!(DType::parse("double").unwrap(), DType::Float64);
+        assert_eq!(DType::Float64.to_str(), "float64");
+        assert_eq!(DType::Float64.element_size(), 8);
+    }
+
+    /// Widening to fp64 and coming back has to be exact, since every fp32
+    /// value is an fp64 value. It buys nothing in precision — that is said
+    /// plainly on the variant — but it must not lose any either.
+    #[test]
+    fn a_widening_cast_to_fp64_round_trips_exactly() {
+        let values: Vec<f32> = vec![0.0, -1.5, 3.25e-8, 6.02e23, f32::MIN, f32::MAX];
+        let src: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+        let (wide, dtype, scale) = cast_tensor(&src, "float32", &DType::Float64).unwrap();
+        assert_eq!(dtype, "float64");
+        assert_eq!(scale, None);
+        assert_eq!(wide.len(), src.len() * 2);
+
+        let back = uncast_tensor(&wide, "float64", "float32", None).unwrap();
+        assert_eq!(back, src);
+    }
+
+    /// A tensor that is already fp64 is not touched by `save_dtype="fp64"`:
+    /// the source-equals-target arm returns before any conversion, so the
+    /// bytes are the bytes and no `original_dtype` is recorded.
+    #[test]
+    fn an_fp64_tensor_under_an_fp64_target_is_left_alone() {
+        let src: Vec<u8> = (0..64u64).flat_map(|i| (i as f64).to_le_bytes()).collect();
+        let (out, dtype, scale) = cast_tensor(&src, "float64", &DType::Float64).unwrap();
+        assert_eq!(out, src);
+        assert_eq!(dtype, "float64");
+        assert_eq!(scale, None);
+    }
+
+    /// Everything PyTorch produces that is not a castable float travels
+    /// through untouched, whatever the target is. This is the transport half
+    /// of the dtype question, and it is answered by `cast_tensor` refusing to
+    /// reinterpret rather than by an allow-list that would have to be kept up
+    /// to date with torch.
+    #[test]
+    fn non_float_dtypes_are_transported_not_cast() {
+        let data: Vec<u8> = (0..256u32).map(|i| i as u8).collect();
+        for dtype in [
+            "int64", "int32", "int16", "int8", "uint8", "uint16", "uint32", "uint64", "bool",
+            "complex32", "complex64", "complex128", "float8_e4m3fn", "float8_e5m2",
+        ] {
+            for target in [
+                DType::BFloat16,
+                DType::Float16,
+                DType::Float32,
+                DType::Float64,
+                DType::Float8E4M3,
+            ] {
+                let (out, out_dtype, scale) = cast_tensor(&data, dtype, &target).unwrap();
+                assert_eq!(out, data, "{dtype} under {target:?}");
+                assert_eq!(out_dtype, dtype, "{dtype} under {target:?}");
+                assert_eq!(scale, None, "{dtype} under {target:?}");
+            }
+        }
+    }
+
+    /// Integer names are refused as *targets* even though they are carried as
+    /// sources. Accepting `save_dtype="int8"` would mean quantization, which
+    /// needs a scale and a zero-point that have nowhere to live.
+    #[test]
+    fn integer_names_are_not_cast_targets() {
+        for name in ["int8", "uint8", "int64", "bool", "complex64"] {
+            assert!(
+                DType::parse(name).is_err(),
+                "'{name}' must not be accepted as a save_dtype target"
+            );
+        }
+    }
+
+    #[test]
+    fn globs_match_what_they_look_like() {
+        assert!(glob_match("*", "anything/at/all"));
+        assert!(glob_match("ravex/optimizers/*", "ravex/optimizers/exp_avg"));
+        assert!(!glob_match("ravex/optimizers/*", "ravex/models/weight"));
+        assert!(glob_match("*optimizer*", "a/optimizers/b"));
+        assert!(glob_match("exact", "exact"));
+        assert!(!glob_match("exact", "exactly"));
+        assert!(!glob_match("exact", "inexact"));
+        assert!(glob_match("a*b*c", "a__b__c"));
+        assert!(!glob_match("a*b*c", "a__b__d"));
+        assert!(glob_match("*.weight", "layers.0.weight"));
+        assert!(glob_match("**", "x"));
+        assert!(glob_match("*", ""));
+        assert!(!glob_match("a", ""));
+
+        // The pattern that turns a naive recursive matcher exponential. It
+        // has to come back, and quickly, rather than hang a save.
+        assert!(!glob_match(
+            "*a*a*a*a*a*a*a*a*a*a*b",
+            &"a".repeat(64)
+        ));
+    }
+
+    /// The scalar form has to keep meaning exactly what it meant before
+    /// patterns existed, because every configuration in the wild uses it.
+    #[test]
+    fn a_scalar_save_dtype_still_means_everything() {
+        let policy = DTypePolicy::parse("bf16").unwrap();
+        assert_eq!(*policy.for_tensor("ravex/models/w"), DType::BFloat16);
+        assert_eq!(*policy.for_tensor("anything"), DType::BFloat16);
+        assert!(policy.casts_anything());
+
+        let none = DTypePolicy::parse("none").unwrap();
+        assert_eq!(*none.for_tensor("ravex/models/w"), DType::None);
+        assert!(!none.casts_anything());
+        assert_eq!(none, DTypePolicy::none());
+    }
+
+    /// First match wins, in the order written. That is what makes an
+    /// exception expressible: the narrow rule goes before the broad one.
+    #[test]
+    fn the_first_matching_rule_wins() {
+        let policy =
+            DTypePolicy::from_rules([("ravex/models/*", "none"), ("*", "bf16")]).unwrap();
+        assert_eq!(*policy.for_tensor("ravex/models/layer.weight"), DType::None);
+        assert_eq!(
+            *policy.for_tensor("ravex/optimizers/exp_avg"),
+            DType::BFloat16
+        );
+        assert_eq!(*policy.for_tensor("scheduler/last_epoch"), DType::BFloat16);
+
+        // Reversed, the broad rule shadows the narrow one — and it should,
+        // because that is what "first match wins" means. Written the wrong
+        // way round the exception simply does not happen.
+        let shadowed =
+            DTypePolicy::from_rules([("*", "bf16"), ("ravex/models/*", "none")]).unwrap();
+        assert_eq!(
+            *shadowed.for_tensor("ravex/models/layer.weight"),
+            DType::BFloat16
+        );
+    }
+
+    #[test]
+    fn a_tensor_matching_no_rule_is_not_cast() {
+        let policy = DTypePolicy::from_rules([("ravex/optimizers/*", "bf16")]).unwrap();
+        assert_eq!(*policy.for_tensor("ravex/models/w"), DType::None);
+    }
+
+    /// The quiet failure of a pattern API: a rule that reads as if it did
+    /// something and matches nothing. `{"model": ...}` is the shape of the
+    /// mistake, because names arrive with their full path.
+    #[test]
+    fn patterns_that_match_nothing_are_reported() {
+        let policy = DTypePolicy::from_rules([
+            ("model", "bf16"),
+            ("ravex/optimizers/*", "bf16"),
+            ("ravex/scheduler/*", "bf16"),
+        ])
+        .unwrap();
+        let names = ["ravex/models/w", "ravex/optimizers/exp_avg"];
+        assert_eq!(
+            policy.dead_patterns(&names),
+            vec!["model", "ravex/scheduler/*"]
+        );
+
+        let good = DTypePolicy::from_rules([("ravex/*", "bf16")]).unwrap();
+        assert!(good.dead_patterns(&names).is_empty());
+    }
+
+    #[test]
+    fn a_bad_dtype_in_a_rule_is_refused_with_its_pattern_intact() {
+        assert!(DTypePolicy::from_rules([("ravex/optimizers/*", "bfloat")]).is_err());
+        assert!(DTypePolicy::from_rules([("", "bf16")]).is_err());
     }
 }

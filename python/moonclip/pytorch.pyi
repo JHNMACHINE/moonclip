@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
 
 def flatten_state_dict(
     state_dict: dict,
@@ -22,7 +22,7 @@ class CheckpointManager:
 
     world_size: int
     rank: int
-    save_dtype: str
+    save_dtype: Union[str, Mapping[str, str], None]
     last_resume_metadata: Dict[str, str]
     _mgr: Any
     _best_metric: Optional[float]
@@ -39,7 +39,7 @@ class CheckpointManager:
         rank: Union[int, str, None] = None,
         merge_stride: int = 0,
         merge_max_chain: int = 10,
-        save_dtype: str = "none",
+        save_dtype: Union[str, Mapping[str, str], None] = None,
         max_total_snapshots: Optional[int] = None,
         async_save: bool = True,
         keep_base_in_memory: bool = True,

@@ -622,3 +622,168 @@ class TestUnflattenStateDict:
 
         assert unflatten_state_dict({}) == {}
         assert unflatten_state_dict({"loose/tensor": b"\x00\x01"}) == {}
+
+
+class TestPerComponentSaveDtype:
+    """`save_dtype` chosen per tensor name.
+
+    The reason it exists: on a real run the optimizer moments are ~85% of
+    the bytes written and delta almost not at all, and they are also the
+    part that tolerates the least precision. One dtype for the whole
+    snapshot cannot express that.
+    """
+
+    def _run(self, tmp_path, save_dtype, steps=2):
+        """Train two steps, checkpoint each, reload into a fresh pair.
+
+        Returns the largest absolute error on the weights and on `exp_avg`,
+        which is what tells a cast component from an uncast one.
+        """
+        torch.manual_seed(0)
+        model = torch.nn.Linear(128, 128, bias=False)
+        opt = torch.optim.AdamW(model.parameters(), lr=0.1)
+        mgr = CheckpointManager(
+            storage_root=str(tmp_path), async_save=False, save_dtype=save_dtype
+        )
+
+        def step():
+            model(torch.randn(8, 128)).sum().backward()
+            opt.step()
+            opt.zero_grad()
+
+        for i in range(steps):
+            step()
+            mgr.save(step=i + 1, model=model, optimizer=opt)
+        mgr.flush()
+
+        want_w = model.weight.detach().clone()
+        want_m = opt.state[model.weight]["exp_avg"].clone()
+
+        torch.manual_seed(0)
+        model2 = torch.nn.Linear(128, 128, bias=False)
+        opt2 = torch.optim.AdamW(model2.parameters(), lr=0.1)
+        model2(torch.randn(8, 128)).sum().backward()
+        opt2.step()
+        opt2.zero_grad()
+        CheckpointManager(storage_root=str(tmp_path)).load_latest(
+            model=model2, optimizer=opt2
+        )
+
+        return (
+            (model2.weight.detach() - want_w).abs().max().item(),
+            (opt2.state[model2.weight]["exp_avg"] - want_m).abs().max().item(),
+        )
+
+    def test_a_string_still_casts_everything(self, tmp_path):
+        """The form every existing configuration uses must not change
+        meaning."""
+        weight_err, moment_err = self._run(tmp_path, "bf16")
+        assert weight_err > 0
+        assert moment_err > 0
+
+    def test_a_pattern_casts_only_what_it_matches(self, tmp_path):
+        """The headline case: moments to bf16, weights untouched.
+
+        The weights must come back *bit* exact — anything else means the
+        cast leaked past its pattern.
+        """
+        weight_err, moment_err = self._run(tmp_path, {"optimizer/*": "bf16"})
+        assert weight_err == 0.0
+        assert moment_err > 0
+
+    def test_an_exception_is_written_by_putting_it_first(self, tmp_path):
+        weight_err, moment_err = self._run(
+            tmp_path, {"model/*": "none", "*": "bf16"}
+        )
+        assert weight_err == 0.0
+        assert moment_err > 0
+
+    def test_the_order_of_the_rules_is_the_precedence(self, tmp_path):
+        """First match wins, so a catch-all written first shadows what
+        follows. Reversing the previous test has to reverse its outcome —
+        otherwise the ordering is not doing anything and the documented rule
+        is a fiction."""
+        weight_err, _ = self._run(tmp_path, {"*": "bf16", "model/*": "none"})
+        assert weight_err > 0
+
+    def test_no_save_dtype_casts_nothing(self, tmp_path):
+        weight_err, moment_err = self._run(tmp_path, None)
+        assert weight_err == 0.0
+        assert moment_err == 0.0
+
+    def test_a_delta_after_a_partial_cast_still_reconstructs(self, tmp_path):
+        """The failure mode the per-tensor `retain_base` rule avoids.
+
+        With one component cast and the other not, the base kept in memory
+        for the next delta is partial. Four steps is enough for the second
+        save onward to be deltas against it.
+        """
+        weight_err, moment_err = self._run(
+            tmp_path, {"optimizer/*": "bf16"}, steps=4
+        )
+        assert weight_err == 0.0
+        # bf16 keeps 8 significant bits. An error this small is rounding; a
+        # delta applied to the wrong base would be nothing like it.
+        assert moment_err < 0.05
+
+    def test_integer_state_is_never_cast(self, tmp_path):
+        """`save_dtype` names a target for floats. A step counter is not a
+        float and has no business being touched because one was set."""
+        torch.manual_seed(0)
+        model = torch.nn.Linear(64, 64, bias=False)
+        opt = torch.optim.SGD(model.parameters(), lr=0.1, momentum=0.9)
+        mgr = CheckpointManager(
+            storage_root=str(tmp_path), async_save=False, save_dtype="bf16"
+        )
+        counter = torch.arange(1024, dtype=torch.int64)
+        mask = torch.zeros(1024, dtype=torch.bool)
+        mask[::3] = True
+
+        model(torch.randn(4, 64)).sum().backward()
+        opt.step()
+        mgr.save(
+            step=1,
+            model=model,
+            optimizer=opt,
+            extra={"counters": {"seen": counter, "mask": mask}},
+        )
+        mgr.flush()
+
+        _, state = CheckpointManager(storage_root=str(tmp_path)).load_latest()
+        back = state["extra/counters"]
+        assert back["seen"].dtype == torch.int64
+        assert torch.equal(back["seen"], counter)
+        assert back["mask"].dtype == torch.bool
+        assert torch.equal(back["mask"], mask)
+
+    def test_fp64_is_a_target_that_loses_nothing(self, tmp_path):
+        """It only ever widens — it recovers no precision the source did not
+        have — but it must not drop any either."""
+        weight_err, moment_err = self._run(tmp_path, "fp64")
+        assert weight_err == 0.0
+        assert moment_err == 0.0
+
+    def test_a_pattern_that_matches_nothing_is_reported(self, tmp_path, capfd):
+        """The quiet failure of a pattern API. `{"weight": ...}` reads as if
+        it did something: names arrive as `model/weight`, so it matches
+        nothing, casts nothing, and would otherwise say nothing."""
+        self._run(tmp_path, {"weight": "bf16"}, steps=1)
+        err = capfd.readouterr().err
+        assert "save_dtype pattern(s) weight matched none" in err
+
+    @pytest.mark.parametrize(
+        "bad,exc",
+        [
+            ({"optimizer/*": "bfloat"}, RuntimeError),
+            ({"optimizer/*": 16}, TypeError),
+            ({"": "bf16"}, RuntimeError),
+            ("bfloat", RuntimeError),
+            (16, TypeError),
+        ],
+    )
+    def test_a_bad_save_dtype_is_refused_not_ignored(self, tmp_path, bad, exc):
+        """Same rule as the scalar form has always had: a value that cannot
+        be understood stops the run, because mapping it to "do not cast"
+        makes a typo into a silently doubled checkpoint."""
+        with pytest.raises(exc):
+            CheckpointManager(storage_root=str(tmp_path), save_dtype=bad)

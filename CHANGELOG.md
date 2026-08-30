@@ -95,7 +95,86 @@ The first is a behaviour change and the migration is one line — see below.
   off, where the write happens on the calling thread and is the write rather
   than a queue in front of it.
 
+- **`save_dtype` may now be chosen per tensor**, as an ordered dict of glob
+  pattern to dtype:
+
+  ```python
+  CheckpointManager(save_dtype={"optimizer/*": "bf16"})
+  ```
+
+  `*` matches any run of characters, everything else is literal, and **the
+  first matching rule wins** — so an exception is written by putting it first,
+  `{"model/*": "none", "*": "bf16"}`. A tensor matching no rule is stored as
+  it arrived. A plain string is unchanged in meaning and still casts
+  everything, so no existing configuration moves.
+
+  One dtype for a whole snapshot was the wrong shape, and the measurement says
+  how wrong. On a 1.5B model under FSDP2, per rank: the weights are about a
+  third of the bytes and delta well, −70%; `exp_avg` and `exp_avg_sq` are the
+  other two thirds and delta essentially not at all, −1.1% and −4.0%. Two
+  consecutive Adam moments differ across nearly every mantissa bit — with
+  β₁ = 0.9 a tenth of the value is replaced each step — so there is nothing in
+  the XOR for a compressor to find. **85% of the bytes written are the part
+  that does not compress**, and it is also the part that tolerates the least
+  precision: `exp_avg_sq` enters Adam through `sqrt(v)`, which halves the
+  relative error, which is why 8-bit optimizers are ordinary practice. Casting
+  only the moments to bf16 halves 85% of the volume and leaves the model
+  alone.
+
+  Nothing in Moonclip knows what an optimizer is, and that is the design: the
+  structure separating the components already exists in the names the caller
+  passes, so a second channel to carry it could only add a way for the two to
+  disagree. `model/` and `optimizer/` are what Moonclip's own PyTorch layer
+  writes; a caller that names its tensors differently writes its own patterns.
+
+  A pattern matching none of a rank's tensors is reported on stderr, once. It
+  is this feature's quiet failure — `{"weight": "bf16"}` reads as if it did
+  something and matches nothing, because names arrive as `model/weight` — and
+  it is the same shape as the `save_dtype` typo that has always been refused.
+  A complaint rather than a refusal, because on a sharded save a pattern
+  matching nothing *on this rank* is legitimate.
+
+- **`save_dtype="fp64"`.** A widening target, and the only one: it recovers no
+  precision the source did not have, it writes twice the bytes. It is here for
+  reference runs and numerical bisection, which want a whole snapshot in one
+  width to diff against a reference implementation and otherwise have to make
+  a second full copy of the state outside Moonclip. A tensor that is already
+  float64 is untouched, as before.
+
 ### Changed
+
+- **`keep_base_in_memory` is now decided per tensor rather than per
+  snapshot.** It used to be switched off entirely whenever `save_dtype` cast
+  anything, because what a later delta is computed against is the bytes on
+  disk and for a cast tensor those are not the bytes that arrived. That is
+  still true, and the test is now `original_dtype`, which is set exactly when
+  the stored bytes and the incoming bytes differ. So the ordinary
+  configuration — moments to bf16, weights untouched — keeps the weights in
+  memory, which is the third of the state where the delta actually pays, and
+  where the retained base removes 36% of the write path's CPU.
+
+  Nothing downstream needed changing for a partial base: `BaseCache` looks
+  each tensor up by name and falls back to storage on a miss.
+
+- **`shuffle::element_size` knows `complex128`, `complex32` and the six
+  float8 names.** A dtype missing from that table falls back to one byte,
+  which turns the byte-plane filter into a no-op — safe, never a corruption,
+  and completely silent. `complex128` was in exactly that position: stored
+  correctly at 16 bytes an element and shuffled as if it were bytes, so its
+  deltas compressed worse than they had to with nothing anywhere to say so.
+  Extending the table does not affect checkpoints already written; the load
+  path unshuffles only when the entry's `shuffled` flag is set, and a delta
+  written under the old width did not set it.
+
+- **`torch.uint32`, `torch.uint64` and `torch.complex32` are accepted** on the
+  direct tensor path, which was refusing them with a hard `ValueError`
+  mid-run. The quantized dtypes (`qint8`, `quint8`, `qint32`, `quint4x2`,
+  `quint2x4`) are still refused, and deliberately: their scale and zero-point
+  are properties of the tensor rather than of the buffer, and a `TensorEntry`
+  has nowhere to keep them, so storing the bytes would produce a checkpoint
+  that loads without complaint and holds integers nobody can turn back into
+  numbers.
+
 
 - **`CheckpointManager` no longer decides its own topology.** It used to read
   `RANK`/`WORLD_SIZE` from the environment whenever it was not told, and adopt

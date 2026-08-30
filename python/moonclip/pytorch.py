@@ -15,7 +15,7 @@ import ctypes
 import os
 import pickle
 import sys
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, Mapping, Optional, Tuple, Union
 
 import torch
 
@@ -578,7 +578,7 @@ class CheckpointManager:
         rank: Union[int, str, None] = None,
         merge_stride: int = 0,
         merge_max_chain: int = 10,
-        save_dtype: str = "none",
+        save_dtype: Union[str, Mapping[str, str], None] = None,
         max_total_snapshots: Optional[int] = None,
         async_save: bool = True,
         keep_base_in_memory: bool = True,
