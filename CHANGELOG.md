@@ -73,6 +73,28 @@ The first is a behaviour change and the migration is one line — see below.
   around it. The infinity itself still survives as a NaN, so nothing is
   hidden.
 
+- **`last_queue_wait()`**, on `MoonclipManager` and `CheckpointManager`: how
+  long the last save spent waiting for the previous one to drain, in seconds.
+
+  One save is allowed in flight, so a writer that has not finished stops the
+  next `save_tensors` before any of its own work begins. From outside Moonclip
+  that is indistinguishable from the shadow copy having been slow — one call,
+  one duration — and the two have nothing to do with each other: the copy is
+  memory bandwidth and grows with the model, the wait is backpressure and
+  grows with the checkpoint cadence and the speed of the storage. Summed, they
+  point at neither. Ravex reports them as separate phases on the strength of
+  this.
+
+  The number already existed and `MOONCLIP_PROFILE=1` already printed it. What
+  it could not do is reach a program, and a caller that has to turn on a
+  profiler and read stderr does not have the number at the moment the question
+  comes up, which is mid-run on a machine being billed by the hour.
+
+  Read it on the thread that just called `save_tensors` and it describes that
+  call. Zero when nothing was in flight, and always zero with `async_save`
+  off, where the write happens on the calling thread and is the write rather
+  than a queue in front of it.
+
 ### Changed
 
 - **`CheckpointManager` no longer decides its own topology.** It used to read

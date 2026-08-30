@@ -905,6 +905,22 @@ class CheckpointManager:
             step=step, tensors=tensors, metadata=metadata or {}
         )
 
+    def last_queue_wait(self) -> float:
+        """
+        Seconds the last save waited for the previous one to drain.
+
+        Moonclip allows one save in flight, so a writer that has not caught up
+        stops the next save before it does anything. A caller timing its own
+        save sees that wait folded into the same number as the shadow copy,
+        and the two want different answers: the copy is memory bandwidth and
+        scales with the model, the wait is backpressure and scales with the
+        cadence and the storage. Reading this straight after a save separates
+        them.
+
+        Zero when nothing was in flight, and when async_save is off.
+        """
+        return self._mgr.last_queue_wait()
+
     def stats(self) -> Dict[str, Any]:
         """
         Return aggregate checkpoint statistics.

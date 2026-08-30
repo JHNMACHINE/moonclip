@@ -392,6 +392,18 @@ impl MoonclipManager {
         Ok(id.to_string())
     }
 
+    /// Seconds the last `save_tensors` spent waiting for the previous save.
+    ///
+    /// Call it straight after `save_tensors`, on the same thread, and it
+    /// describes that call. See `Coordinator::last_queue_wait` for what the
+    /// number is and why it is worth having apart: a caller timing its own
+    /// save sees the shadow copy and this wait as one duration, and they have
+    /// different causes and different remedies. `MOONCLIP_PROFILE=1` prints it
+    /// too, but a log line is not available to a program.
+    fn last_queue_wait(&self) -> f64 {
+        self.inner.last_queue_wait().as_secs_f64()
+    }
+
     /// Create a new snapshot (multi-rank: rank 0 only).
     #[pyo3(signature = (step, metadata = None))]
     fn create_snapshot(&self, step: u64, metadata: Option<Bound<'_, PyDict>>) -> PyResult<String> {

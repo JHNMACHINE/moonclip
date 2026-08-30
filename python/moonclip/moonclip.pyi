@@ -142,6 +142,27 @@ class MoonclipManager:
         """
         ...
 
+    def last_queue_wait(self) -> float:
+        """
+        Seconds the last save_tensors() waited for the previous save to drain.
+
+        One save is allowed in flight. When the writer has not finished, the
+        next save_tensors() blocks before any of its own work starts, and from
+        the outside that is indistinguishable from the shadow copy having been
+        slow: one call, one duration, two unrelated causes. The copy is memory
+        bandwidth and grows with the model; this is backpressure and grows with
+        the checkpoint cadence and the speed of the storage. Told apart, each
+        points at a different fix; added together they point at neither.
+
+        Call it right after save_tensors(), on the same thread, and it
+        describes that call. It is a single value overwritten by each save.
+
+        Zero when there was nothing to wait for, and always zero when
+        async_save is off — the write then happens on the calling thread, and
+        that is the write itself rather than a queue in front of it.
+        """
+        ...
+
     def create_snapshot(
         self,
         step: int,

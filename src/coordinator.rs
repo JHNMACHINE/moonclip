@@ -1,7 +1,8 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
@@ -516,6 +517,30 @@ impl Coordinator {
             self.core.save_sync(snap_id, step, tensors, metadata)?;
         }
         Ok(snap_id)
+    }
+
+    /// How long the last save spent waiting for the previous one to drain.
+    ///
+    /// One save is allowed in flight, so a writer that has not finished stops
+    /// the next `save` before any of its work begins. From outside Moonclip
+    /// that wait is indistinguishable from a slow shadow copy — the caller
+    /// sees one call that took longer — and the two have nothing in common:
+    /// the copy is memory bandwidth and scales with the model, this is
+    /// backpressure and scales with the cadence and the storage. A caller that
+    /// reports its own phase timings needs them apart to name the right one.
+    ///
+    /// Read it on the thread that just called `save`, where it describes that
+    /// save. It is one value, overwritten by each submission, and Moonclip
+    /// takes one save at a time from one thread; nothing here makes it a
+    /// meaningful answer to a thread that did not ask.
+    ///
+    /// Zero when there is nothing to wait for: with `async_save` off the write
+    /// happens on the calling thread, and that is the write, not a queue.
+    pub fn last_queue_wait(&self) -> Duration {
+        match self.saver {
+            Some(ref saver) => Duration::from_nanos(saver.last_wait.load(Ordering::Relaxed)),
+            None => Duration::ZERO,
+        }
     }
 
     /// Block until any in-flight background save completes and surface
@@ -1640,6 +1665,10 @@ struct AsyncSaver {
     tx: Option<mpsc::Sender<SaveJob>>,
     shared: Arc<(Mutex<SaverShared>, Condvar)>,
     handle: Option<thread::JoinHandle<()>>,
+    /// How long the most recent `submit` waited for the previous save to
+    /// drain. Written by the caller's thread in `submit`, read by that same
+    /// thread once `save` returns — see [`Coordinator::last_queue_wait`].
+    last_wait: AtomicU64,
 }
 
 impl AsyncSaver {
@@ -1693,6 +1722,7 @@ impl AsyncSaver {
             tx: Some(tx),
             shared,
             handle: Some(handle),
+            last_wait: AtomicU64::new(0),
         }
     }
 
@@ -1752,8 +1782,12 @@ impl AsyncSaver {
         }
         // How long that wait was is the difference between "the copy is slow"
         // and "the writer never catches up", and the caller cannot tell them
-        // apart from the outside. Reported under MOONCLIP_PROFILE.
+        // apart from the outside. Kept for the caller as well as logged: a
+        // number only `MOONCLIP_PROFILE=1` will show is a number nobody has
+        // when the question comes up, which is on a rented machine mid-run.
         let waited = queued.elapsed();
+        self.last_wait
+            .store(waited.as_nanos() as u64, Ordering::Relaxed);
         // Surface a failure from the previous save before starting another,
         // matching what the old `self.flush()?` on entry did.
         if let Some(e) = state.error.take() {
@@ -2123,6 +2157,68 @@ mod tests {
                 "trial {trial}: a concurrent save is missing from the manifest"
             );
         }
+    }
+
+    /// The queue wait is available to the caller, not only to a log line.
+    ///
+    /// GPU-61: a caller timing its own save could not tell the shadow copy
+    /// from the wait for the previous writer, so a phase dominated by a memcpy
+    /// was read as a writer in deficit — and an issue was opened against the
+    /// writer on the strength of it.
+    #[test]
+    fn the_queue_wait_is_reported_to_the_caller() {
+        let dir = tempfile::tempdir().unwrap();
+        let coord = make_coordinator(dir.path());
+
+        // Nothing has ever been in flight, so there was nothing to wait for.
+        coord.save(1, sample_tensors(1), HashMap::new()).unwrap();
+        let first = coord.last_queue_wait();
+
+        // No flush in between. `submit` sets `busy` before it returns, so the
+        // second save cannot get past the condvar until the first has drained
+        // — the wait is forced by the ordering, not hoped for from timing.
+        let big = vec![TensorData {
+            name: "w".into(),
+            shape: vec![16 << 20],
+            dtype: "uint8".into(),
+            data: (0..(16u32 << 20)).map(|i| (i ^ (i >> 7)) as u8).collect(),
+        }];
+        coord.save(2, big.clone(), HashMap::new()).unwrap();
+        coord.save(3, big, HashMap::new()).unwrap();
+        let queued = coord.last_queue_wait();
+        coord.flush().unwrap();
+
+        assert!(
+            queued > first,
+            "a save submitted behind an in-flight one reported no wait \
+             (first {first:?}, queued {queued:?})"
+        );
+        assert!(
+            queued > Duration::ZERO,
+            "the wait for the previous writer came back as zero"
+        );
+    }
+
+    /// With no background saver there is no queue to wait in. The write then
+    /// happens on the calling thread, and calling that backpressure would name
+    /// the write itself as the thing standing in front of the write.
+    #[test]
+    fn a_synchronous_save_waits_for_nobody() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(dir.path()).unwrap());
+        let config = CoordinatorConfig {
+            world_size: 1,
+            rank: 0,
+            async_save: false,
+            compression: CompressionAlgo::Zstd { level: 1 },
+            ..Default::default()
+        };
+        let coord = Coordinator::new(storage, config).unwrap();
+
+        coord.save(1, sample_tensors(1), HashMap::new()).unwrap();
+        coord.save(2, sample_tensors(2), HashMap::new()).unwrap();
+
+        assert_eq!(coord.last_queue_wait(), Duration::ZERO);
     }
 
     #[test]

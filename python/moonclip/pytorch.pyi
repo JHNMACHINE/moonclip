@@ -67,6 +67,10 @@ class CheckpointManager:
         """Save pre-flattened tensors directly (for background executor pattern)."""
         ...
 
+    def last_queue_wait(self) -> float:
+        """Seconds the last save waited for the previous one to drain."""
+        ...
+
     def save_best(
         self,
         step: int,
