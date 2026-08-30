@@ -8,7 +8,7 @@ name: Checks
 # One job, one container, no MinIO and no interpreter matrix: `cargo test`
 # covers the library and its 177 tests in seconds, and clippy covers the rest.
 # What it deliberately does *not* cover is what needs a real environment — the
-# S3 backend against MinIO, the PyTorch adapter, and Python 3.9 through 3.14.
+# S3 backend against MinIO, the PyTorch adapter, and Python 3.11 through 3.14.
 # Those wait for main.
 on:
   push:

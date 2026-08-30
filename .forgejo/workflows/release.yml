@@ -245,7 +245,7 @@ jobs:
       # leaves a half-published release with no way to finish it.
       fail-fast: false
       matrix:
-        python: [cp39, cp310, cp311, cp312, cp313, cp314]
+        python: [cp311, cp312, cp313, cp314]
     steps:
       - name: Install Rust
         run: |

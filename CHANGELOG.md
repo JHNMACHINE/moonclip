@@ -143,6 +143,26 @@ The first is a behaviour change and the migration is one line — see below.
 
 ### Changed
 
+- **Python 3.9 and 3.10 are no longer supported.** The floor is 3.11, and no
+  cp39 or cp310 wheel is published.
+
+  The list is [the Python devguide's](https://devguide.python.org/versions/)
+  rather than a judgement of our own about who is still out there. 3.9 reached
+  end-of-life on 31 October 2025, ten months before this release. 3.10 is
+  still in security-only maintenance, but it reaches end-of-life in **October
+  2026** — two months from now — so stopping there would have meant doing this
+  again almost immediately. 3.11 runs to October 2027.
+
+  Three lists move together here and all three were changed: the test matrix
+  in `ci.yml`, the classifiers in `pyproject.toml`, and the wheel build list
+  in `release.yml`. The last is the one that matters at tag time — it was
+  still building `cp39` and `cp310`, so a tag would have published wheels for
+  two interpreters the package no longer claims to support.
+
+  3.15 is deliberately absent rather than watched. Moonclip ships a compiled
+  wheel per interpreter, so a version it tests is a version it can publish,
+  and there is no cp315 manylinux to build against yet.
+
 - **`keep_base_in_memory` is now decided per tensor rather than per
   snapshot.** It used to be switched off entirely whenever `save_dtype` cast
   anything, because what a later delta is computed against is the bytes on

@@ -8,7 +8,7 @@ name: CI
 # What guards the branch instead is `checks.yml`, which is fast and runs on
 # every push that is not main. The trade is deliberate and worth stating: a
 # branch is no longer proven against the full matrix before it is merged, so a
-# failure specific to, say, Python 3.9 or to the S3 backend now surfaces on
+# failure specific to, say, one interpreter or to the S3 backend now surfaces on
 # main rather than on the pull request. `main` is what `release.yml` publishes
 # from, so when that happens, fix forward promptly.
 on:
@@ -131,7 +131,7 @@ jobs:
         # Every version release.yml ships a wheel for: a version we publish is
         # a version we test. Keep this list, the classifiers in pyproject.toml,
         # and the build list in release.yml in step with each other.
-        python: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]
+        python: ["3.11", "3.12", "3.13", "3.14"]
     container:
       # One official image per version. Each ships that interpreter with pip
       # already in it, so the job needs no Python version manager and no venv:
