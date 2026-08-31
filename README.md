@@ -225,10 +225,10 @@ python/moonclip/
 | `examples/` | Runnable: plain model, transformer, DDP, S3 |
 | `.forgejo/workflows/` | `checks.yml` on branches, `ci.yml` on main, `bench.yml`, `release.yml` |
 
-As of 0.0.9 that is about 14.2k lines of Rust across 22 files and 1.7k of
-Python, covered by 211 crate tests, 5 more against a live MinIO, and 101
+As of 0.1.0 that is about 15.6k lines of Rust across 22 files and 1.4k of
+Python, covered by 222 crate tests, 19 more against a live MinIO, and 108
 Python ones. Roughly half of the Rust is `#[cfg(test)]`: `coordinator/`
-carries 1.7k lines of tests against 1.9k of code, which is why it is the one
+carries 2.2k lines of tests against 2.3k of code, which is why it is the one
 part of the crate laid out as a directory.
 
 ## Development
