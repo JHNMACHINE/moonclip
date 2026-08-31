@@ -234,6 +234,45 @@ The first is a behaviour change and the migration is one line — see below.
   the absent value is the correct one rather than a missing one. The format
   version is unmoved at 2.
 
+### Fixed
+
+- **The merger and the remote syncer no longer die in silence.** Moonclip runs
+  three background threads and only one of them — the async saver — was
+  protected from panics. A panic on either of the other two killed the thread
+  outright: `for cmd in rx` ended, the receiver dropped, and every later
+  `notify` failed into a `let _ =`. Nothing was poisoned and nothing was
+  raised, because the worker held the receiving end and the callers hold the
+  sending one, so the calls went on succeeding at nothing for the rest of the
+  process.
+
+  What that cost, silently:
+
+  - **Merger gone** — delta chains stop being consolidated. Loads degrade
+    without limit and no message says why.
+  - **Syncer gone** — nothing reaches S3 or R2 again. For a durability feature
+    this is the worst failure available: the run believes it has remote
+    backups, and finds out it does not when the machine dies and a resume is
+    attempted.
+
+  Both loops now catch panics per command, the same treatment and for the same
+  reason as the saver: a panic becomes what a storage failure already was — an
+  error, with the loop still running. A forced merge and `sync_now`, which have
+  a caller waiting on a reply, get that error returned rather than logged.
+
+  Catching is only half. A thread can still go for a reason no `catch_unwind`
+  reaches, so **`flush()` now reports a background thread that is gone**, and
+  reports it every time rather than once: it is not an event that happened but
+  a state that will not improve, since nothing restarts those threads. The
+  error names which thread and what has stopped, and says the checkpoints on
+  local disk are still being written and still readable.
+
+- **`merge_now()` no longer reports success when there was no thread to do the
+  merge.** A failed send to a departed merger returned `Ok(())`, on the grounds
+  that shutdown could be racing it — but `shutdown` takes `&mut self` and
+  cannot be. `save_final` is the caller this mattered for: it merges and then
+  uploads, so a fold reported as done that never happened is how a run's final
+  checkpoint reaches the bucket unmerged.
+
 
 ## 0.0.8 — 2026-08-21
 

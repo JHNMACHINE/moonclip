@@ -1,3 +1,4 @@
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -113,6 +114,9 @@ pub struct RemoteSyncer {
     handle: Option<thread::JoinHandle<()>>,
     save_counter: std::sync::atomic::AtomicU64,
     sync_every: u64,
+    /// Raised when the worker loop leaves by any route other than the
+    /// `Shutdown` command. See [`RemoteSyncer::is_dead`].
+    dead: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl RemoteSyncer {
@@ -129,30 +133,68 @@ impl RemoteSyncer {
     ) -> Self {
         let (tx, rx) = mpsc::channel();
         let sync_every = config.sync_every_n_saves;
+        let dead = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let dead_worker = Arc::clone(&dead);
 
         let handle = thread::Builder::new()
             .name("moonclip-remote-sync".into())
             .spawn(move || {
+                let mut life = crate::merger::ThreadLife::new(dead_worker);
                 for cmd in rx {
                     match cmd {
                         SyncCommand::SyncPrefix(prefix) => {
-                            if let Err(e) = sync_prefix(&local, &remote, &prefix) {
-                                eprintln!("[Moonclip sync] Error syncing '{}': {}", prefix, e);
+                            // Caught for the same reason the saver and the
+                            // merger catch: a panic here killed this thread,
+                            // the receiver dropped, and `notify_save` went on
+                            // succeeding at nothing. For a durability feature
+                            // that is the worst failure available — the run
+                            // believes it has remote backups and does not, and
+                            // finds out when the machine dies and a resume is
+                            // attempted.
+                            let outcome = catch_unwind(AssertUnwindSafe(|| {
+                                let result = sync_prefix(&local, &remote, &prefix);
+                                apply_deletes(&remote, &deletes);
+                                result
+                            }));
+                            match outcome {
+                                Ok(Ok(())) => {}
+                                Ok(Err(e)) => {
+                                    eprintln!("[Moonclip sync] Error syncing '{}': {}", prefix, e)
+                                }
+                                Err(panic) => eprintln!(
+                                    "[Moonclip sync] Syncing '{}' panicked: {}",
+                                    prefix,
+                                    crate::error::panic_message(&*panic)
+                                ),
                             }
-                            apply_deletes(&remote, &deletes);
                         }
                         SyncCommand::SyncAll(reply) => {
-                            let outcome = match sync_store(&local, &remote) {
-                                Ok(()) => None,
-                                Err(e) => Some(e.to_string()),
+                            // The caller is blocked on `reply` and wants the
+                            // outcome, so a panic becomes that outcome rather
+                            // than a dropped sender the caller has to infer
+                            // something from.
+                            let outcome = catch_unwind(AssertUnwindSafe(|| {
+                                let result = sync_store(&local, &remote);
+                                // After the upload, never before: a key queued
+                                // for deletion is already gone locally, so the
+                                // upload above cannot have put it back.
+                                apply_deletes(&remote, &deletes);
+                                result
+                            }));
+                            let outcome = match outcome {
+                                Ok(Ok(())) => None,
+                                Ok(Err(e)) => Some(e.to_string()),
+                                Err(panic) => Some(format!(
+                                    "sync thread panicked: {}",
+                                    crate::error::panic_message(&*panic)
+                                )),
                             };
-                            // After the upload, never before: a key queued for
-                            // deletion is already gone locally, so the upload
-                            // above cannot have put it back.
-                            apply_deletes(&remote, &deletes);
                             let _ = reply.send(outcome);
                         }
-                        SyncCommand::Shutdown => break,
+                        SyncCommand::Shutdown => {
+                            life.shutting_down();
+                            break;
+                        }
                     }
                 }
             })
@@ -163,7 +205,14 @@ impl RemoteSyncer {
             handle: Some(handle),
             save_counter: std::sync::atomic::AtomicU64::new(0),
             sync_every,
+            dead,
         }
+    }
+
+    /// Whether the worker thread is gone while it was still meant to be
+    /// running. Permanent once true: nothing restarts it.
+    pub(crate) fn is_dead(&self) -> bool {
+        self.dead.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Notify the syncer that a save happened.
@@ -185,8 +234,15 @@ impl RemoteSyncer {
             if let Some(ref tx) = self.sender {
                 let tx = tx.lock().unwrap();
                 // Sync snapshots and manifest
-                let _ = tx.send(SyncCommand::SyncPrefix("snapshots".into()));
-                let _ = tx.send(SyncCommand::SyncPrefix(MANIFEST.into()));
+                let snapshots = tx.send(SyncCommand::SyncPrefix("snapshots".into()));
+                let manifest = tx.send(SyncCommand::SyncPrefix(MANIFEST.into()));
+                // A failed send means the receiver is gone, which means the
+                // worker is. Recorded rather than discarded: this call is on
+                // the save path and cannot fail loudly, but a syncer that is
+                // no longer there has to be visible to the next `flush`.
+                if snapshots.is_err() || manifest.is_err() {
+                    self.dead.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
             }
         }
     }
@@ -210,6 +266,7 @@ impl RemoteSyncer {
             .send(SyncCommand::SyncAll(reply_tx))
             .is_err()
         {
+            self.dead.store(true, std::sync::atomic::Ordering::Relaxed);
             return Err(MoonclipError::Storage(
                 "Remote sync thread is gone; nothing was synced".into(),
             ));
@@ -218,11 +275,14 @@ impl RemoteSyncer {
         match reply_rx.recv() {
             Ok(None) => Ok(()),
             Ok(Some(e)) => Err(MoonclipError::Storage(format!("Remote sync failed: {e}"))),
-            Err(_) => Err(MoonclipError::Storage(
-                "Remote sync thread stopped before reporting; data may not have \
-                 reached the remote"
-                    .into(),
-            )),
+            Err(_) => {
+                self.dead.store(true, std::sync::atomic::Ordering::Relaxed);
+                Err(MoonclipError::Storage(
+                    "Remote sync thread stopped before reporting; data may not have \
+                     reached the remote"
+                        .into(),
+                ))
+            }
         }
     }
 

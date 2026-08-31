@@ -300,12 +300,22 @@ impl Coordinator {
     }
 
     /// Block until any in-flight background save completes and surface
-    /// its error, if any.
+    /// its error, if any — and report a background thread that has died.
+    ///
+    /// The saver's error is taken once and consumed; a dead merger or syncer
+    /// is reported **every time**, because it is not an event that happened
+    /// but a state that will not improve. Nothing restarts those threads, so a
+    /// one-shot report would be one message a caller could miss on its way to
+    /// discovering, at resume time, that half a run's deltas were never folded
+    /// or never left the machine.
+    ///
+    /// The saved data is still on local disk in both cases, and still
+    /// readable. What has stopped is the consolidating and the uploading.
     pub fn flush(&self) -> Result<()> {
-        match self.saver {
-            Some(ref s) => s.flush(),
-            None => Ok(()),
+        if let Some(ref s) = self.saver {
+            s.flush()?;
         }
+        self.core.check_background_threads()
     }
 
     fn wait_idle(&self) {
@@ -390,6 +400,29 @@ impl Coordinator {
 }
 
 impl Core {
+    /// Report a background thread that is gone while it was still meant to be
+    /// running. See [`Coordinator::flush`].
+    ///
+    /// Both are named in one error when both are gone, so a caller reading a
+    /// log does not fix one and rediscover the other.
+    fn check_background_threads(&self) -> Result<()> {
+        let mut gone: Vec<&str> = Vec::new();
+        if self.merger.as_ref().is_some_and(|m| m.is_dead()) {
+            gone.push("merger (delta chains are no longer being consolidated)");
+        }
+        if self.syncer.as_ref().is_some_and(|s| s.is_dead()) {
+            gone.push("remote syncer (nothing is reaching the remote store)");
+        }
+        if gone.is_empty() {
+            return Ok(());
+        }
+        Err(MoonclipError::Storage(format!(
+            "Background thread gone: {}. Checkpoints are still being written \
+             locally and are still readable.",
+            gone.join("; ")
+        )))
+    }
+
     /// Full single-rank save pipeline (runs on the caller thread or the
     /// background save thread).
     ///

@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -90,6 +92,38 @@ pub struct DeltaMerger {
     // the coordinator shares it with the background save thread.
     sender: Option<Mutex<mpsc::Sender<MergeCommand>>>,
     handle: Option<thread::JoinHandle<()>>,
+    /// Raised when the worker loop leaves by any route other than the
+    /// `Shutdown` command. See [`DeltaMerger::is_dead`].
+    dead: Arc<AtomicBool>,
+}
+
+/// Raises `dead` on drop unless the loop it guards exited deliberately.
+///
+/// A `Drop` impl rather than a statement after the loop, because the case
+/// worth catching is precisely the one that skips statements: a panic that
+/// escapes the `catch_unwind`s and unwinds the thread out from under them.
+pub(crate) struct ThreadLife {
+    dead: Arc<AtomicBool>,
+    clean: bool,
+}
+
+impl ThreadLife {
+    pub(crate) fn new(dead: Arc<AtomicBool>) -> Self {
+        ThreadLife { dead, clean: false }
+    }
+
+    /// Call immediately before leaving on a `Shutdown`.
+    pub(crate) fn shutting_down(&mut self) {
+        self.clean = true;
+    }
+}
+
+impl Drop for ThreadLife {
+    fn drop(&mut self) {
+        if !self.clean {
+            self.dead.store(true, Ordering::Relaxed);
+        }
+    }
 }
 
 impl DeltaMerger {
@@ -106,20 +140,42 @@ impl DeltaMerger {
         pending_deletes: Arc<PendingDeletes>,
     ) -> Self {
         let (tx, rx) = mpsc::channel();
+        let dead = Arc::new(AtomicBool::new(false));
+        let dead_worker = Arc::clone(&dead);
 
         let handle = thread::Builder::new()
             .name("moonclip-bg-merger".into())
             .spawn(move || {
+                let mut life = ThreadLife::new(dead_worker);
                 for cmd in rx {
                     // Per command, not around the loop: `install` blocks a pool
                     // worker for as long as the closure runs, and this thread
                     // spends nearly all its life waiting on `rx`.
                     match cmd {
                         MergeCommand::CheckAndMerge => {
-                            if let Err(e) = crate::pool::install(|| {
-                                do_stride_merge(&config, &storage, &manifest, &compression, &in_flight, &pending_deletes)
-                            }) {
-                                eprintln!("[Moonclip merger] stride merge error: {e}");
+                            // Same treatment the async saver already gives its
+                            // pipeline, and for the same reason: a panic used
+                            // to kill this thread outright, `for cmd in rx`
+                            // ended, the receiver dropped, and `notify` went on
+                            // failing silently for the rest of the run. Delta
+                            // chains then stop being consolidated and loads
+                            // degrade without limit, with nothing saying so.
+                            // Caught, a panic is what a storage failure here
+                            // already is: logged, loop survives.
+                            let outcome = catch_unwind(AssertUnwindSafe(|| {
+                                crate::pool::install(|| {
+                                    do_stride_merge(&config, &storage, &manifest, &compression, &in_flight, &pending_deletes)
+                                })
+                            }));
+                            match outcome {
+                                Ok(Ok(())) => {}
+                                Ok(Err(e)) => {
+                                    eprintln!("[Moonclip merger] stride merge error: {e}");
+                                }
+                                Err(panic) => eprintln!(
+                                    "[Moonclip merger] stride merge panicked: {}",
+                                    crate::error::panic_message(&*panic)
+                                ),
                             }
                         }
                         MergeCommand::ForceFullMerge(done) => {
@@ -157,8 +213,22 @@ impl DeltaMerger {
                                         FORCED_MERGE_WAIT.as_secs()
                                     )));
                                 };
-                                let attempt = crate::pool::install(|| {
-                                    do_full_merge_within(&storage, &manifest, &compression, &in_flight, &pending_deletes, left)
+                                // A panic becomes the error it would have been
+                                // had the same fault returned one, so the
+                                // caller waiting on `done` — `save_final`,
+                                // whose whole job is to know the run's last
+                                // checkpoint is folded and uploaded — hears
+                                // about it instead of waiting out the timeout.
+                                let attempt = catch_unwind(AssertUnwindSafe(|| {
+                                    crate::pool::install(|| {
+                                        do_full_merge_within(&storage, &manifest, &compression, &in_flight, &pending_deletes, left)
+                                    })
+                                }))
+                                .unwrap_or_else(|panic| {
+                                    Err(MoonclipError::Storage(format!(
+                                        "Forced merge panicked: {}",
+                                        crate::error::panic_message(&*panic)
+                                    )))
                                 });
                                 match attempt {
                                     Ok(MergeOutcome::Busy) => in_flight.wait_for_any_unpin(
@@ -182,7 +252,10 @@ impl DeltaMerger {
                                 }
                             }
                         }
-                        MergeCommand::Shutdown => break,
+                        MergeCommand::Shutdown => {
+                            life.shutting_down();
+                            break;
+                        }
                     }
                 }
             })
@@ -191,12 +264,49 @@ impl DeltaMerger {
         DeltaMerger {
             sender: Some(Mutex::new(tx)),
             handle: Some(handle),
+            dead,
+        }
+    }
+
+    /// Whether the worker thread is gone while it was still meant to be
+    /// running. Permanent once true: nothing restarts it.
+    ///
+    /// `catch_unwind` above covers the panics this crate can foresee, and this
+    /// covers the rest. It is the half that stops the failure being *silent*,
+    /// and it is worth as much as the catching: a merger that dies of anything
+    /// the catch does not reach still has to reach the caller, or the run goes
+    /// on believing its deltas are being folded.
+    pub(crate) fn is_dead(&self) -> bool {
+        self.dead.load(Ordering::Relaxed)
+    }
+
+    /// A merger whose worker thread is gone: the sender is live, the receiver
+    /// is not. Exactly what a panicked worker leaves behind, and the only part
+    /// of it that is observable from outside the thread.
+    ///
+    /// A constructor rather than a flag to set, so the tests go through the
+    /// real `notify` and `force_full_merge` and not around them.
+    #[cfg(test)]
+    pub(crate) fn with_no_worker() -> Self {
+        let (tx, rx) = mpsc::channel();
+        drop(rx);
+        DeltaMerger {
+            sender: Some(Mutex::new(tx)),
+            handle: None,
+            dead: Arc::new(AtomicBool::new(false)),
         }
     }
 
     pub fn notify(&self) {
         if let Some(ref tx) = self.sender {
-            let _ = tx.lock().unwrap().send(MergeCommand::CheckAndMerge);
+            // A failed send means the receiver is gone, which means the worker
+            // is. Recorded rather than dropped on the floor: `let _ =` here is
+            // what made a dead merger indistinguishable from a working one —
+            // `tx` is not poisoned (the worker held `rx`), so this went on
+            // being a no-op forever without so much as a panic.
+            if tx.lock().unwrap().send(MergeCommand::CheckAndMerge).is_err() {
+                self.dead.store(true, Ordering::Relaxed);
+            }
         }
     }
 
@@ -219,9 +329,18 @@ impl DeltaMerger {
             .send(MergeCommand::ForceFullMerge(Some(tx)))
             .is_err()
         {
-            // The merger thread is gone, so there is nothing to wait for and
-            // nothing was merged. Not an error: shutdown races with this.
-            return Ok(());
+            // The merger thread is gone. This used to return `Ok(())` on the
+            // grounds that shutdown races with it — but `shutdown` takes
+            // `&mut self`, so it cannot be running beside this, and the only
+            // way the receiver disappears while the sender is still here is
+            // the worker dying. `save_final` is the caller that matters: it
+            // merges and then uploads, and being told the fold succeeded when
+            // no thread was left to do it is how the run's final checkpoint
+            // goes to the bucket unmerged.
+            self.dead.store(true, Ordering::Relaxed);
+            return Err(MoonclipError::Storage(
+                "The merger thread is gone; nothing was merged".into(),
+            ));
         }
         // Bounded, because the merger's own budget is not visible from here
         // and an unbounded `recv` turns any way of wedging that thread into a
@@ -229,9 +348,17 @@ impl DeltaMerger {
         // finishes just as its deadline lands.
         match rx.recv_timeout(FORCED_MERGE_WAIT + FORCED_MERGE_GRACE) {
             Ok(outcome) => outcome,
-            // The thread died holding the channel. Not an error: shutdown
-            // races with this.
-            Err(mpsc::RecvTimeoutError::Disconnected) => Ok(()),
+            // The thread died holding the channel, after taking the command.
+            // Same as the failed send above, and not the shutdown race it was
+            // once read as — `shutdown` needs `&mut self`.
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                self.dead.store(true, Ordering::Relaxed);
+                Err(MoonclipError::Storage(
+                    "The merger thread died mid-merge; the snapshots are \
+                     unmerged, and still readable"
+                        .into(),
+                ))
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => Err(MoonclipError::Storage(format!(
                 "Forced merge did not answer within {}s; the merger thread is                  wedged. The snapshots are unmerged, and still readable",
                 (FORCED_MERGE_WAIT + FORCED_MERGE_GRACE).as_secs()
@@ -1904,5 +2031,144 @@ mod tests {
                 "{pack} outlived the reader that was holding it back"
             );
         }
+    }
+
+    /// A backend whose `delete` panics once armed.
+    ///
+    /// `delete` is what a merge does and a save does not, so the panic lands
+    /// inside the merger loop and nowhere else — and it lands *after* the
+    /// manifest lock has been dropped, which keeps this test about the thread
+    /// rather than about the lock.
+    struct PanicOnDelete {
+        inner: LocalStorage,
+        armed: std::sync::atomic::AtomicBool,
+    }
+
+    impl StorageBackend for PanicOnDelete {
+        fn put(&self, rel_path: &str, data: &[u8]) -> Result<()> {
+            self.inner.put(rel_path, data)
+        }
+        fn get(&self, rel_path: &str) -> Result<Vec<u8>> {
+            self.inner.get(rel_path)
+        }
+        fn get_range(&self, rel_path: &str, offset: u64, len: usize) -> Result<Vec<u8>> {
+            self.inner.get_range(rel_path, offset, len)
+        }
+        fn exists(&self, rel_path: &str) -> Result<bool> {
+            self.inner.exists(rel_path)
+        }
+        fn delete(&self, rel_path: &str) -> Result<()> {
+            if self.armed.load(Ordering::Relaxed) {
+                panic!("unlink went wrong");
+            }
+            self.inner.delete(rel_path)
+        }
+        fn list(&self, prefix: &str) -> Result<Vec<String>> {
+            self.inner.list(prefix)
+        }
+    }
+
+    /// A panic inside a merge must become an error and leave the thread
+    /// running.
+    ///
+    /// Before this, a panic killed `moonclip-bg-merger` outright: `for cmd in
+    /// rx` ended, the receiver dropped, and every later `notify` failed into a
+    /// `let _ =`. Delta chains then stopped being consolidated for the rest of
+    /// the run, loads degraded without limit, and nothing anywhere said so.
+    ///
+    /// Run on a deadline, because the shape a regression takes is a caller
+    /// waiting on a reply from a thread that no longer exists.
+    #[test]
+    fn a_panic_inside_a_merge_is_reported_and_the_thread_survives() {
+        let dir = tempfile::tempdir().unwrap();
+        let hooked = Arc::new(PanicOnDelete {
+            inner: LocalStorage::new(dir.path()).unwrap(),
+            armed: std::sync::atomic::AtomicBool::new(false),
+        });
+        let storage: Arc<dyn StorageBackend> = Arc::clone(&hooked) as Arc<dyn StorageBackend>;
+        let (manifest, _) = delta_run(storage.as_ref(), 2, 20_000, 3);
+        let manifest = Arc::new(Mutex::new(manifest));
+
+        let merger = DeltaMerger::new(
+            MergerConfig::default(),
+            Arc::clone(&storage),
+            Arc::clone(&manifest),
+            ZSTD3,
+            unread(),
+            no_remote(),
+        );
+
+        hooked.armed.store(true, Ordering::Relaxed);
+        let reported = merger.force_full_merge();
+        let message = match reported {
+            Err(e) => e.to_string(),
+            Ok(()) => panic!("the panic vanished: the merge reported success"),
+        };
+        assert!(
+            message.contains("panicked"),
+            "the failure was reported as something other than the panic it was: {message}"
+        );
+        assert!(
+            !merger.is_dead(),
+            "the merger thread died of a panic it was supposed to catch"
+        );
+
+        // The load-bearing half. A dead thread answers nothing, so a second
+        // command coming back at all is the proof the catch kept it alive.
+        hooked.armed.store(false, Ordering::Relaxed);
+        merger
+            .force_full_merge()
+            .expect("the merger stopped answering after the panic");
+    }
+
+    /// The other half of the same failure: a thread that dies of something the
+    /// catch does not reach still has to be visible.
+    ///
+    /// `notify` swallowed the `SendError` — and the `Mutex` around `tx` is not
+    /// poisoned either, because the worker held `rx` and not `tx` — so a dead
+    /// merger was indistinguishable from a working one for the rest of the
+    /// process.
+    #[test]
+    fn a_merger_whose_worker_is_gone_stops_pretending_otherwise() {
+        let merger = DeltaMerger::with_no_worker();
+
+        assert!(!merger.is_dead(), "nothing has told it yet");
+        merger.notify();
+        assert!(
+            merger.is_dead(),
+            "notify swallowed the SendError, as it used to"
+        );
+        assert!(
+            merger.force_full_merge().is_err(),
+            "a forced merge with no thread to run it reported success"
+        );
+    }
+
+    /// `ThreadLife` is what covers the panics the `catch_unwind`s do not: it
+    /// has to fire on the way out of an unwinding thread, and not on a
+    /// deliberate shutdown.
+    #[test]
+    fn thread_life_marks_an_unwinding_thread_and_not_a_clean_one() {
+        let died = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&died);
+        let _ = thread::spawn(move || {
+            let _life = ThreadLife::new(flag);
+            panic!("something the catch_unwinds do not wrap");
+        })
+        .join();
+        assert!(died.load(Ordering::Relaxed), "an unwinding thread went unnoticed");
+
+        let shut = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&shut);
+        thread::spawn(move || {
+            let mut life = ThreadLife::new(flag);
+            life.shutting_down();
+        })
+        .join()
+        .unwrap();
+        assert!(
+            !shut.load(Ordering::Relaxed),
+            "a deliberate shutdown was reported as a death"
+        );
     }
 }

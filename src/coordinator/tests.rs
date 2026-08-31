@@ -1743,3 +1743,53 @@ fn an_equal_width_cast_does_not_poison_the_retained_base() {
          means the delta was applied to the wrong base"
     );
 }
+
+/// The death of a background thread has to reach whoever is saving.
+///
+/// `catch_unwind` covers the panics this crate can foresee; nothing covers a
+/// thread that goes for another reason, and that is the case worth reporting.
+/// A dead syncer in particular is the worst failure a durability feature has:
+/// the run believes its checkpoints are reaching the bucket, and finds out
+/// they are not when the machine dies and a resume is attempted.
+///
+/// Built by hand rather than through `Coordinator::new` because that spawns a
+/// live merger, and the state under test is one where the thread is gone.
+#[test]
+fn a_dead_background_thread_is_reported_by_flush() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(dir.path()).unwrap());
+    let merger = crate::merger::DeltaMerger::with_no_worker();
+    // The real `notify`, sending into a channel whose receiver is gone: this
+    // is how a live coordinator learns of it, and it is the step that used to
+    // be a `let _ =`.
+    merger.notify();
+
+    let core = Arc::new(Core {
+        storage,
+        manifest: Arc::new(Mutex::new(Manifest::default())),
+        config: CoordinatorConfig::default(),
+        merger: Some(merger),
+        syncer: None,
+        in_flight: Arc::new(crate::inflight::InFlight::default()),
+        pending_deletes: Arc::new(PendingDeletes::default()),
+        retained_base: Mutex::new(None),
+        dtype_patterns_checked: AtomicBool::new(false),
+    });
+    let coord = Coordinator { saver: None, core };
+
+    let message = match coord.flush() {
+        Err(e) => e.to_string(),
+        Ok(()) => panic!("flush reported nothing: the merger died in silence"),
+    };
+    assert!(
+        message.contains("merger"),
+        "the report does not say which thread is gone: {message}"
+    );
+
+    // Not an event but a state, and nothing restarts that thread — so it is
+    // reported again, rather than consumed the way the saver's error is.
+    assert!(
+        coord.flush().is_err(),
+        "the report was one-shot: a caller that missed it never hears again"
+    );
+}
