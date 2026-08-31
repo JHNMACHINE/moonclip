@@ -1,5 +1,195 @@
 # Changelog
 
+## 0.1.0 — 2026-08-31
+
+Two of the three background threads could take the whole process down with
+them, and now none of them can. A panic in the save pipeline used to poison
+the manifest lock and turn every later call into a `PanicException` raised
+somewhere unrelated; a panic in the merger or the syncer killed the thread
+outright and nothing said so, which for the syncer meant a run believing it
+had remote backups and finding out otherwise at resume time. Both are fixed,
+and the death of a background thread is now something `flush()` reports.
+
+Alongside them, a checkpoint can be asked what it holds without being read.
+`describe()` answers off the manifest with no storage access at all, and
+`load_tensors()` reads only the byte ranges the named tensors occupy. The
+caller this was written for is a reshard, which has to know how long every old
+shard is before it can plan a single slice and until now loaded each old
+checkpoint in full to find out.
+
+**Why 0.1.0 and not 0.0.10.** The read API needed a way to say "this tensor's
+span, not the whole pack", and `Option<&[u8]>` cannot say it. Two public items
+in `moonclip::tensor` changed signature as a result — see *Changed —
+breaking*. Cargo treats every `0.0.z` as incompatible with every other, so
+0.0.10 would have been technically sufficient; a minor bump says out loud what
+the version number would otherwise only imply. **The Python API is unaffected
+and nothing there needs changing.**
+
+### Added
+
+- **`describe()`, `describe_latest()` and `load_tensors()`**, on
+  `MoonclipManager` and `CheckpointManager`: read what a checkpoint holds, and
+  read parts of it, without reading all of it.
+
+  There was nothing between `list_snapshots`, which reports totals, and
+  `load`, which materializes everything. A caller that needed a tensor's
+  *shape* had to load the tensor to find out — and the caller that pays for
+  that is a reshard, which has to know how long every old shard is before it
+  can plan a single slice. From N ranks to M that is N complete reads of data
+  it then discards, tens of gigabytes on a real model.
+
+  - `describe(snap_id)` returns the snapshot's metadata and, for every tensor
+    this rank wrote, `name`, `shape`, `dtype`, `stored_dtype`, `storage`
+    (`full` / `delta` / `skipped` / `alias`), `raw_size` and
+    `compressed_size`. **It touches no storage at all** — everything it
+    reports is already in the manifest in memory. `dtype` is what a load hands
+    back and `stored_dtype` is what is on disk; they differ exactly when
+    `save_dtype` cast the tensor, and conflating them would have a caller size
+    an fp32 buffer for what it reads as bf16. A skipped tensor stores no bytes
+    and still reports its shape, which is what makes this usable past the
+    first checkpoint of a run.
+
+  - `load_tensors(snap_id, names)` reads only the byte ranges those tensors
+    occupy, rather than pulling the rank's pack and decompressing all of it.
+    Deltas and skips resolve against a base it also declines to read whole —
+    the case that matters, since a small unchanging tensor is stored `skipped`
+    from step two onwards, and resolving that through a full base read would
+    give back everything the ranged read saved. A name that is not in the
+    snapshot is an error naming it, not a missing key.
+
+- **`describe_state_dict()` and `TensorStub`**, beside `unflatten_state_dict`.
+  Same reading of the same pickle, materializing nothing: every tensor comes
+  back as a `TensorStub` with its `name`, `shape` and `dtype`, and everything
+  that was never a tensor is there unchanged.
+
+  That last part is what makes the pair complete. Moonclip does not model
+  placements, layout tags or whatever else a caller wrapped around its
+  tensors — but they were in the template all along, so
+  `load_tensors(snap, ["model._metadata"])` plus `describe_state_dict` hands
+  back the whole structure, with shapes, for a few kilobytes. The stubs carry
+  the flat names, so having measured, a caller fetches exactly the tensors it
+  turned out to want.
+
+  A `<prefix>._blob` prefix is left out rather than half-described: a blob is
+  one pickle holding the tensors themselves, and there is no describing it
+  short of loading it.
+
+
+### Changed — breaking
+
+Rust callers only. Nothing in the Python API moves.
+
+- **`moonclip::tensor::load_tensor` and `BaseEntry` changed shape**, to make a
+  ranged read expressible:
+
+  ```rust
+  -pub type BaseEntry = (TensorEntry, CompressionAlgo, Option<Arc<Vec<u8>>>);
+  +pub type BaseEntry = (TensorEntry, CompressionAlgo, OwnedPack);
+
+  -pub fn load_tensor(…, pack_data: Option<&[u8]>, …)
+  +pub fn load_tensor(…, pack: PackSource<'_>, …)
+  ```
+
+  `Option<&[u8]>` had exactly two meanings — the whole pack in memory, or
+  nothing and fall back to per-file storage — and `load_tensors` needs a third:
+  the pack is on storage and only one tensor's span is wanted. `PackSource`
+  spells the three out; `OwnedPack` is the owning form the base-entry resolver
+  hands back.
+
+  Migration is mechanical. `None` becomes `PackSource::PerFile`, and
+  `Some(&bytes)` becomes `PackSource::Whole(&bytes)`; a resolver returning
+  `None` for the pack returns `OwnedPack::PerFile`, and one returning
+  `Some(arc)` returns `OwnedPack::Whole(arc)`.
+
+### Changed
+
+- **CI builds on Rust 1.97.1, and `rust-toolchain.toml` pins the same version
+  locally.** The two used to differ without saying so: the workflows pinned
+  `rust:1.90-bookworm` while development ran 1.97, so a red `cargo clippy`
+  locally did not mean anything was broken — it could be the version gap — and
+  a green CI did not mean the next image bump would pass. The crate spent a
+  while in exactly that state, red locally on four findings that were lints
+  1.90 did not have. All four are fixed, and three of the four `-A` allowances
+  in `checks.yml` are gone with them; `too_many_arguments` remains.
+
+  The pin carries the patch number on both sides on purpose. Inside
+  `rust:1.97.1-bookworm` the installed toolchain is named `1.97.1-…`, so a
+  `channel = "1.97"` does not match it and rustup downloads a second copy of
+  the same compiler on every job — 31s against 1.4s, measured in that
+  container.
+
+  **This does not change the MSRV.** `rust-version` stays 1.83 and a
+  `rust-toolchain.toml` applies only inside the repository, so nothing changes
+  for anyone depending on the crate. What it does mean is that CI no longer
+  verifies the 1.83 claim.
+
+
+### Fixed
+
+- **A panic while saving no longer walls off the manager for the rest of the
+  process.** The background saver already caught panics, and that fix was
+  right as far as it went: it restored the *thread*, so a failed save stopped
+  hanging the training loop. It did nothing about the poison flag a `Mutex`
+  sets when a guard is dropped mid-unwind — and the save pipeline holds the
+  manifest lock across retention, which persists through the caller's
+  `StorageBackend`. That trait is public, so a panic inside that critical
+  section is reachable without touching a line of Moonclip.
+
+  What it cost: every later `save`, `load`, `flush` and `list_snapshots`
+  raised `PanicException`, on the caller's thread, from somewhere unrelated to
+  what had actually failed. One bad checkpoint took the run with it, and the
+  message named the wrong place. Every access to the manifest now recovers the
+  lock instead — the in-memory copy is re-readable from storage, so refusing
+  to hand it out buys nothing that re-reading does not.
+
+  The re-read is the second half, and it is not cosmetic: a save that panics
+  in retention has already pushed its snapshot into the in-memory manifest, so
+  recovering the lock alone would carry an entry that never reached storage
+  into the next manifest written. The two write paths that do not already
+  re-read now do so before trusting what is in memory.
+
+  Unchanged: what a failed checkpoint costs is still that checkpoint. The
+  failure is still reported by the next `save` or `flush`, with the panic's
+  own message.
+
+- **The merger and the remote syncer no longer die in silence.** Moonclip runs
+  three background threads and only one of them — the async saver — was
+  protected from panics. A panic on either of the other two killed the thread
+  outright: `for cmd in rx` ended, the receiver dropped, and every later
+  `notify` failed into a `let _ =`. Nothing was poisoned and nothing was
+  raised, because the worker held the receiving end and the callers hold the
+  sending one, so the calls went on succeeding at nothing for the rest of the
+  process.
+
+  What that cost, silently:
+
+  - **Merger gone** — delta chains stop being consolidated. Loads degrade
+    without limit and no message says why.
+  - **Syncer gone** — nothing reaches S3 or R2 again. For a durability feature
+    this is the worst failure available: the run believes it has remote
+    backups, and finds out it does not when the machine dies and a resume is
+    attempted.
+
+  Both loops now catch panics per command, the same treatment and for the same
+  reason as the saver: a panic becomes what a storage failure already was — an
+  error, with the loop still running. A forced merge and `sync_now`, which have
+  a caller waiting on a reply, get that error returned rather than logged.
+
+  Catching is only half. A thread can still go for a reason no `catch_unwind`
+  reaches, so **`flush()` now reports a background thread that is gone**, and
+  reports it every time rather than once: it is not an event that happened but
+  a state that will not improve, since nothing restarts those threads. The
+  error names which thread and what has stopped, and says the checkpoints on
+  local disk are still being written and still readable.
+
+- **`merge_now()` no longer reports success when there was no thread to do the
+  merge.** A failed send to a departed merger returned `Ok(())`, on the grounds
+  that shutdown could be racing it — but `shutdown` takes `&mut self` and
+  cannot be. `save_final` is the caller this mattered for: it merges and then
+  uploads, so a fold reported as done that never happened is how a run's final
+  checkpoint reaches the bucket unmerged.
+
+
 ## 0.0.9 — 2026-08-30
 
 Float8, which turned out to be two features wearing one name. A tensor that
@@ -141,54 +331,6 @@ The first is a behaviour change and the migration is one line — see below.
   a second full copy of the state outside Moonclip. A tensor that is already
   float64 is untouched, as before.
 
-- **`describe()`, `describe_latest()` and `load_tensors()`**, on
-  `MoonclipManager` and `CheckpointManager`: read what a checkpoint holds, and
-  read parts of it, without reading all of it.
-
-  There was nothing between `list_snapshots`, which reports totals, and
-  `load`, which materializes everything. A caller that needed a tensor's
-  *shape* had to load the tensor to find out — and the caller that pays for
-  that is a reshard, which has to know how long every old shard is before it
-  can plan a single slice. From N ranks to M that is N complete reads of data
-  it then discards, tens of gigabytes on a real model.
-
-  - `describe(snap_id)` returns the snapshot's metadata and, for every tensor
-    this rank wrote, `name`, `shape`, `dtype`, `stored_dtype`, `storage`
-    (`full` / `delta` / `skipped` / `alias`), `raw_size` and
-    `compressed_size`. **It touches no storage at all** — everything it
-    reports is already in the manifest in memory. `dtype` is what a load hands
-    back and `stored_dtype` is what is on disk; they differ exactly when
-    `save_dtype` cast the tensor, and conflating them would have a caller size
-    an fp32 buffer for what it reads as bf16. A skipped tensor stores no bytes
-    and still reports its shape, which is what makes this usable past the
-    first checkpoint of a run.
-
-  - `load_tensors(snap_id, names)` reads only the byte ranges those tensors
-    occupy, rather than pulling the rank's pack and decompressing all of it.
-    Deltas and skips resolve against a base it also declines to read whole —
-    the case that matters, since a small unchanging tensor is stored `skipped`
-    from step two onwards, and resolving that through a full base read would
-    give back everything the ranged read saved. A name that is not in the
-    snapshot is an error naming it, not a missing key.
-
-- **`describe_state_dict()` and `TensorStub`**, beside `unflatten_state_dict`.
-  Same reading of the same pickle, materializing nothing: every tensor comes
-  back as a `TensorStub` with its `name`, `shape` and `dtype`, and everything
-  that was never a tensor is there unchanged.
-
-  That last part is what makes the pair complete. Moonclip does not model
-  placements, layout tags or whatever else a caller wrapped around its
-  tensors — but they were in the template all along, so
-  `load_tensors(snap, ["model._metadata"])` plus `describe_state_dict` hands
-  back the whole structure, with shapes, for a few kilobytes. The stubs carry
-  the flat names, so having measured, a caller fetches exactly the tensors it
-  turned out to want.
-
-  A `<prefix>._blob` prefix is left out rather than half-described: a blob is
-  one pickle holding the tensors themselves, and there is no describing it
-  short of loading it.
-
-
 ### Changed
 
 - **Python 3.9 and 3.10 are no longer supported.** The floor is 3.11, and no
@@ -281,92 +423,6 @@ The first is a behaviour change and the migration is one line — see below.
   written before this deserialize unchanged — they hold no float8 entries, so
   the absent value is the correct one rather than a missing one. The format
   version is unmoved at 2.
-
-### Fixed
-
-- **A panic while saving no longer walls off the manager for the rest of the
-  process.** The background saver already caught panics, and that fix was
-  right as far as it went: it restored the *thread*, so a failed save stopped
-  hanging the training loop. It did nothing about the poison flag a `Mutex`
-  sets when a guard is dropped mid-unwind — and the save pipeline holds the
-  manifest lock across retention, which persists through the caller's
-  `StorageBackend`. That trait is public, so a panic inside that critical
-  section is reachable without touching a line of Moonclip.
-
-  What it cost: every later `save`, `load`, `flush` and `list_snapshots`
-  raised `PanicException`, on the caller's thread, from somewhere unrelated to
-  what had actually failed. One bad checkpoint took the run with it, and the
-  message named the wrong place. Every access to the manifest now recovers the
-  lock instead — the in-memory copy is re-readable from storage, so refusing
-  to hand it out buys nothing that re-reading does not.
-
-  The re-read is the second half, and it is not cosmetic: a save that panics
-  in retention has already pushed its snapshot into the in-memory manifest, so
-  recovering the lock alone would carry an entry that never reached storage
-  into the next manifest written. The two write paths that do not already
-  re-read now do so before trusting what is in memory.
-
-  Unchanged: what a failed checkpoint costs is still that checkpoint. The
-  failure is still reported by the next `save` or `flush`, with the panic's
-  own message.
-
-- **The merger and the remote syncer no longer die in silence.** Moonclip runs
-  three background threads and only one of them — the async saver — was
-  protected from panics. A panic on either of the other two killed the thread
-  outright: `for cmd in rx` ended, the receiver dropped, and every later
-  `notify` failed into a `let _ =`. Nothing was poisoned and nothing was
-  raised, because the worker held the receiving end and the callers hold the
-  sending one, so the calls went on succeeding at nothing for the rest of the
-  process.
-
-  What that cost, silently:
-
-  - **Merger gone** — delta chains stop being consolidated. Loads degrade
-    without limit and no message says why.
-  - **Syncer gone** — nothing reaches S3 or R2 again. For a durability feature
-    this is the worst failure available: the run believes it has remote
-    backups, and finds out it does not when the machine dies and a resume is
-    attempted.
-
-  Both loops now catch panics per command, the same treatment and for the same
-  reason as the saver: a panic becomes what a storage failure already was — an
-  error, with the loop still running. A forced merge and `sync_now`, which have
-  a caller waiting on a reply, get that error returned rather than logged.
-
-  Catching is only half. A thread can still go for a reason no `catch_unwind`
-  reaches, so **`flush()` now reports a background thread that is gone**, and
-  reports it every time rather than once: it is not an event that happened but
-  a state that will not improve, since nothing restarts those threads. The
-  error names which thread and what has stopped, and says the checkpoints on
-  local disk are still being written and still readable.
-
-- **`merge_now()` no longer reports success when there was no thread to do the
-  merge.** A failed send to a departed merger returned `Ok(())`, on the grounds
-  that shutdown could be racing it — but `shutdown` takes `&mut self` and
-  cannot be. `save_final` is the caller this mattered for: it merges and then
-  uploads, so a fold reported as done that never happened is how a run's final
-  checkpoint reaches the bucket unmerged.
-
-
-- **CI builds on Rust 1.97.1, and `rust-toolchain.toml` pins the same version
-  locally.** The two used to differ without saying so: the workflows pinned
-  `rust:1.90-bookworm` while development ran 1.97, so a red `cargo clippy`
-  locally did not mean anything was broken — it could be the version gap — and
-  a green CI did not mean the next image bump would pass. The crate spent a
-  while in exactly that state, red locally on four findings that were lints
-  1.90 did not have. All four are fixed, and three of the four `-A` allowances
-  in `checks.yml` are gone with them; `too_many_arguments` remains.
-
-  The pin carries the patch number on both sides on purpose. Inside
-  `rust:1.97.1-bookworm` the installed toolchain is named `1.97.1-…`, so a
-  `channel = "1.97"` does not match it and rustup downloads a second copy of
-  the same compiler on every job — 31s against 1.4s, measured in that
-  container.
-
-  **This does not change the MSRV.** `rust-version` stays 1.83 and a
-  `rust-toolchain.toml` applies only inside the repository, so nothing changes
-  for anyone depending on the crate. What it does mean is that CI no longer
-  verifies the 1.83 claim.
 
 
 ## 0.0.8 — 2026-08-21
