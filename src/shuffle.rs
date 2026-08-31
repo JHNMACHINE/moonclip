@@ -37,8 +37,13 @@ const UNSHUFFLE_BLOCK: usize = 8192;
 /// A trailing partial element is copied through unchanged, so the transform
 /// round-trips for any length.
 pub fn shuffle(data: &[u8], itemsize: usize) -> Vec<u8> {
-    let count = if itemsize == 0 { 0 } else { data.len() / itemsize };
-    if itemsize <= 1 || count == 0 {
+    // `itemsize <= 1` first: it subsumes the zero case, which makes the
+    // division below safe by construction rather than by a guard.
+    if itemsize <= 1 {
+        return data.to_vec();
+    }
+    let count = data.len() / itemsize;
+    if count == 0 {
         return data.to_vec();
     }
     let n = count * itemsize;
@@ -58,8 +63,13 @@ pub fn shuffle(data: &[u8], itemsize: usize) -> Vec<u8> {
 
 /// Inverse of [`shuffle`].
 pub fn unshuffle(data: &[u8], itemsize: usize) -> Vec<u8> {
-    let count = if itemsize == 0 { 0 } else { data.len() / itemsize };
-    if itemsize <= 1 || count == 0 {
+    // `itemsize <= 1` first: it subsumes the zero case, which makes the
+    // division below safe by construction rather than by a guard.
+    if itemsize <= 1 {
+        return data.to_vec();
+    }
+    let count = data.len() / itemsize;
+    if count == 0 {
         return data.to_vec();
     }
     let n = count * itemsize;

@@ -954,11 +954,14 @@ mod tests {
 
     /// A resolver over a fixed set of base entries, standing in for what the
     /// coordinator reads out of the manifest at load time.
+    /// What a base lookup hands back: the entry, how it was compressed,
+    /// and its bytes when the caller already holds them.
+    type Resolved = (TensorEntry, CompressionAlgo, Option<Arc<Vec<u8>>>);
+
     fn base_resolver(
         entries: Vec<TensorEntry>,
         compression: CompressionAlgo,
-    ) -> impl Fn(uuid::Uuid, &str) -> Result<(TensorEntry, CompressionAlgo, Option<Arc<Vec<u8>>>)> + Sync
-    {
+    ) -> impl Fn(uuid::Uuid, &str) -> Result<Resolved> + Sync {
         let map: HashMap<String, TensorEntry> =
             entries.into_iter().map(|e| (e.name.clone(), e)).collect();
         move |_id, name| {

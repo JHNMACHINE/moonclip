@@ -313,7 +313,7 @@ fn sign_request(
     }
 
     // Sort by the lowercased header name (required by SigV4)
-    headers_to_sign.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+    headers_to_sign.sort_by_key(|h| h.0.to_lowercase());
 
     // Build canonical_headers string
     let canonical_headers: String = headers_to_sign

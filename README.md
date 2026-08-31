@@ -169,33 +169,87 @@ same time.
 
 ## Architecture
 
+Two layers, and the line between them is the whole design. The Rust crate
+stores *named tensors* and has never heard of PyTorch; everything that knows
+what a `state_dict` is lives in the Python package on top. That is why
+Moonclip can sit under a runtime like [Ravex](https://codeberg.org/JHNMACHINE/ravex)
+without either one owning the other — and why `import moonclip` does not
+import torch.
+
+**`src/` — the engine (Rust)**
+
 ```
 src/
-├── cast.rs          # Rust-native fp32↔bf16/fp16/float8 casting (rayon parallel)
-├── coordinator.rs   # Rank-aware snapshot lifecycle
+├── lib.rs           # Crate root
+├── coordinator/     # Snapshot lifecycle: create → save_rank → finalize, per rank
+│   ├── mod.rs       #   The Coordinator facade and the Core behind it
+│   ├── recovery.rs  #   Putting a store back together at open time
+│   ├── saver.rs     #   The background thread a save is handed to
+│   └── tests.rs     #   Reaches into Core and the packs; not an integration test
 ├── tensor.rs        # Per-tensor delta tracking and storage
-├── manifest.rs      # Manifest v2: per-rank, per-tensor, lineage
-├── compression.rs   # Zstd compression (parallel frames)
-├── delta.rs         # XOR delta computation (rayon parallel)
-├── shuffle.rs       # Byte-plane transpose before compressing a delta
-├── pack.rs          # One pack file per rank, with a recovery descriptor
-├── merger.rs        # Background delta merging
-├── remote_sync.rs   # Batched S3 sync
-├── s3.rs            # S3-compatible storage (AWS SigV4)
+├── cast.rs          # fp32 ↔ bf16/fp16/float8 casting, in parallel
+├── delta.rs         # XOR delta computation, in parallel
+├── shuffle.rs       # Byte-plane transpose, so a delta compresses
+├── compression.rs   # Zstd, as concatenated frames across cores
+├── pack.rs          # The pack file: data plus its own description, one write
+├── manifest.rs      # Manifest v2 — per-rank, per-tensor, lineage
+├── merger.rs        # Background consolidation of delta chains
+├── inflight.rs      # Which snapshots a read holds, so a merge cannot delete them
 ├── storage.rs       # StorageBackend trait + LocalStorage (4KB aligned)
-├── pool.rs          # The private rayon pool (see Tuning)
-├── profile.rs       # Opt-in phase timing (MOONCLIP_PROFILE)
+├── s3.rs            # S3-compatible storage (AWS SigV4, no SDK)
+├── remote_sync.rs   # Batched sync to the remote backend
+├── pool.rs          # Moonclip's private rayon pool — see Tuning
 ├── hash.rs          # xxHash3-128 integrity
-├── python.rs        # PyO3 bindings
+├── profile.rs       # Opt-in phase timing (MOONCLIP_PROFILE)
+├── python.rs        # PyO3 bindings — the only file that knows Python exists
 └── error.rs         # Error types
 ```
+
+**`python/moonclip/` — the PyTorch surface**
+
+```
+python/moonclip/
+├── __init__.py      # Re-exports; torch resolves lazily, never at import time
+├── pytorch.py       # CheckpointManager — state dicts in, snapshots out
+├── _env.py          # Reads torchrun's topology variables (detects; does not adopt)
+└── *.pyi, py.typed  # Stubs, for both layers
+```
+
+**And around them**
+
+| Path | |
+|---|---|
+| `tests/` | PyTorch and distributed tests, plus `s3_minio.rs` against a live MinIO |
+| `benches/` | Criterion microbenchmarks for the delta path |
+| `bench/` | End-to-end checkpoint benchmarks, and the GPU scripts behind them |
+| `examples/` | Runnable: plain model, transformer, DDP, S3 |
+| `.forgejo/workflows/` | `checks.yml` on branches, `ci.yml` on main, `bench.yml`, `release.yml` |
+
+As of 0.0.9 that is about 14.2k lines of Rust across 22 files and 1.7k of
+Python, covered by 211 crate tests, 5 more against a live MinIO, and 101
+Python ones. Roughly half of the Rust is `#[cfg(test)]`: `coordinator/`
+carries 1.7k lines of tests against 1.9k of code, which is why it is the one
+part of the crate laid out as a directory.
 
 ## Development
 
 ```bash
-cargo test                          # Rust tests
+cargo test                                      # Rust tests, no Python needed
 maturin develop --release && pytest tests/ -v   # Python + PyTorch tests
+cargo clippy --all-targets -- -D warnings       # what CI gates on
 ```
+
+`checks.yml` runs clippy and `cargo test` on every branch push — one container,
+seconds. The full matrix (MinIO, the PyTorch adapter, CPython 3.9–3.14) waits
+for `main`, in `ci.yml`.
+
+Both pin `rust:1.90-bookworm`, so a newer local toolchain lints more strictly
+than the gate does. That is worth knowing before bumping the image: clippy
+1.97 adds `manual_checked_ops` and widens `type_complexity`, and the crate was
+green on 1.90 while failing on 1.97.
+
+Note that the crate is deliberately **not** `cargo fmt`-clean: the gate is
+clippy, and running `cargo fmt` over it produces a diff nobody asked for.
 
 ## License
 
