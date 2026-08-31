@@ -20,7 +20,7 @@ jobs:
     runs-on: codeberg-small
     container:
       # Matches ci.yml. Bump both together.
-      image: rust:1.90-bookworm
+      image: rust:1.97.1-bookworm
     steps:
       - name: Install git
         run: |
@@ -42,36 +42,30 @@ jobs:
           set -eu
           rustup component add clippy
           # `-D warnings` so a new lint fails the branch rather than scrolling
-          # past. The four allowances below are pre-existing debt, listed one
-          # per line so that removing one is a one-line change:
+          # past. One allowance remains:
           #
           #   too_many_arguments  MoonclipManager::new takes 24 — it is the
           #                       Python constructor, and every argument is a
           #                       documented keyword.
-          #   type_complexity     the BaseEntryResolver signature in tensor.rs.
-          #   unnecessary_sort_by \
-          #   manual_checked_ops   surfaced by the 1.97 clippy, not yet fixed.
           #
           # Anything not on this list is a real finding and stops the push.
           #
-          # `-A unknown-lints` is what makes that list survive two toolchains.
-          # `manual_checked_ops` only exists from clippy 1.97; this container
-          # pins 1.90, where naming it is `error[E0602]: unknown lint` — and
-          # `-D warnings` promotes that from a note to a hard failure. This job
-          # had never passed for exactly that reason. Deleting the line would
-          # fix today and break the day the image is bumped, which is the one
-          # moment nobody would think to look here.
+          # `type_complexity`, `unnecessary_sort_by` and `manual_checked_ops`
+          # used to be here as well. The last two only exist from clippy 1.97,
+          # which this container did not have, so they were listed against a
+          # toolchain that could not raise them; all three findings are fixed
+          # and the lines are gone with them.
           #
-          # What it costs: a misspelled lint name in the list above is ignored
-          # rather than reported. Four commented lines is a cheap place to pay
-          # that.
+          # `-A unknown-lints` stays, and is now the only thing keeping this
+          # readable across a toolchain change: naming a lint an older clippy
+          # does not know is `error[E0602]`, which `-D warnings` turns into a
+          # hard failure. This job had never passed for exactly that reason.
+          # What it costs is that a misspelled lint name above is ignored
+          # rather than reported.
           cargo clippy --all-targets --features python -- \
             -D warnings \
             -A unknown-lints \
-            -A clippy::too_many_arguments \
-            -A clippy::type_complexity \
-            -A clippy::unnecessary_sort_by \
-            -A clippy::manual_checked_ops
+            -A clippy::too_many_arguments
 
       # Last, because a compile error should be reported by clippy above with a
       # better message than a bare test failure — and split in two so that when

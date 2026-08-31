@@ -243,10 +243,17 @@ cargo clippy --all-targets -- -D warnings       # what CI gates on
 seconds. The full matrix (MinIO, the PyTorch adapter, CPython 3.9–3.14) waits
 for `main`, in `ci.yml`.
 
-Both pin `rust:1.90-bookworm`, so a newer local toolchain lints more strictly
-than the gate does. That is worth knowing before bumping the image: clippy
-1.97 adds `manual_checked_ops` and widens `type_complexity`, and the crate was
-green on 1.90 while failing on 1.97.
+Both pin `rust:1.97.1-bookworm`, and `rust-toolchain.toml` pins the same
+version for a local build, so a red `cargo clippy` here means the gate is red
+too. That agreement is the point of the file: the two used to differ — CI on
+1.90, development on 1.97 — and the crate spent a while green in CI and red
+locally on four findings that were not regressions, only lints the older
+clippy did not have.
+
+The toolchain file is **not** the MSRV. `rust-version` in `Cargo.toml` says
+1.83, which is what a consumer of the published crate needs; a
+`rust-toolchain.toml` applies only inside this directory and does not raise
+that floor. It does mean nothing verifies the 1.83 claim any more.
 
 Note that the crate is deliberately **not** `cargo fmt`-clean: the gate is
 clippy, and running `cargo fmt` over it produces a diff nobody asked for.
