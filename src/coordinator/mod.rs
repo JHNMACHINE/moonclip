@@ -144,6 +144,11 @@ pub(crate) struct Core {
     /// between steps, and a run checkpointing every hundred steps would
     /// otherwise print the same complaint for a week.
     dtype_patterns_checked: AtomicBool,
+    /// Set when [`Core::lock_manifest`] found the lock poisoned, meaning a
+    /// panic unwound out of a critical section and the in-memory manifest may
+    /// be half-updated. Cleared by the next successful re-read from storage.
+    /// See [`Core::heal_manifest`].
+    manifest_stale: AtomicBool,
 }
 
 /// The main checkpoint coordinator.
@@ -225,6 +230,7 @@ impl Coordinator {
             pending_deletes,
             retained_base: Mutex::new(None),
             dtype_patterns_checked: AtomicBool::new(false),
+            manifest_stale: AtomicBool::new(false),
         });
 
         let saver = if use_async {
@@ -423,6 +429,60 @@ impl Core {
         )))
     }
 
+    /// Take the manifest lock, surviving a panic that poisoned it.
+    ///
+    /// Every access to `self.manifest` goes through here rather than
+    /// `.lock().unwrap()`. See [`crate::manifest::lock_manifest`] for why
+    /// recovering beats walling the coordinator off; what this adds on top is
+    /// remembering that it happened, so the in-memory copy can be replaced
+    /// with the one on disk before anybody writes it back out.
+    fn lock_manifest(&self) -> std::sync::MutexGuard<'_, Manifest> {
+        if self.manifest.is_poisoned() {
+            self.manifest_stale.store(true, Ordering::Relaxed);
+        }
+        crate::manifest::lock_manifest(&self.manifest)
+    }
+
+    /// Replace a possibly half-updated in-memory manifest with the one on
+    /// storage. A no-op unless a panic actually poisoned the lock.
+    ///
+    /// Called at the top of the two write paths that do **not** already
+    /// re-read — `save_sync_in_pool` and `create_snapshot`. The multi-rank
+    /// paths (`save_rank_in_pool`, `finalize_snapshot`) open with a
+    /// `reload_manifest` of their own for a different reason and get this for
+    /// free, which is why `reload_manifest` is where the flag is cleared.
+    ///
+    /// The read paths deliberately skip it. A stale manifest costs a reader a
+    /// `NotFound` or a snapshot it cannot see yet, both of which are ordinary
+    /// errors it already handles; a writer persisting one costs the entries
+    /// that went missing. Only the second is worth an extra round trip to
+    /// storage on a path that has none.
+    ///
+    /// On a failed re-read the flag goes back up, so the next writer retries
+    /// rather than quietly proceeding on the copy this was called to distrust.
+    fn heal_manifest(&self) -> Result<()> {
+        // Both questions, and the first is the one that catches the common
+        // case: nothing has taken the lock since the panic, so the poison flag
+        // is still standing and `lock_manifest` has had no chance to notice.
+        // Asking only `manifest_stale` here re-read one save too late — the
+        // save that should have been healed took the lock, raised the flag,
+        // and persisted the copy it had.
+        //
+        // The flag still earns its place for the other order: a `load` or a
+        // `list_snapshots` between the panic and the next write clears the
+        // poison as it recovers, and by the time a writer arrives
+        // `is_poisoned` is false while the copy in memory is no less suspect.
+        if self.manifest.is_poisoned() {
+            self.manifest_stale.store(true, Ordering::Relaxed);
+        }
+        if !self.manifest_stale.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        self.reload_manifest().inspect_err(|_| {
+            self.manifest_stale.store(true, Ordering::Relaxed);
+        })
+    }
+
     /// Full single-rank save pipeline (runs on the caller thread or the
     /// background save thread).
     ///
@@ -447,6 +507,11 @@ impl Core {
         tensors: Vec<TensorData>,
         metadata: HashMap<String, String>,
     ) -> Result<()> {
+        // Before anything reads the manifest: if a previous panic poisoned the
+        // lock, this save would otherwise diff against a half-updated copy and
+        // then persist it. See `heal_manifest`.
+        self.heal_manifest()?;
+
         let snap_dir = format!("snapshots/{}", snap_id);
         let save_started = Instant::now();
         let raw_bytes: u64 = tensors.iter().map(|t| t.data.len() as u64).sum();
@@ -458,7 +523,7 @@ impl Core {
         // merge has already claimed is not picked up at all — this save writes
         // a full snapshot instead, which costs bytes for one step and cannot
         // end up as a delta against something that no longer exists.
-        let manifest = self.manifest.lock().unwrap();
+        let manifest = self.lock_manifest();
         let force_full = manifest.should_force_full(step);
         let base_snap = if force_full {
             None
@@ -497,7 +562,7 @@ impl Core {
             finalized: true,
         };
 
-        let mut manifest = self.manifest.lock().unwrap();
+        let mut manifest = self.lock_manifest();
         manifest.snapshots.push(snapshot);
         // apply_retention persists the manifest when done.
         let evicted = self.apply_retention(&mut manifest)?;
@@ -545,13 +610,17 @@ impl Core {
     }
 
     fn create_snapshot(&self, step: u64, metadata: HashMap<String, String>) -> Result<Uuid> {
+        // See `save_sync_in_pool`: the other write path that does not already
+        // open with a re-read.
+        self.heal_manifest()?;
+
         let snap_id = Uuid::new_v4();
 
         // A base a merge has already claimed is not picked up, exactly as in
         // the single-rank path: it will not exist by the time anyone loads the
         // delta written against it. Rank 0 chooses for every rank here, so
         // getting it wrong costs the whole snapshot rather than one shard.
-        let manifest = self.manifest.lock().unwrap();
+        let manifest = self.lock_manifest();
         let force_full = manifest.should_force_full(step);
         let base_id = if force_full {
             None
@@ -574,7 +643,7 @@ impl Core {
             finalized: false, // Not yet finalized
         };
 
-        let mut manifest = self.manifest.lock().unwrap();
+        let mut manifest = self.lock_manifest();
         manifest.snapshots.push(snapshot);
         self.persist_manifest(&manifest)?;
         drop(manifest);
@@ -591,7 +660,7 @@ impl Core {
         // (another rank may have created the snapshot)
         self.reload_manifest()?;
 
-        let manifest = self.manifest.lock().unwrap();
+        let manifest = self.lock_manifest();
         let snap = manifest
             .find_snapshot(snap_id)
             .ok_or_else(|| MoonclipError::NotFound(format!("Snapshot {snap_id}")))?
@@ -691,7 +760,7 @@ impl Core {
         // this is the same data by a route that has one writer.
         let shards = self.collect_rank_shards(snap_id)?;
 
-        let mut manifest = self.manifest.lock().unwrap();
+        let mut manifest = self.lock_manifest();
         if let Some(snap) = manifest.snapshots.iter_mut().find(|s| s.id == snap_id) {
             // Verify all ranks have reported
             let expected = self.config.world_size;
@@ -749,7 +818,7 @@ impl Core {
         // under the manifest lock *below*, while this pin is held. That is
         // only safe because nothing waits on a pin while holding the manifest
         // lock.
-        let manifest = self.manifest.lock().unwrap();
+        let manifest = self.lock_manifest();
         let snap = manifest
             .find_snapshot(snap_id)
             .ok_or_else(|| MoonclipError::NotFound(format!("Snapshot {snap_id}")))?
@@ -787,7 +856,7 @@ impl Core {
             .any(|t| t.storage != TensorStorage::Full);
         let base_ctx: Option<BaseCtx> = match (needs_base, snap.base_snapshot_id) {
             (true, Some(base_id)) => {
-                let manifest = self.manifest.lock().unwrap();
+                let manifest = self.lock_manifest();
                 let base_snap = manifest.find_snapshot(base_id).cloned();
                 drop(manifest);
                 match base_snap {
@@ -871,7 +940,7 @@ impl Core {
     }
 
     fn load_latest(&self) -> Result<(Uuid, HashMap<String, Vec<u8>>)> {
-        let manifest = self.manifest.lock().unwrap();
+        let manifest = self.lock_manifest();
         let snap = manifest
             .snapshots
             .iter()
@@ -887,7 +956,7 @@ impl Core {
     }
 
     fn list_snapshots(&self) -> Vec<SnapshotInfo> {
-        let manifest = self.manifest.lock().unwrap();
+        let manifest = self.lock_manifest();
         manifest
             .snapshots
             .iter()
@@ -972,7 +1041,7 @@ impl Core {
         }
 
         let usable = !fresh.snapshots.is_empty();
-        *self.manifest.lock().unwrap() = fresh;
+        *self.lock_manifest() = fresh;
         Ok(usable)
     }
 
@@ -1274,7 +1343,7 @@ impl Core {
         base_id: Uuid,
         tensor_name: &str,
     ) -> Result<crate::tensor::BaseEntry> {
-        let manifest = self.manifest.lock().unwrap();
+        let manifest = self.lock_manifest();
         let base_snap = manifest
             .find_snapshot(base_id)
             .ok_or_else(|| MoonclipError::NotFound(format!("Base snapshot {base_id}")))?;
@@ -1323,11 +1392,19 @@ impl Core {
                 let trimmed = &data[..end];
                 let new_manifest: Manifest = serde_json::from_slice(trimmed)
                     .map_err(|e| MoonclipError::Serialization(e.to_string()))?;
-                let mut m = self.manifest.lock().unwrap();
+                let mut m = self.lock_manifest();
                 *m = new_manifest;
+                // Whatever a panic may have left half-written in memory is
+                // gone: this is the file, read whole. See `heal_manifest`.
+                self.manifest_stale.store(false, Ordering::Relaxed);
                 Ok(())
             }
-            Err(MoonclipError::NotFound(_)) => Ok(()),
+            // Nothing on storage to re-read, so the copy in memory is all
+            // there is and distrusting it further buys nothing.
+            Err(MoonclipError::NotFound(_)) => {
+                self.manifest_stale.store(false, Ordering::Relaxed);
+                Ok(())
+            }
             Err(e) => Err(e),
         }
     }

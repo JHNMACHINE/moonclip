@@ -1774,6 +1774,7 @@ fn a_dead_background_thread_is_reported_by_flush() {
         pending_deletes: Arc::new(PendingDeletes::default()),
         retained_base: Mutex::new(None),
         dtype_patterns_checked: AtomicBool::new(false),
+        manifest_stale: AtomicBool::new(false),
     });
     let coord = Coordinator { saver: None, core };
 
@@ -1792,4 +1793,110 @@ fn a_dead_background_thread_is_reported_by_flush() {
         coord.flush().is_err(),
         "the report was one-shot: a caller that missed it never hears again"
     );
+}
+
+/// A backend that writes everything but the manifest, and panics on that.
+///
+/// Not a contrivance. `apply_retention` persists through the caller's
+/// `StorageBackend` **with the manifest guard held**, and `StorageBackend` is
+/// a public trait anyone can implement — so a panic inside that critical
+/// section is reachable from outside the crate without touching a line of it.
+/// `PanickingStorage` above cannot show this: it dies on the pack write, which
+/// happens before the lock is taken.
+///
+/// Armed after the first save, so the store holds one real manifest to be
+/// re-read from.
+struct ManifestPanickingStorage {
+    inner: LocalStorage,
+    armed: AtomicBool,
+}
+
+impl ManifestPanickingStorage {
+    fn new(dir: &std::path::Path) -> Self {
+        ManifestPanickingStorage {
+            inner: LocalStorage::new(dir).unwrap(),
+            armed: AtomicBool::new(false),
+        }
+    }
+}
+
+impl StorageBackend for ManifestPanickingStorage {
+    fn put(&self, rel_path: &str, data: &[u8]) -> Result<()> {
+        if rel_path == "manifest.json" && self.armed.load(Ordering::Relaxed) {
+            panic!("manifest write went wrong");
+        }
+        self.inner.put(rel_path, data)
+    }
+    fn get(&self, rel_path: &str) -> Result<Vec<u8>> {
+        self.inner.get(rel_path)
+    }
+    fn exists(&self, rel_path: &str) -> Result<bool> {
+        self.inner.exists(rel_path)
+    }
+    fn delete(&self, rel_path: &str) -> Result<()> {
+        self.inner.delete(rel_path)
+    }
+    fn list(&self, prefix: &str) -> Result<Vec<String>> {
+        self.inner.list(prefix)
+    }
+}
+
+/// A panic under the manifest lock must not wall off the coordinator.
+///
+/// `catch_unwind` on the save thread restores the *thread*; it does nothing
+/// about the poison flag the `Mutex` sets when a guard is dropped mid-unwind.
+/// Left alone, that flag turns one failed checkpoint into a `PanicException`
+/// on every later `save`, `load`, `flush` and `list_snapshots`, raised on the
+/// caller's thread from somewhere unrelated to what actually broke — and the
+/// manager stays that way for the rest of the process.
+///
+/// The second half matters as much: the failed save had already pushed its
+/// snapshot into the in-memory manifest before the panic, so recovering the
+/// lock without re-reading would carry that phantom entry into the next
+/// persisted manifest.
+#[test]
+fn a_panic_under_the_manifest_lock_does_not_wall_off_the_coordinator() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = Arc::new(ManifestPanickingStorage::new(dir.path()));
+    let coord = Coordinator::new(
+        Arc::clone(&storage) as Arc<dyn StorageBackend>,
+        CoordinatorConfig {
+            compression: CompressionAlgo::Zstd { level: 1 },
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    coord.save(1, sample_tensors(1), HashMap::new()).unwrap();
+    coord.flush().expect("the first save is on an unarmed backend");
+
+    storage.armed.store(true, Ordering::Relaxed);
+    let _ = coord.save(2, sample_tensors(2), HashMap::new());
+    assert!(
+        coord.flush().is_err(),
+        "the panic under the lock was swallowed instead of being reported"
+    );
+    assert!(
+        coord.core.manifest.is_poisoned(),
+        "this test is vacuous unless the panic actually poisoned the lock"
+    );
+
+    // The backend works again, as it would after a transient failure. What
+    // must not persist is the poisoning.
+    storage.armed.store(false, Ordering::Relaxed);
+    let third = coord
+        .save(3, sample_tensors(3), HashMap::new())
+        .expect("a save after the poisoning must not fail");
+    coord
+        .flush()
+        .expect("the recovered save must complete, not raise the old panic");
+
+    let steps: Vec<u64> = coord.list_snapshots().iter().map(|s| s.step).collect();
+    assert_eq!(
+        steps,
+        vec![1, 3],
+        "step 2 never reached storage, so re-reading the manifest is what \
+         keeps it from being carried into the next one"
+    );
+    assert_eq!(coord.load(third).unwrap()["w"], vec![3u8; 8192]);
 }

@@ -414,7 +414,7 @@ fn do_stride_merge(
     in_flight: &Arc<InFlight>,
     pending_deletes: &Arc<PendingDeletes>,
 ) -> Result<()> {
-    let mut manifest = manifest_lock.lock().unwrap();
+    let mut manifest = crate::manifest::lock_manifest(manifest_lock);
     let delta_count = manifest.pending_delta_count();
 
     // The depth limit is tested first so that it holds whatever `stride` is
@@ -613,7 +613,7 @@ pub(crate) fn do_full_merge_within(
     pending_deletes: &Arc<PendingDeletes>,
     unlink_wait: std::time::Duration,
 ) -> Result<MergeOutcome> {
-    let manifest = manifest_lock.lock().unwrap();
+    let manifest = crate::manifest::lock_manifest(manifest_lock);
 
     let base_snap = manifest
         .last_full_snapshot()
@@ -874,7 +874,7 @@ pub(crate) fn do_full_merge_within(
         finalized: true,
     };
 
-    let mut manifest = manifest_lock.lock().unwrap();
+    let mut manifest = crate::manifest::lock_manifest(manifest_lock);
     let delta_ids: Vec<Uuid> = deltas.iter().map(|s| s.id).collect();
 
     // Publish the new manifest *before* deleting anything it replaces.

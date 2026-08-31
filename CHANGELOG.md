@@ -236,6 +236,32 @@ The first is a behaviour change and the migration is one line — see below.
 
 ### Fixed
 
+- **A panic while saving no longer walls off the manager for the rest of the
+  process.** The background saver already caught panics, and that fix was
+  right as far as it went: it restored the *thread*, so a failed save stopped
+  hanging the training loop. It did nothing about the poison flag a `Mutex`
+  sets when a guard is dropped mid-unwind — and the save pipeline holds the
+  manifest lock across retention, which persists through the caller's
+  `StorageBackend`. That trait is public, so a panic inside that critical
+  section is reachable without touching a line of Moonclip.
+
+  What it cost: every later `save`, `load`, `flush` and `list_snapshots`
+  raised `PanicException`, on the caller's thread, from somewhere unrelated to
+  what had actually failed. One bad checkpoint took the run with it, and the
+  message named the wrong place. Every access to the manifest now recovers the
+  lock instead — the in-memory copy is re-readable from storage, so refusing
+  to hand it out buys nothing that re-reading does not.
+
+  The re-read is the second half, and it is not cosmetic: a save that panics
+  in retention has already pushed its snapshot into the in-memory manifest, so
+  recovering the lock alone would carry an entry that never reached storage
+  into the next manifest written. The two write paths that do not already
+  re-read now do so before trusting what is in memory.
+
+  Unchanged: what a failed checkpoint costs is still that checkpoint. The
+  failure is still reported by the next `save` or `flush`, with the panic's
+  own message.
+
 - **The merger and the remote syncer no longer die in silence.** Moonclip runs
   three background threads and only one of them — the async saver — was
   protected from panics. A panic on either of the other two killed the thread

@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::{Mutex, MutexGuard};
 use uuid::Uuid;
 
 // ─── Tensor-level metadata ──────────────────────────────────────────
@@ -301,6 +302,36 @@ impl Manifest {
         ids.reverse();
         ids
     }
+}
+
+// ─── Taking the lock ────────────────────────────────────────────────
+
+/// Take the manifest lock, recovering it when a panic has poisoned it.
+///
+/// `catch_unwind` in `coordinator::saver` restores the *thread* after a panic
+/// in the save pipeline; it does not touch the poison flag a `Mutex` sets when
+/// a guard is dropped during unwinding. Left alone, the flag turns one panic
+/// under this lock into a `PanicException` on every subsequent `save`, `load`,
+/// `flush` and `list_snapshots` — raised on the caller's thread, from a place
+/// unconnected to whatever actually failed, for the rest of the process.
+///
+/// Recovering is the right trade here and not merely the convenient one. The
+/// invariant a poisoned `Manifest` could break is "the in-memory copy might be
+/// half-updated", and that copy is **re-readable from storage**: the on-disk
+/// manifest is only ever replaced whole, so `Core::reload_manifest` gets back a
+/// consistent one. Walling off the coordinator for the rest of the run buys
+/// nothing a re-read does not, and this is a library whose contract is that a
+/// failed checkpoint costs that checkpoint, not the run.
+///
+/// The poison flag is cleared as well as bypassed, so `Mutex::is_poisoned`
+/// stays a signal about the *last* panic rather than a latch that is stuck on
+/// forever; [`crate::coordinator`] reads it to decide whether to re-read from
+/// storage before trusting what is in memory.
+pub(crate) fn lock_manifest(lock: &Mutex<Manifest>) -> MutexGuard<'_, Manifest> {
+    lock.lock().unwrap_or_else(|poisoned| {
+        lock.clear_poison();
+        poisoned.into_inner()
+    })
 }
 
 #[cfg(test)]
