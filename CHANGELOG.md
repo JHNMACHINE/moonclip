@@ -235,6 +235,27 @@ The first is a behaviour change and the migration is one line — see below.
   version is unmoved at 2.
 
 
+- **CI builds on Rust 1.97.1, and `rust-toolchain.toml` pins the same version
+  locally.** The two used to differ without saying so: the workflows pinned
+  `rust:1.90-bookworm` while development ran 1.97, so a red `cargo clippy`
+  locally did not mean anything was broken — it could be the version gap — and
+  a green CI did not mean the next image bump would pass. The crate spent a
+  while in exactly that state, red locally on four findings that were lints
+  1.90 did not have. All four are fixed, and three of the four `-A` allowances
+  in `checks.yml` are gone with them; `too_many_arguments` remains.
+
+  The pin carries the patch number on both sides on purpose. Inside
+  `rust:1.97.1-bookworm` the installed toolchain is named `1.97.1-…`, so a
+  `channel = "1.97"` does not match it and rustup downloads a second copy of
+  the same compiler on every job — 31s against 1.4s, measured in that
+  container.
+
+  **This does not change the MSRV.** `rust-version` stays 1.83 and a
+  `rust-toolchain.toml` applies only inside the repository, so nothing changes
+  for anyone depending on the crate. What it does mean is that CI no longer
+  verifies the 1.83 claim.
+
+
 ## 0.0.8 — 2026-08-21
 
 S3 stopped being a one-way street. A gathered checkpoint of a 1B model with
