@@ -33,7 +33,7 @@ jobs:
     runs-on: codeberg-medium
     container:
       # Matches ci.yml and checks.yml. Bump all three together.
-      image: rust:1.90-bookworm
+      image: rust:1.97.1-bookworm
     steps:
       - name: Install git
         run: |
