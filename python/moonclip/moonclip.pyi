@@ -265,6 +265,59 @@ class MoonclipManager:
         """
         ...
 
+    def load_tensors(self, snap_id: str, names: List[str]) -> Dict[str, bytearray]:
+        """
+        Load only the named tensors out of a snapshot.
+
+        ``load`` reads the rank's whole pack in one request and decompresses
+        every tensor in it, which is right when every tensor is wanted. This
+        reads only the byte ranges the named tensors occupy — which over S3 or
+        R2 is the difference between a few kilobytes and the checkpoint.
+
+        Args:
+            snap_id: Snapshot UUID string.
+            names: Tensor names, as ``describe`` reports them.
+
+        Returns:
+            Dict mapping tensor_name -> raw bytes (as bytearray).
+
+        Raises:
+            RuntimeError: if a name is not in the snapshot. A missing name is
+                an error rather than an absent key: answering a typo with
+                nothing is how a caller ends up reasoning about a checkpoint it
+                never read.
+        """
+        ...
+
+    def describe(self, snap_id: str) -> Dict[str, Any]:
+        """
+        What a snapshot holds, without reading any of it.
+
+        Reads the manifest already in memory and touches no storage at all.
+        The dict carries ``id``, ``step``, ``created_at``, ``is_delta``,
+        ``base_snapshot_id``, ``rank``, ``ranks``, ``metadata``, and
+        ``tensors`` — one entry per tensor with ``name``, ``shape``, ``dtype``,
+        ``stored_dtype``, ``storage`` (``full`` / ``delta`` / ``skipped`` /
+        ``alias``), ``alias_of``, ``raw_size`` and ``compressed_size``.
+
+        ``dtype`` is what a load hands back; ``stored_dtype`` is what is on
+        disk. They differ exactly when ``save_dtype`` cast the tensor.
+
+        For anything that needs a checkpoint's shapes but not its bytes — a
+        reshard planning how N old shards map onto M new ones, an inspector,
+        a size report — this is the question, and until now the only way to
+        ask it was to load the snapshot and measure it.
+        """
+        ...
+
+    def describe_latest(self) -> Dict[str, Any]:
+        """
+        The newest finalized snapshot, described rather than loaded.
+
+        See :meth:`describe`.
+        """
+        ...
+
     def list_snapshots(self) -> List[Dict[str, Any]]:
         """
         List all finalized snapshots.

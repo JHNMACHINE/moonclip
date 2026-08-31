@@ -558,6 +558,96 @@ def unflatten_state_dict(raw: dict) -> Dict[str, Any]:
     return result
 
 
+class TensorStub:
+    """A tensor's name, shape and dtype, standing where the tensor would be.
+
+    What :func:`describe_state_dict` puts in a reconstructed tree instead of
+    the tensor. ``shape`` is a tuple and ``dtype`` a string, so code that only
+    measures — ``len(t.shape)``, ``t.shape[dim]`` — works against a described
+    tree and a real one without knowing which it has.
+
+    ``name`` is the flat key the tensor is stored under, which is what makes
+    this useful rather than merely informative: having measured, a caller
+    passes the names it actually wants to ``load_tensors`` and reads those.
+    """
+
+    __slots__ = ("name", "shape", "dtype")
+
+    def __init__(self, name: str, shape, dtype: str):
+        self.name = name
+        self.shape = tuple(shape)
+        self.dtype = dtype
+
+    def __repr__(self) -> str:
+        return "TensorStub(%r, shape=%r, dtype=%r)" % (
+            self.name,
+            self.shape,
+            self.dtype,
+        )
+
+    def __eq__(self, other) -> bool:
+        if not isinstance(other, TensorStub):
+            return NotImplemented
+        return (
+            self.name == other.name
+            and self.shape == other.shape
+            and self.dtype == other.dtype
+        )
+
+    def __hash__(self) -> int:
+        return hash((self.name, self.shape, self.dtype))
+
+
+def _stub_from_tensors(meta: Any) -> Any:
+    """`_reconstruct_from_tensors` with stubs where the tensors would go."""
+    if isinstance(meta, dict) and "__tensor__" in meta:
+        return TensorStub(meta["__tensor__"], meta.get("shape", ()), meta.get("dtype", ""))
+    if isinstance(meta, dict):
+        return {k: _stub_from_tensors(v) for k, v in meta.items()}
+    if isinstance(meta, list):
+        return [_stub_from_tensors(v) for v in meta]
+    if isinstance(meta, tuple):
+        return tuple(_stub_from_tensors(v) for v in meta)
+    return meta
+
+
+def describe_state_dict(raw: dict) -> Dict[str, Any]:
+    """The structure a checkpoint has, with stubs where its tensors are.
+
+    Same shape as :func:`unflatten_state_dict` and the same reading of the
+    same pickle, except that nothing is materialized: every tensor comes back
+    as a :class:`TensorStub` carrying its name, shape and dtype. Everything
+    that was never a tensor — the scalars, the flags, whatever structure the
+    caller wrapped around them — is there unchanged, because it was in the
+    template all along.
+
+    Pair it with ``MoonclipManager.load_tensors``: this needs only the
+    ``<prefix>._metadata`` entries, which are kilobytes, and the names in the
+    stubs say what to fetch afterwards. Together they answer "what is in this
+    checkpoint, and how big" without reading it, which is the question a
+    reshard asks of every old shard before it can plan a single slice.
+
+    Args:
+        raw: ``{name: bytes}``, needing only the ``._metadata`` entries — as
+            ``load_tensors(snap_id, ["model._metadata"])`` returns.
+
+    Returns:
+        ``{prefix: tree}`` for each prefix that could be described.
+
+    A ``<prefix>._blob`` prefix is **left out**. A blob is one pickle holding
+    the tensors themselves, so there is no describing it short of loading it,
+    and returning something half-described would be worse than saying nothing:
+    the caller would measure a tree missing exactly the part this could not
+    reach. Use :func:`unflatten_state_dict` for those.
+    """
+    result: Dict[str, Any] = {}
+    for key, value in raw.items():
+        if not key.endswith("._metadata"):
+            continue
+        result[key[: -len("._metadata")]] = _stub_from_tensors(pickle.loads(value))
+    return result
+
+
 class CheckpointManager:
     """
     PyTorch-aware wrapper around MoonclipManager.
@@ -803,6 +893,27 @@ class CheckpointManager:
 
     def list_snapshots(self):
         return self._mgr.list_snapshots()
+
+    def describe(self, snap_id: str) -> dict:
+        """What a snapshot holds, without reading any of it.
+
+        Names, shapes and dtypes off the manifest — no tensors materialized
+        and no storage touched. See ``MoonclipManager.describe``.
+        """
+        return self._mgr.describe(snap_id)
+
+    def describe_latest(self) -> dict:
+        """The newest finalized snapshot, described rather than loaded."""
+        return self._mgr.describe_latest()
+
+    def load_tensors(self, snap_id: str, names) -> dict:
+        """Raw bytes for the named tensors, and nothing else.
+
+        Deliberately raw and deliberately not applied to any object: the
+        callers are the ones that want a piece of a checkpoint rather than the
+        checkpoint. ``load``/``resume`` remain the way to restore a run.
+        """
+        return self._mgr.load_tensors(snap_id, list(names))
 
     def resume(
         self,

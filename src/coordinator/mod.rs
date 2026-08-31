@@ -363,6 +363,37 @@ impl Coordinator {
         self.core.load_latest()
     }
 
+    /// What a snapshot holds, without reading a byte of it.
+    ///
+    /// Name, shape, dtype and how each tensor is stored, for this rank, read
+    /// off the manifest already in memory. No storage access at all — see
+    /// [`Core::describe`] for why that is worth its own call.
+    pub fn describe(&self, snap_id: Uuid) -> Result<SnapshotDescription> {
+        self.wait_idle();
+        self.core.describe(snap_id)
+    }
+
+    /// The newest finalized snapshot's description.
+    pub fn describe_latest(&self) -> Result<SnapshotDescription> {
+        self.wait_idle();
+        self.core.describe_latest()
+    }
+
+    /// Load the named tensors and nothing else.
+    ///
+    /// [`Self::load`] reads the rank's whole pack in one go and decompresses
+    /// every tensor in it, which is right when every tensor is wanted. This
+    /// reads only the spans the named tensors occupy. See
+    /// [`Core::load_tensors`].
+    pub fn load_tensors(
+        &self,
+        snap_id: Uuid,
+        names: &[String],
+    ) -> Result<HashMap<String, Vec<u8>>> {
+        self.flush()?;
+        self.core.load_tensors(snap_id, names)
+    }
+
     /// List all snapshots.
     pub fn list_snapshots(&self) -> Vec<SnapshotInfo> {
         self.wait_idle();
@@ -848,7 +879,7 @@ impl Core {
             Uuid,
             HashMap<String, TensorEntry>,
             CompressionAlgo,
-            Option<Arc<Vec<u8>>>,
+            tensor::OwnedPack,
         );
         let needs_base = rank_entry
             .tensors
@@ -862,12 +893,12 @@ impl Core {
                 match base_snap {
                     Some(bs) => match bs.ranks.get(&self.config.rank) {
                         Some(re) => {
-                            let pack = re
-                                .pack_file
-                                .as_ref()
-                                .map(|p| self.storage.get(p))
-                                .transpose()?
-                                .map(Arc::new);
+                            let pack = match re.pack_file {
+                                Some(ref p) => {
+                                    tensor::OwnedPack::Whole(Arc::new(self.storage.get(p)?))
+                                }
+                                None => tensor::OwnedPack::PerFile,
+                            };
                             let entries = re
                                 .tensors
                                 .iter()
@@ -897,7 +928,7 @@ impl Core {
                     return Ok((entry, comp.clone(), pack.clone()));
                 }
             }
-            self.find_base_tensor_entry_with_pack(base_id, tensor_name)
+            self.find_base_tensor_entry_with_pack(base_id, tensor_name, true)
         };
 
         let pairs: Result<Vec<(String, Vec<u8>)>> = rank_entry
@@ -910,7 +941,10 @@ impl Core {
                     snap.base_snapshot_id,
                     self.storage.as_ref(),
                     &snap.compression,
-                    pack_data.as_deref(),
+                    match pack_data {
+                        Some(ref bytes) => tensor::PackSource::Whole(bytes),
+                        None => tensor::PackSource::PerFile,
+                    },
                     &resolver,
                 )
                 .map(|data| (entry.name.clone(), data))
@@ -953,6 +987,172 @@ impl Core {
         let id = snap.id;
         let data = self.load(id)?;
         Ok((id, data))
+    }
+
+    /// What a snapshot holds, with none of its bytes.
+    ///
+    /// Everything here is already in the manifest — shape, dtype, how the
+    /// tensor is stored, how many bytes it takes — so this touches no storage
+    /// and costs a clone. It exists because there was no way to ask: `load`
+    /// materialized the whole snapshot, and a caller that only wanted to know
+    /// *how long* a shard was had to read the shard to find out.
+    ///
+    /// Resharding is the caller that pays for that. Planning how N old shards
+    /// map onto M new ones needs every old length before it can cut the first
+    /// slice, so a reshard read every old checkpoint in full, measured it, and
+    /// threw it away — N complete reads of data it did not want.
+    ///
+    /// This rank's tensors, the same set [`Core::load`] returns. A snapshot
+    /// this rank did not write is a `NotFound` rather than an empty list: the
+    /// two mean different things and only one of them is a checkpoint.
+    fn describe(&self, snap_id: Uuid) -> Result<SnapshotDescription> {
+        let manifest = self.lock_manifest();
+        let snap = manifest
+            .find_snapshot(snap_id)
+            .ok_or_else(|| MoonclipError::NotFound(format!("Snapshot {snap_id}")))?;
+        Self::describe_snapshot(snap, self.config.rank)
+    }
+
+    fn describe_latest(&self) -> Result<SnapshotDescription> {
+        let manifest = self.lock_manifest();
+        let snap = manifest
+            .snapshots
+            .iter()
+            .rev()
+            .find(|s| s.finalized)
+            .ok_or_else(|| MoonclipError::NotFound("No finalized snapshots".into()))?;
+        Self::describe_snapshot(snap, self.config.rank)
+    }
+
+    fn describe_snapshot(snap: &Snapshot, rank: u32) -> Result<SnapshotDescription> {
+        let rank_entry = snap.ranks.get(&rank).ok_or_else(|| {
+            MoonclipError::NotFound(format!("Rank {rank} not found in snapshot {}", snap.id))
+        })?;
+
+        let tensors = rank_entry
+            .tensors
+            .iter()
+            .map(|t| TensorDescription {
+                name: t.name.clone(),
+                shape: t.shape.clone(),
+                // What a load hands back, which is the question a caller
+                // sizing a buffer is asking. `stored_dtype` is the other one —
+                // what is on disk — and the two differ exactly when
+                // `save_dtype` cast the tensor on the way down.
+                dtype: t.original_dtype.clone().unwrap_or_else(|| t.dtype.clone()),
+                stored_dtype: t.dtype.clone(),
+                storage: t.storage.clone(),
+                alias_of: t.alias_of.clone(),
+                raw_size: t.raw_size,
+                compressed_size: t.compressed_size,
+            })
+            .collect();
+
+        Ok(SnapshotDescription {
+            id: snap.id,
+            step: snap.step,
+            created_at: snap.created_at,
+            is_delta: snap.base_snapshot_id.is_some(),
+            base_snapshot_id: snap.base_snapshot_id,
+            metadata: snap.metadata.clone(),
+            rank,
+            ranks: snap.ranks.len() as u32,
+            tensors,
+        })
+    }
+
+    /// Load the named tensors and nothing else.
+    ///
+    /// [`Core::load`] reads the rank's pack with a single `get` and slices
+    /// every tensor out of it, which is the right shape when every tensor is
+    /// wanted. Asking for a handful that way costs the whole checkpoint — over
+    /// a network, the whole checkpoint over the wire — so this reads each
+    /// wanted tensor's span on its own instead, and resolves deltas and skips
+    /// against a base it also refuses to read whole.
+    ///
+    /// Sequential rather than parallel, deliberately: the callers are asking
+    /// for a few small tensors, and a rayon pass over three of them buys
+    /// nothing worth the coordination.
+    ///
+    /// A name that is not in the snapshot is an error naming it, not a gap in
+    /// the returned map. Answering a typo with silence is how a caller ends up
+    /// reasoning about a checkpoint it never read.
+    fn load_tensors(&self, snap_id: Uuid, names: &[String]) -> Result<HashMap<String, Vec<u8>>> {
+        let manifest = self.lock_manifest();
+        let snap = manifest
+            .find_snapshot(snap_id)
+            .ok_or_else(|| MoonclipError::NotFound(format!("Snapshot {snap_id}")))?
+            .clone();
+        // Pinned for the same reason a full load pins: a merge running beside
+        // this would otherwise unlink the packs being read. The base too,
+        // since a skipped tensor is read from it. See `crate::inflight`.
+        let mut pinned = vec![snap.id];
+        pinned.extend(snap.base_snapshot_id);
+        let _pin = self.in_flight.pin(&pinned);
+        drop(manifest);
+
+        let rank_entry = snap.ranks.get(&self.config.rank).ok_or_else(|| {
+            MoonclipError::NotFound(format!(
+                "Rank {} not found in snapshot {snap_id}",
+                self.config.rank
+            ))
+        })?;
+
+        let pack = match rank_entry.pack_file {
+            Some(ref path) => tensor::PackSource::Ranged(path),
+            None => tensor::PackSource::PerFile,
+        };
+        // `false`: one tensor's worth of base, not the base checkpoint. That
+        // is the whole point of this call, and it is the path a skipped tensor
+        // takes — which for something small and unchanging, a state template
+        // among them, is nearly every step.
+        let resolver = |base_id: Uuid, tensor_name: &str| -> Result<crate::tensor::BaseEntry> {
+            self.find_base_tensor_entry_with_pack(base_id, tensor_name, false)
+        };
+
+        let mut out = HashMap::with_capacity(names.len());
+        for name in names {
+            let entry = rank_entry
+                .tensors
+                .iter()
+                .find(|t| &t.name == name)
+                .ok_or_else(|| {
+                    MoonclipError::NotFound(format!("Tensor '{name}' not in snapshot {snap_id}"))
+                })?;
+
+            // An alias holds no bytes of its own; they are under another name
+            // in this same rank entry. A full load resolves these in a second
+            // pass over everything it read, which is not available here — the
+            // target may well not be among the names asked for.
+            let entry = if entry.storage == TensorStorage::Alias {
+                let target = entry.alias_of.as_deref().ok_or_else(|| {
+                    MoonclipError::NotFound(format!("Alias '{name}' has no target"))
+                })?;
+                rank_entry
+                    .tensors
+                    .iter()
+                    .find(|t| t.name == target)
+                    .ok_or_else(|| {
+                        MoonclipError::NotFound(format!(
+                            "Alias '{name}' points at '{target}', which is not in this snapshot"
+                        ))
+                    })?
+            } else {
+                entry
+            };
+
+            let data = tensor::load_tensor(
+                entry,
+                snap.base_snapshot_id,
+                self.storage.as_ref(),
+                &snap.compression,
+                pack,
+                &resolver,
+            )?;
+            out.insert(name.clone(), data);
+        }
+
+        Ok(out)
     }
 
     fn list_snapshots(&self) -> Vec<SnapshotInfo> {
@@ -1335,13 +1535,19 @@ impl Core {
         });
     }
 
-    /// Find base tensor entry + pack data for loading (fallback path for
-    /// base snapshots not covered by the per-load prefetch).
-    /// Returns (TensorEntry, CompressionAlgo, Option<pack_data>).
+    /// Find base tensor entry + where its bytes are (fallback path for base
+    /// snapshots not covered by the per-load prefetch).
+    ///
+    /// `whole_pack` says whether to read the base pack now or leave each
+    /// tensor to a ranged read. Reading it whole is right when the caller is
+    /// resolving many tensors against this base, and wrong when it wants one:
+    /// `load_tensors` asks for a handful and would otherwise pull the entire
+    /// base checkpoint to reconstruct a few kilobytes of it.
     fn find_base_tensor_entry_with_pack(
         &self,
         base_id: Uuid,
         tensor_name: &str,
+        whole_pack: bool,
     ) -> Result<crate::tensor::BaseEntry> {
         let manifest = self.lock_manifest();
         let base_snap = manifest
@@ -1371,12 +1577,15 @@ impl Core {
         let pack_file = rank_entry.pack_file.clone();
         drop(manifest);
 
-        let pack_data = match pack_file {
-            Some(ref pack) => Some(Arc::new(self.storage.get(pack)?)),
-            None => None,
+        let pack = match pack_file {
+            Some(ref path) if whole_pack => {
+                tensor::OwnedPack::Whole(Arc::new(self.storage.get(path)?))
+            }
+            Some(path) => tensor::OwnedPack::Ranged(path.into()),
+            None => tensor::OwnedPack::PerFile,
         };
 
-        Ok((entry, compression, pack_data))
+        Ok((entry, compression, pack))
     }
 
     /// Re-read manifest from storage (for multi-rank sync).
@@ -1569,6 +1778,42 @@ impl Core {
         manifest.snapshots.retain(|s| !to_remove.contains(&s.id));
         Ok(evicted)
     }
+}
+
+/// One tensor as the manifest describes it. See [`SnapshotDescription`].
+#[derive(Debug, Clone)]
+pub struct TensorDescription {
+    pub name: String,
+    pub shape: Vec<usize>,
+    /// The dtype a load hands back: the tensor's original one when
+    /// `save_dtype` cast it on the way down, otherwise what is on disk.
+    pub dtype: String,
+    /// The dtype actually stored. Differs from `dtype` only under a cast.
+    pub stored_dtype: String,
+    pub storage: TensorStorage,
+    /// For an `Alias`, the tensor in this same snapshot holding the bytes.
+    pub alias_of: Option<String>,
+    pub raw_size: u64,
+    /// Bytes on disk. Zero for `Skipped` and `Alias`, which store none — the
+    /// honest answer to "what does this snapshot cost", and not the same
+    /// question as "how big is this tensor", which is `raw_size`.
+    pub compressed_size: u64,
+}
+
+/// What a snapshot holds, without any of its bytes. See [`Coordinator::describe`].
+#[derive(Debug, Clone)]
+pub struct SnapshotDescription {
+    pub id: Uuid,
+    pub step: u64,
+    pub created_at: DateTime<Utc>,
+    pub is_delta: bool,
+    pub base_snapshot_id: Option<Uuid>,
+    pub metadata: HashMap<String, String>,
+    /// The rank these tensors belong to — this coordinator's own.
+    pub rank: u32,
+    /// How many ranks wrote into this snapshot.
+    pub ranks: u32,
+    pub tensors: Vec<TensorDescription>,
 }
 
 /// Public snapshot info returned by list_snapshots.

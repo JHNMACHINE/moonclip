@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use crate::cast::DTypePolicy;
 use crate::coordinator::{Coordinator, CoordinatorConfig};
-use crate::manifest::{CompressionAlgo, LineageConfig, RetentionPolicy};
+use crate::manifest::{CompressionAlgo, LineageConfig, RetentionPolicy, TensorStorage};
 use crate::merger::MergerConfig;
 use crate::remote_sync::RemoteSyncConfig;
 use crate::s3::{S3Config, S3Storage};
@@ -277,6 +277,58 @@ fn materialize_tensors(pending: Vec<PendingTensor>) -> Vec<TensorData> {
         .collect()
 }
 
+/// A `SnapshotDescription` as a plain dict.
+///
+/// Plain dicts rather than a `#[pyclass]`, matching `list_snapshots`: what
+/// comes back here is data to read, not an object with behaviour, and a dict
+/// pickles, prints and compares without anyone importing a type to do it.
+fn description_dict<'py>(
+    py: Python<'py>,
+    described: &crate::coordinator::SnapshotDescription,
+) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("id", described.id.to_string())?;
+    d.set_item("step", described.step)?;
+    d.set_item("created_at", described.created_at.to_rfc3339())?;
+    d.set_item("is_delta", described.is_delta)?;
+    d.set_item(
+        "base_snapshot_id",
+        described.base_snapshot_id.map(|id| id.to_string()),
+    )?;
+    d.set_item("rank", described.rank)?;
+    d.set_item("ranks", described.ranks)?;
+
+    let meta = PyDict::new(py);
+    for (k, v) in &described.metadata {
+        meta.set_item(k, v)?;
+    }
+    d.set_item("metadata", meta)?;
+
+    let mut tensors = Vec::with_capacity(described.tensors.len());
+    for t in &described.tensors {
+        let e = PyDict::new(py);
+        e.set_item("name", &t.name)?;
+        e.set_item("shape", t.shape.clone())?;
+        e.set_item("dtype", &t.dtype)?;
+        e.set_item("stored_dtype", &t.stored_dtype)?;
+        e.set_item(
+            "storage",
+            match t.storage {
+                TensorStorage::Full => "full",
+                TensorStorage::DeltaXor => "delta",
+                TensorStorage::Skipped => "skipped",
+                TensorStorage::Alias => "alias",
+            },
+        )?;
+        e.set_item("alias_of", t.alias_of.clone())?;
+        e.set_item("raw_size", t.raw_size)?;
+        e.set_item("compressed_size", t.compressed_size)?;
+        tensors.push(e);
+    }
+    d.set_item("tensors", tensors)?;
+    Ok(d)
+}
+
 /// High-performance checkpoint manager for ML training.
 #[pyclass]
 pub struct MoonclipManager {
@@ -524,6 +576,37 @@ impl MoonclipManager {
         }
         let id_str = PyString::new(py, &id.to_string());
         Ok((id_str, dict))
+    }
+
+    /// Load only the named tensors. Returns dict of tensor_name → bytearray.
+    fn load_tensors<'py>(
+        &self,
+        py: Python<'py>,
+        snap_id: &str,
+        names: Vec<String>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let uuid = uuid::Uuid::parse_str(snap_id)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        let tensors = py.detach(|| self.inner.load_tensors(uuid, &names))?;
+        let dict = PyDict::new(py);
+        for (name, data) in tensors {
+            dict.set_item(name, PyByteArray::new(py, &data))?;
+        }
+        Ok(dict)
+    }
+
+    /// What a snapshot holds, without reading any of it.
+    fn describe<'py>(&self, py: Python<'py>, snap_id: &str) -> PyResult<Bound<'py, PyDict>> {
+        let uuid = uuid::Uuid::parse_str(snap_id)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        let described = py.detach(|| self.inner.describe(uuid))?;
+        description_dict(py, &described)
+    }
+
+    /// The newest finalized snapshot, described rather than loaded.
+    fn describe_latest<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let described = py.detach(|| self.inner.describe_latest())?;
+        description_dict(py, &described)
     }
 
     /// List all finalized snapshots.

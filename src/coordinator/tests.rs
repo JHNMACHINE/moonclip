@@ -3,6 +3,7 @@
 //! A child module, not `tests/`: these reach into `Core`, the manifest and
 //! the packs on disk, which an integration test cannot see.
 
+use std::sync::atomic::AtomicUsize;
 use std::sync::mpsc;
 use std::thread;
 
@@ -1899,4 +1900,333 @@ fn a_panic_under_the_manifest_lock_does_not_wall_off_the_coordinator() {
          keeps it from being carried into the next one"
     );
     assert_eq!(coord.load(third).unwrap()["w"], vec![3u8; 8192]);
+}
+/// Counts what a load actually pulls off storage, and how much of it.
+///
+/// The point of `describe` and `load_tensors` is not what they return — the
+/// manifest and the full load already had that — but what they decline to
+/// read. A test asserting only the values would pass on an implementation that
+/// loads the whole checkpoint and throws it away, which is the implementation
+/// being replaced.
+struct MeasuredStorage {
+    inner: LocalStorage,
+    whole_reads: AtomicUsize,
+    ranged_reads: AtomicUsize,
+    bytes_read: AtomicUsize,
+}
+
+impl MeasuredStorage {
+    fn new(dir: &std::path::Path) -> Self {
+        MeasuredStorage {
+            inner: LocalStorage::new(dir).unwrap(),
+            whole_reads: AtomicUsize::new(0),
+            ranged_reads: AtomicUsize::new(0),
+            bytes_read: AtomicUsize::new(0),
+        }
+    }
+
+    fn reset(&self) {
+        self.whole_reads.store(0, Ordering::Relaxed);
+        self.ranged_reads.store(0, Ordering::Relaxed);
+        self.bytes_read.store(0, Ordering::Relaxed);
+    }
+}
+
+impl StorageBackend for MeasuredStorage {
+    fn put(&self, rel_path: &str, data: &[u8]) -> Result<()> {
+        self.inner.put(rel_path, data)
+    }
+    fn put_parts(&self, rel_path: &str, parts: &[&[u8]]) -> Result<()> {
+        self.inner.put_parts(rel_path, parts)
+    }
+    fn get(&self, rel_path: &str) -> Result<Vec<u8>> {
+        let data = self.inner.get(rel_path)?;
+        if rel_path.ends_with(".pack") {
+            self.whole_reads.fetch_add(1, Ordering::Relaxed);
+            self.bytes_read.fetch_add(data.len(), Ordering::Relaxed);
+        }
+        Ok(data)
+    }
+    fn get_range(&self, rel_path: &str, offset: u64, len: usize) -> Result<Vec<u8>> {
+        let data = self.inner.get_range(rel_path, offset, len)?;
+        if rel_path.ends_with(".pack") {
+            self.ranged_reads.fetch_add(1, Ordering::Relaxed);
+            self.bytes_read.fetch_add(data.len(), Ordering::Relaxed);
+        }
+        Ok(data)
+    }
+    fn exists(&self, rel_path: &str) -> Result<bool> {
+        self.inner.exists(rel_path)
+    }
+    fn delete(&self, rel_path: &str) -> Result<()> {
+        self.inner.delete(rel_path)
+    }
+    fn list(&self, prefix: &str) -> Result<Vec<String>> {
+        self.inner.list(prefix)
+    }
+}
+
+/// One tiny tensor beside one large incompressible one, so "read the whole
+/// pack" and "read one tensor" are separated by orders of magnitude.
+///
+/// The large one has to be *noise*. A run of predictable bytes compresses to
+/// nothing, the pack comes out one page long, and the test then measures
+/// storage padding rather than either strategy.
+fn mixed_state(seed: u8) -> Vec<TensorData> {
+    let mut s = (seed as u64) | 1;
+    let w: Vec<u8> = (0..400_000)
+        .map(|_| {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            (s >> 24) as u8
+        })
+        .collect();
+    vec![
+        TensorData {
+            name: "meta".into(),
+            shape: vec![64],
+            dtype: "uint8".into(),
+            data: vec![seed; 64],
+        },
+        TensorData {
+            name: "w".into(),
+            shape: vec![400_000],
+            dtype: "uint8".into(),
+            data: w,
+        },
+    ]
+}
+
+/// `describe` answers off the manifest and reads nothing at all.
+#[test]
+fn describe_reports_the_shapes_without_touching_storage() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = Arc::new(MeasuredStorage::new(dir.path()));
+    let coord = Coordinator::new(
+        Arc::clone(&storage) as Arc<dyn StorageBackend>,
+        CoordinatorConfig {
+            compression: CompressionAlgo::Zstd { level: 1 },
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let mut meta = HashMap::new();
+    meta.insert("placements".into(), "{\"w\": \"shard(0)\"}".into());
+    let snap = coord.save(7, mixed_state(1), meta).unwrap();
+    coord.flush().unwrap();
+    storage.reset();
+
+    let described = coord.describe(snap).unwrap();
+
+    assert_eq!(
+        (
+            storage.whole_reads.load(Ordering::Relaxed),
+            storage.ranged_reads.load(Ordering::Relaxed)
+        ),
+        (0, 0),
+        "describe read pack bytes: the whole point is that it does not"
+    );
+    assert_eq!(described.step, 7);
+    assert_eq!(described.id, snap);
+    assert!(!described.is_delta);
+    assert_eq!(described.rank, 0);
+    assert_eq!(described.ranks, 1);
+    assert_eq!(
+        described.metadata.get("placements").map(String::as_str),
+        Some("{\"w\": \"shard(0)\"}"),
+        "the caller's own metadata is what carries anything Moonclip does not \
+         model, placements among it"
+    );
+
+    let by_name: HashMap<&str, &TensorDescription> = described
+        .tensors
+        .iter()
+        .map(|t| (t.name.as_str(), t))
+        .collect();
+    assert_eq!(by_name["w"].shape, vec![400_000]);
+    assert_eq!(by_name["w"].dtype, "uint8");
+    assert_eq!(by_name["w"].raw_size, 400_000);
+    assert_eq!(by_name["meta"].shape, vec![64]);
+}
+
+/// The shapes have to keep coming back once the snapshot is a delta, because
+/// that is what a run of any length actually holds — and a delta's rank entry
+/// lists every tensor, including the ones it stored nothing for.
+#[test]
+fn describe_reports_shapes_for_a_delta_and_its_skipped_tensors() {
+    let dir = tempfile::tempdir().unwrap();
+    let coord = make_coordinator(dir.path());
+
+    coord.save(1, mixed_state(1), HashMap::new()).unwrap();
+    let mut next = mixed_state(1);
+    next[1].data[..32].copy_from_slice(&[9u8; 32]);
+    let snap = coord.save(2, next, HashMap::new()).unwrap();
+    coord.flush().unwrap();
+
+    let described = coord.describe(snap).unwrap();
+    assert!(described.is_delta, "step 2 was stored as a full snapshot");
+
+    let by_name: HashMap<&str, &TensorDescription> = described
+        .tensors
+        .iter()
+        .map(|t| (t.name.as_str(), t))
+        .collect();
+    assert_eq!(
+        by_name["meta"].storage,
+        TensorStorage::Skipped,
+        "`meta` was unchanged and should have been skipped"
+    );
+    assert_eq!(
+        by_name["meta"].shape,
+        vec![64],
+        "a skipped tensor stores no bytes and still knows its shape — which is \
+         the case that makes this API usable at all"
+    );
+    assert_eq!(by_name["w"].shape, vec![400_000]);
+    assert_eq!(by_name["w"].raw_size, 400_000);
+}
+
+/// `load_tensors` reads the named spans, not the pack.
+#[test]
+fn load_tensors_reads_only_what_was_asked_for() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = Arc::new(MeasuredStorage::new(dir.path()));
+    let coord = Coordinator::new(
+        Arc::clone(&storage) as Arc<dyn StorageBackend>,
+        CoordinatorConfig {
+            compression: CompressionAlgo::Zstd { level: 1 },
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let snap = coord.save(1, mixed_state(3), HashMap::new()).unwrap();
+    coord.flush().unwrap();
+
+    storage.reset();
+    let whole = coord.load(snap).unwrap();
+    let full_bytes = storage.bytes_read.load(Ordering::Relaxed);
+    assert_eq!(whole["meta"], mixed_state(3)[0].data);
+
+    storage.reset();
+    let got = coord
+        .load_tensors(snap, &["meta".to_string()])
+        .unwrap();
+
+    assert_eq!(got.len(), 1, "something other than `meta` came back");
+    assert_eq!(got["meta"], mixed_state(3)[0].data);
+    assert_eq!(
+        storage.whole_reads.load(Ordering::Relaxed),
+        0,
+        "the pack was read whole: this is the read the call exists to avoid"
+    );
+    let subset_bytes = storage.bytes_read.load(Ordering::Relaxed);
+    assert!(
+        subset_bytes * 100 < full_bytes,
+        "reading one 64-byte tensor cost {subset_bytes} bytes against the full \
+         load's {full_bytes}: the range read is not being used"
+    );
+}
+
+/// The case that decides whether this is usable in a real run: a small tensor
+/// that does not change is stored `Skipped` from step two onwards, so reading
+/// it means going to the base — and a base read that pulls the whole base pack
+/// gives back everything the ranged read just saved.
+#[test]
+fn load_tensors_does_not_pull_the_base_pack_to_resolve_a_skip() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = Arc::new(MeasuredStorage::new(dir.path()));
+    let coord = Coordinator::new(
+        Arc::clone(&storage) as Arc<dyn StorageBackend>,
+        CoordinatorConfig {
+            compression: CompressionAlgo::Zstd { level: 1 },
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    coord.save(1, mixed_state(5), HashMap::new()).unwrap();
+    let mut next = mixed_state(5);
+    next[1].data[..32].copy_from_slice(&[7u8; 32]);
+    let snap = coord.save(2, next, HashMap::new()).unwrap();
+    coord.flush().unwrap();
+
+    let described = coord.describe(snap).unwrap();
+    let meta = described.tensors.iter().find(|t| t.name == "meta").unwrap();
+    assert_eq!(
+        meta.storage,
+        TensorStorage::Skipped,
+        "this test is vacuous unless `meta` was skipped"
+    );
+
+    storage.reset();
+    let got = coord.load_tensors(snap, &["meta".to_string()]).unwrap();
+
+    assert_eq!(got["meta"], mixed_state(5)[0].data);
+    assert_eq!(
+        storage.whole_reads.load(Ordering::Relaxed),
+        0,
+        "resolving the skip read the base pack whole, which costs the entire \
+         previous checkpoint to recover 64 bytes"
+    );
+    let read = storage.bytes_read.load(Ordering::Relaxed);
+    assert!(
+        read < 8192,
+        "read {read} bytes to recover a 64-byte tensor from the base"
+    );
+}
+
+/// A name that is not there is an error saying so.
+#[test]
+fn load_tensors_refuses_a_name_the_snapshot_does_not_have() {
+    let dir = tempfile::tempdir().unwrap();
+    let coord = make_coordinator(dir.path());
+    let snap = coord.save(1, sample_tensors(2), HashMap::new()).unwrap();
+    coord.flush().unwrap();
+
+    let err = coord
+        .load_tensors(snap, &["not_a_tensor".to_string()])
+        .expect_err("a missing name came back as an empty answer");
+    assert!(
+        err.to_string().contains("not_a_tensor"),
+        "the error does not name what was missing: {err}"
+    );
+}
+
+/// Tied weights are stored once and aliased, and an alias holds no bytes of
+/// its own. A full load resolves those in a second pass over everything it
+/// read; asking for the alias alone has to follow the reference instead.
+#[test]
+fn load_tensors_follows_an_alias_to_the_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let coord = make_coordinator(dir.path());
+
+    let shared = (0..20_000u32).map(|i| (i % 251) as u8).collect::<Vec<u8>>();
+    let tied = |name: &str| TensorData {
+        name: name.into(),
+        shape: vec![20_000],
+        dtype: "uint8".into(),
+        data: shared.clone(),
+    };
+    let snap = coord
+        .save(
+            1,
+            vec![tied("embed.weight"), tied("lm_head.weight")],
+            HashMap::new(),
+        )
+        .unwrap();
+    coord.flush().unwrap();
+
+    let described = coord.describe(snap).unwrap();
+    let alias = described
+        .tensors
+        .iter()
+        .find(|t| t.storage == TensorStorage::Alias)
+        .expect("neither tied tensor was deduplicated: this test proves nothing");
+    assert!(alias.alias_of.is_some(), "an alias with no target");
+
+    let got = coord.load_tensors(snap, std::slice::from_ref(&alias.name)).unwrap();
+    assert_eq!(got[&alias.name], shared, "the alias came back as the wrong bytes");
 }

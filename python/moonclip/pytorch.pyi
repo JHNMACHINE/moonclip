@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple, Union
 
 def flatten_state_dict(
     state_dict: dict,
@@ -6,6 +6,25 @@ def flatten_state_dict(
     as_tensors: bool = False,
 ) -> Tuple[dict, Any]:
     """Flatten a PyTorch state_dict into individual tensors."""
+    ...
+
+class TensorStub:
+    """A tensor's name, shape and dtype, standing where the tensor would be."""
+
+    name: str
+    shape: Tuple[int, ...]
+    dtype: str
+
+    def __init__(self, name: str, shape: Iterable[int], dtype: str) -> None: ...
+
+def describe_state_dict(raw: dict) -> Dict[str, Any]:
+    """The structure a checkpoint has, with TensorStubs where its tensors are.
+
+    Same reading of the same pickle as unflatten_state_dict, materializing
+    nothing. Needs only the `<prefix>._metadata` entries. A `._blob` prefix is
+    left out: a blob holds the tensors themselves and cannot be described
+    without being loaded.
+    """
     ...
 
 def unflatten_state_dict(raw: dict) -> Dict[str, Any]:
@@ -146,6 +165,21 @@ class CheckpointManager:
         ...
 
     def list_snapshots(self) -> List[Dict[str, Any]]: ...
+
+    def describe(self, snap_id: str) -> Dict[str, Any]:
+        """What a snapshot holds, without reading any of it."""
+        ...
+
+    def describe_latest(self) -> Dict[str, Any]:
+        """The newest finalized snapshot, described rather than loaded."""
+        ...
+
+    def load_tensors(
+        self, snap_id: str, names: Iterable[str]
+    ) -> Dict[str, bytearray]:
+        """Raw bytes for the named tensors, and nothing else."""
+        ...
+
     def merge_now(self) -> None: ...
     def sync_now(self) -> None: ...
 

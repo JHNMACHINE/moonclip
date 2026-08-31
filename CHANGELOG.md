@@ -141,6 +141,54 @@ The first is a behaviour change and the migration is one line — see below.
   a second full copy of the state outside Moonclip. A tensor that is already
   float64 is untouched, as before.
 
+- **`describe()`, `describe_latest()` and `load_tensors()`**, on
+  `MoonclipManager` and `CheckpointManager`: read what a checkpoint holds, and
+  read parts of it, without reading all of it.
+
+  There was nothing between `list_snapshots`, which reports totals, and
+  `load`, which materializes everything. A caller that needed a tensor's
+  *shape* had to load the tensor to find out — and the caller that pays for
+  that is a reshard, which has to know how long every old shard is before it
+  can plan a single slice. From N ranks to M that is N complete reads of data
+  it then discards, tens of gigabytes on a real model.
+
+  - `describe(snap_id)` returns the snapshot's metadata and, for every tensor
+    this rank wrote, `name`, `shape`, `dtype`, `stored_dtype`, `storage`
+    (`full` / `delta` / `skipped` / `alias`), `raw_size` and
+    `compressed_size`. **It touches no storage at all** — everything it
+    reports is already in the manifest in memory. `dtype` is what a load hands
+    back and `stored_dtype` is what is on disk; they differ exactly when
+    `save_dtype` cast the tensor, and conflating them would have a caller size
+    an fp32 buffer for what it reads as bf16. A skipped tensor stores no bytes
+    and still reports its shape, which is what makes this usable past the
+    first checkpoint of a run.
+
+  - `load_tensors(snap_id, names)` reads only the byte ranges those tensors
+    occupy, rather than pulling the rank's pack and decompressing all of it.
+    Deltas and skips resolve against a base it also declines to read whole —
+    the case that matters, since a small unchanging tensor is stored `skipped`
+    from step two onwards, and resolving that through a full base read would
+    give back everything the ranged read saved. A name that is not in the
+    snapshot is an error naming it, not a missing key.
+
+- **`describe_state_dict()` and `TensorStub`**, beside `unflatten_state_dict`.
+  Same reading of the same pickle, materializing nothing: every tensor comes
+  back as a `TensorStub` with its `name`, `shape` and `dtype`, and everything
+  that was never a tensor is there unchanged.
+
+  That last part is what makes the pair complete. Moonclip does not model
+  placements, layout tags or whatever else a caller wrapped around its
+  tensors — but they were in the template all along, so
+  `load_tensors(snap, ["model._metadata"])` plus `describe_state_dict` hands
+  back the whole structure, with shapes, for a few kilobytes. The stubs carry
+  the flat names, so having measured, a caller fetches exactly the tensors it
+  turned out to want.
+
+  A `<prefix>._blob` prefix is left out rather than half-described: a blob is
+  one pickle holding the tensors themselves, and there is no describing it
+  short of loading it.
+
+
 ### Changed
 
 - **Python 3.9 and 3.10 are no longer supported.** The floor is 3.11, and no

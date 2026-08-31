@@ -787,3 +787,158 @@ class TestPerComponentSaveDtype:
         makes a typo into a silently doubled checkpoint."""
         with pytest.raises(exc):
             CheckpointManager(storage_root=str(tmp_path), save_dtype=bad)
+
+
+
+class TestDescribeWithoutLoading:
+    """Reading a checkpoint's shapes used to mean reading the checkpoint.
+
+    `list_snapshots` reported sizes and steps, `load` gave back everything,
+    and there was nothing in between — so a caller that needed to know how
+    long a shard was loaded the shard to find out. A reshard from N ranks to M
+    does that once per old rank before it can plan a single slice: N complete
+    reads of data it discards.
+    """
+
+    def _trained(self):
+        torch.manual_seed(0)
+        model = torch.nn.Linear(64, 32)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        model(torch.randn(8, 64)).sum().backward()
+        optimizer.step()
+        return model, optimizer
+
+    def test_describe_reports_every_tensor_with_its_shape(self, tmp_path):
+        model, optimizer = self._trained()
+        mgr = CheckpointManager(storage_root=str(tmp_path), async_save=False)
+        snap = mgr.save(step=3, model=model, optimizer=optimizer, metadata={"lr": "1e-3"})
+        mgr.flush()
+
+        described = mgr.describe(snap)
+
+        assert described["step"] == 3
+        assert described["id"] == snap
+        assert described["metadata"]["lr"] == "1e-3"
+
+        by_name = {t["name"]: t for t in described["tensors"]}
+        for name, tensor in model.state_dict().items():
+            entry = by_name["model/" + name]
+            assert tuple(entry["shape"]) == tuple(tensor.shape), name
+            assert entry["dtype"] == str(tensor.dtype).replace("torch.", ""), name
+
+    def test_a_cast_tensor_reports_the_dtype_a_load_would_give_back(self, tmp_path):
+        """`dtype` is what comes back, `stored_dtype` is what is on disk.
+
+        They differ exactly under `save_dtype`, and conflating them would have
+        a caller size an fp32 buffer for what it reads as bf16.
+        """
+        model, _ = self._trained()
+        mgr = CheckpointManager(
+            storage_root=str(tmp_path), async_save=False, save_dtype="bf16"
+        )
+        snap = mgr.save(step=1, model=model)
+        mgr.flush()
+
+        weight = next(
+            t for t in mgr.describe(snap)["tensors"] if t["name"] == "model/weight"
+        )
+        assert weight["stored_dtype"] == "bfloat16"
+        assert weight["dtype"] == "float32"
+
+    def test_the_shapes_survive_the_step_becoming_a_delta(self, tmp_path):
+        """The case a real run is in from step two onwards.
+
+        An unchanged tensor is stored `skipped` — no bytes at all — and still
+        has to report its shape, or this API answers only the first checkpoint
+        of a run.
+        """
+        model, optimizer = self._trained()
+        mgr = CheckpointManager(storage_root=str(tmp_path), async_save=False)
+        mgr.save(step=1, model=model, optimizer=optimizer)
+        with torch.no_grad():
+            model.weight.add_(0.01)
+        snap = mgr.save(step=2, model=model, optimizer=optimizer)
+        mgr.flush()
+
+        described = mgr.describe(snap)
+        assert described["is_delta"], "step 2 was written as a full snapshot"
+        by_name = {t["name"]: t for t in described["tensors"]}
+        for name, tensor in model.state_dict().items():
+            assert tuple(by_name["model/" + name]["shape"]) == tuple(tensor.shape)
+
+    def test_describe_state_dict_rebuilds_the_tree_out_of_the_metadata_alone(
+        self, tmp_path
+    ):
+        """The whole point, end to end: the structure and every shape, from
+        one small entry, with no tensor materialized and no pack read whole."""
+        from moonclip import MoonclipManager, TensorStub, describe_state_dict
+
+        model, _ = self._trained()
+        mgr = CheckpointManager(storage_root=str(tmp_path), async_save=False)
+        snap = mgr.save(step=1, model=model)
+        mgr.flush()
+
+        low = MoonclipManager(storage_root=str(tmp_path))
+        raw = low.load_tensors(snap, ["model._metadata"])
+        assert set(raw) == {"model._metadata"}, "more than the template was read"
+
+        described = describe_state_dict(raw)["model"]
+        for name, tensor in model.state_dict().items():
+            stub = described[name]
+            assert isinstance(stub, TensorStub)
+            assert stub.shape == tuple(tensor.shape), name
+            assert stub.name == "model/" + name, name
+
+        # And the names are usable: having measured, fetch exactly one.
+        wanted = described["weight"].name
+        got = low.load_tensors(snap, [wanted])
+        assert set(got) == {wanted}
+        back = torch.frombuffer(bytes(got[wanted]), dtype=model.weight.dtype)
+        assert torch.equal(back.reshape(model.weight.shape), model.weight)
+
+    def test_describe_state_dict_keeps_what_was_never_a_tensor(self, tmp_path):
+        """Scalars, flags and whatever structure the caller wrapped around its
+        tensors come back untouched — they were in the template all along.
+
+        This is what lets a caller read placements, layout tags and the like
+        without loading anything: Moonclip does not model them, and does not
+        need to."""
+        from moonclip import MoonclipManager, TensorStub, describe_state_dict
+
+        state = {
+            "group": {
+                "sharded": True,
+                "placements": [{"kind": "shard", "dim": 0}],
+                "local": torch.arange(12, dtype=torch.float32).reshape(3, 4),
+            }
+        }
+        mgr = CheckpointManager(storage_root=str(tmp_path), async_save=False)
+        snap = mgr.save(step=1, extra=state)
+        mgr.flush()
+
+        low = MoonclipManager(storage_root=str(tmp_path))
+        # One prefix per `extra` entry, so this is `extra/group._metadata`.
+        raw = low.load_tensors(snap, ["extra/group._metadata"])
+        node = describe_state_dict(raw)["extra/group"]
+
+        assert node["sharded"] is True
+        assert node["placements"] == [{"kind": "shard", "dim": 0}]
+        assert isinstance(node["local"], TensorStub)
+        assert node["local"].shape == (3, 4)
+        assert node["local"].dtype == "float32"
+
+    def test_it_is_reachable_from_the_package(self):
+        import moonclip
+
+        assert callable(moonclip.describe_state_dict)
+        assert "describe_state_dict" in moonclip.__all__
+        assert "TensorStub" in moonclip.__all__
+
+    def test_load_tensors_refuses_a_name_that_is_not_there(self, tmp_path):
+        model, _ = self._trained()
+        mgr = CheckpointManager(storage_root=str(tmp_path), async_save=False)
+        snap = mgr.save(step=1, model=model)
+        mgr.flush()
+
+        with pytest.raises(RuntimeError, match="model/nope"):
+            mgr.load_tensors(snap, ["model/nope"])

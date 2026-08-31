@@ -426,10 +426,46 @@ fn make_full_entry(
     })
 }
 
+/// Where one tensor's compressed bytes are to come from.
+///
+/// The distinction exists for callers that want a handful of tensors out of a
+/// pack holding thousands. Loading a whole snapshot reads the pack once and
+/// slices it, which is right when every slice is wanted; asking for one tensor
+/// that way costs the entire checkpoint to get a few kilobytes, and over a
+/// network it costs it twice over.
+#[derive(Clone, Copy)]
+pub enum PackSource<'a> {
+    /// The pack is already in memory, whole: every tensor is a slice of it.
+    Whole(&'a [u8]),
+    /// The pack is on storage and only part of it is wanted: each tensor is a
+    /// ranged read of its own span.
+    Ranged(&'a str),
+    /// Legacy per-file storage, where each entry names its own file.
+    PerFile,
+}
+
+/// An owning [`PackSource`], for the resolver, which has to hand one back
+/// rather than borrow one.
+#[derive(Clone)]
+pub enum OwnedPack {
+    Whole(Arc<Vec<u8>>),
+    Ranged(Arc<str>),
+    PerFile,
+}
+
+impl OwnedPack {
+    pub fn as_source(&self) -> PackSource<'_> {
+        match self {
+            OwnedPack::Whole(bytes) => PackSource::Whole(bytes),
+            OwnedPack::Ranged(path) => PackSource::Ranged(path),
+            OwnedPack::PerFile => PackSource::PerFile,
+        }
+    }
+}
+
 /// What a base-entry lookup answers with: the entry, the compression of the
-/// snapshot it came from, and that snapshot's pack bytes when a caller has
-/// already read them.
-pub type BaseEntry = (TensorEntry, CompressionAlgo, Option<Arc<Vec<u8>>>);
+/// snapshot it came from, and where that snapshot's bytes are to be read from.
+pub type BaseEntry = (TensorEntry, CompressionAlgo, OwnedPack);
 
 /// Resolver for base-snapshot tensor entries during load.
 pub type BaseEntryResolver<'a> = dyn Fn(uuid::Uuid, &str) -> Result<BaseEntry> + Sync + 'a;
@@ -445,10 +481,10 @@ pub fn load_tensor(
     snap_base_id: Option<uuid::Uuid>,
     storage: &dyn StorageBackend,
     compression: &CompressionAlgo,
-    pack_data: Option<&[u8]>,
+    pack: PackSource<'_>,
     find_base_entry: &BaseEntryResolver<'_>,
 ) -> Result<Vec<u8>> {
-    let raw = load_tensor_raw(entry, snap_base_id, storage, compression, pack_data, find_base_entry)?;
+    let raw = load_tensor_raw(entry, snap_base_id, storage, compression, pack, find_base_entry)?;
 
     // Uncast if needed (e.g. bf16 on disk → fp32 for training)
     if let Some(ref orig_dtype) = entry.original_dtype {
@@ -465,15 +501,34 @@ pub fn load_tensor(
 fn extract_compressed(
     entry: &TensorEntry,
     storage: &dyn StorageBackend,
-    pack_data: Option<&[u8]>,
+    pack: PackSource<'_>,
 ) -> Result<Vec<u8>> {
-    // Try pack file first
-    if let Some(pack) = pack_data {
-        let start = entry.offset as usize;
-        let end = start + entry.compressed_size as usize;
-        if end <= pack.len() {
-            return Ok(pack[start..end].to_vec());
+    match pack {
+        PackSource::Whole(bytes) => {
+            let start = entry.offset as usize;
+            let end = start + entry.compressed_size as usize;
+            if end <= bytes.len() {
+                return Ok(bytes[start..end].to_vec());
+            }
+            // Falls through to the per-file path, as it always has: a pack
+            // too short for the offset is a manifest describing something
+            // other than these bytes, and the legacy layout is the only
+            // remaining place the tensor could be.
         }
+        PackSource::Ranged(path) => {
+            let data = storage.get_range(path, entry.offset, entry.compressed_size as usize)?;
+            if data.len() == entry.compressed_size as usize {
+                return Ok(data);
+            }
+            return Err(MoonclipError::Storage(format!(
+                "Tensor '{}' wanted {} bytes at offset {} of '{path}', got {}",
+                entry.name,
+                entry.compressed_size,
+                entry.offset,
+                data.len()
+            )));
+        }
+        PackSource::PerFile => {}
     }
 
     // Fallback to individual file
@@ -533,7 +588,7 @@ fn load_tensor_raw(
     snap_base_id: Option<uuid::Uuid>,
     storage: &dyn StorageBackend,
     compression: &CompressionAlgo,
-    pack_data: Option<&[u8]>,
+    pack: PackSource<'_>,
     find_base_entry: &BaseEntryResolver<'_>,
 ) -> Result<Vec<u8>> {
     match entry.storage {
@@ -561,12 +616,12 @@ fn load_tensor_raw(
                 None,
                 storage,
                 &base_compression,
-                base_pack.as_ref().map(|p| p.as_slice()),
+                base_pack.as_source(),
                 find_base_entry,
             )
         }
         TensorStorage::Full => {
-            let compressed = extract_compressed(entry, storage, pack_data)?;
+            let compressed = extract_compressed(entry, storage, pack)?;
 
             // Verify compressed integrity (cheap with xxHash3)
             if let Some(ref expected) = entry.hash_compressed {
@@ -582,7 +637,7 @@ fn load_tensor_raw(
             compression::decompress(&compressed, compression)
         }
         TensorStorage::DeltaXor => {
-            let compressed = extract_compressed(entry, storage, pack_data)?;
+            let compressed = extract_compressed(entry, storage, pack)?;
             let mut delta_data = compression::decompress(&compressed, compression)?;
             if entry.shuffled {
                 delta_data = shuffle::unshuffle(&delta_data, shuffle::element_size(&entry.dtype));
@@ -602,7 +657,7 @@ fn load_tensor_raw(
                 None,
                 storage,
                 &base_compression,
-                base_pack.as_ref().map(|p| p.as_slice()),
+                base_pack.as_source(),
                 find_base_entry,
             )?;
 
@@ -956,7 +1011,7 @@ mod tests {
     /// coordinator reads out of the manifest at load time.
     /// What a base lookup hands back: the entry, how it was compressed,
     /// and its bytes when the caller already holds them.
-    type Resolved = (TensorEntry, CompressionAlgo, Option<Arc<Vec<u8>>>);
+    type Resolved = (TensorEntry, CompressionAlgo, OwnedPack);
 
     fn base_resolver(
         entries: Vec<TensorEntry>,
@@ -967,7 +1022,7 @@ mod tests {
         move |_id, name| {
             map.get(name)
                 .cloned()
-                .map(|e| (e, compression.clone(), None))
+                .map(|e| (e, compression.clone(), OwnedPack::PerFile))
                 .ok_or_else(|| MoonclipError::NotFound(name.into()))
         }
     }
@@ -1109,7 +1164,7 @@ mod tests {
 
         let resolve = base_resolver(vec![], compression.clone());
         let got =
-            load_tensor(&entry, None, storage.as_ref(), &compression, None, &resolve).unwrap();
+            load_tensor(&entry, None, storage.as_ref(), &compression, PackSource::PerFile, &resolve).unwrap();
         assert_eq!(got, data);
     }
 
@@ -1157,7 +1212,7 @@ mod tests {
             Some(base_id),
             storage.as_ref(),
             &compression,
-            None,
+            PackSource::PerFile,
             &resolve,
         )
         .unwrap();
@@ -1193,7 +1248,7 @@ mod tests {
             Some(base_id),
             storage.as_ref(),
             &compression,
-            None,
+            PackSource::PerFile,
             &resolve,
         )
         .unwrap();
@@ -1217,7 +1272,7 @@ mod tests {
         storage.put(&path, &stored).unwrap();
 
         let resolve = base_resolver(vec![], compression.clone());
-        let result = load_tensor(&entry, None, storage.as_ref(), &compression, None, &resolve);
+        let result = load_tensor(&entry, None, storage.as_ref(), &compression, PackSource::PerFile, &resolve);
         assert!(
             matches!(result, Err(MoonclipError::IntegrityError { .. })),
             "expected an integrity error, got {result:?}"
@@ -1235,7 +1290,7 @@ mod tests {
         let alias = make_alias_entry(&td("head", data, "float32"), &target);
 
         let resolve = base_resolver(vec![], compression.clone());
-        let err = load_tensor(&alias, None, storage.as_ref(), &compression, None, &resolve)
+        let err = load_tensor(&alias, None, storage.as_ref(), &compression, PackSource::PerFile, &resolve)
             .unwrap_err();
         let message = err.to_string();
         assert!(
@@ -1268,7 +1323,7 @@ mod tests {
         let entry = persist(storage.as_ref(), processed.entry, processed.write_data, "w.bin");
         let resolve = base_resolver(vec![], compression.clone());
         let got =
-            load_tensor(&entry, None, storage.as_ref(), &compression, None, &resolve).unwrap();
+            load_tensor(&entry, None, storage.as_ref(), &compression, PackSource::PerFile, &resolve).unwrap();
         assert_eq!(
             got.len(),
             data.len(),
@@ -1312,7 +1367,7 @@ mod tests {
         let entry = persist(storage.as_ref(), processed.entry, processed.write_data, "w.bin");
         let resolve = base_resolver(vec![], compression.clone());
         let got =
-            load_tensor(&entry, None, storage.as_ref(), &compression, None, &resolve).unwrap();
+            load_tensor(&entry, None, storage.as_ref(), &compression, PackSource::PerFile, &resolve).unwrap();
         assert_eq!(got.len(), data.len(), "load must uncast back to fp32 width");
 
         let back: Vec<f32> = got
@@ -1368,7 +1423,7 @@ mod tests {
             );
             let resolve = base_resolver(vec![], compression.clone());
             let got =
-                load_tensor(&entry, None, storage.as_ref(), &compression, None, &resolve).unwrap();
+                load_tensor(&entry, None, storage.as_ref(), &compression, PackSource::PerFile, &resolve).unwrap();
             assert_eq!(got, data, "{save_dtype:?}: float8 bytes must be bit-exact");
         }
     }
