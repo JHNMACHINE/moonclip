@@ -75,7 +75,7 @@ Resume integrity verified: max weight diff 0.0 after save → load.
 pip install moonclip
 ```
 
-Wheels are built for **Linux x86_64 (manylinux_2_28), CPython 3.9-3.14** — the
+Wheels are built for **Linux x86_64 (manylinux_2_28), CPython 3.11-3.14** — the
 platform training actually runs on. No Rust toolchain needed there; the
 extension is compiled. What changed between versions is in
 [CHANGELOG.md](https://codeberg.org/JHNMACHINE/moonclip/src/branch/main/CHANGELOG.md).
@@ -240,7 +240,7 @@ cargo clippy --all-targets -- -D warnings       # what CI gates on
 ```
 
 `checks.yml` runs clippy and `cargo test` on every branch push — one container,
-seconds. The full matrix (MinIO, the PyTorch adapter, CPython 3.9–3.14) waits
+seconds. The full matrix (MinIO, the PyTorch adapter, CPython 3.11–3.14) waits
 for `main`, in `ci.yml`.
 
 Both pin `rust:1.97.1-bookworm`, and `rust-toolchain.toml` pins the same
