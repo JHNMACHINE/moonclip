@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **`describe()` reports each tensor's `hash_raw`.** The xxHash3-128 of the
+  tensor's raw bytes, exactly as the manifest records it — the value skip
+  detection already compares — and the same whether the tensor was stored
+  whole, as a delta, skipped or aliased, since it hashes what the tensor holds.
+  Also on `TensorDescription` in Rust.
+
+  The caller is Ravex's audit trail (GPU-93), which fingerprints a checkpoint
+  by its content. Its first version read `manifest.json` to get these hashes,
+  and on Windows that cost checkpoints: Moonclip persists the manifest by
+  renaming a new version over it, the rename fails while anyone holds the file
+  open — even opened sharing delete — and the save being written was lost.
+  `describe()` waits for the writer and reads under Moonclip's own lock, so the
+  hashes are now available without anyone opening the file. The underlying
+  fragility, that any reader of `manifest.json` on Windows can make a save
+  fail, is its own issue (GPU-128) and is not fixed by this.
+
+  Not cryptographic, and said so on the field: it detects corruption and an
+  accidental swap, not a collision constructed on purpose.
+
 ## 0.1.0 — 2026-08-31
 
 Two of the three background threads could take the whole process down with

@@ -1045,6 +1045,7 @@ impl Core {
                 alias_of: t.alias_of.clone(),
                 raw_size: t.raw_size,
                 compressed_size: t.compressed_size,
+                hash_raw: t.hash_raw.clone(),
             })
             .collect();
 
@@ -1798,6 +1799,15 @@ pub struct TensorDescription {
     /// honest answer to "what does this snapshot cost", and not the same
     /// question as "how big is this tensor", which is `raw_size`.
     pub compressed_size: u64,
+    /// xxHash3-128 of the tensor's raw bytes, as the manifest records it: the
+    /// value skip detection compares. The same whether the tensor was stored
+    /// whole, as a delta, skipped or aliased, because it hashes what the
+    /// tensor holds rather than how it was written. Not cryptographic.
+    ///
+    /// Exposed so a caller can identify a snapshot's content without reading
+    /// `manifest.json` itself, which on Windows is not a safe thing to do while
+    /// the writer may be renaming a new manifest over it.
+    pub hash_raw: String,
 }
 
 /// What a snapshot holds, without any of its bytes. See [`Coordinator::describe`].

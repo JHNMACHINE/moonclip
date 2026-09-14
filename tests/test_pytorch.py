@@ -826,6 +826,32 @@ class TestDescribeWithoutLoading:
             assert tuple(entry["shape"]) == tuple(tensor.shape), name
             assert entry["dtype"] == str(tensor.dtype).replace("torch.", ""), name
 
+    def test_describe_reports_each_tensors_raw_hash(self, tmp_path):
+        """`hash_raw` identifies what a snapshot holds without opening
+        `manifest.json`, which on Windows is not safe while the writer may be
+        renaming a new manifest over it (GPU-93, GPU-128).
+
+        It hashes what a tensor holds, not how it was stored: an unchanged
+        tensor keeps its hash when the step becomes a delta, and a tensor whose
+        values moved gets a new one.
+        """
+        model, optimizer = self._trained()
+        mgr = CheckpointManager(storage_root=str(tmp_path), async_save=False)
+        first = mgr.save(step=1, model=model, optimizer=optimizer)
+        with torch.no_grad():
+            model.weight.add_(0.01)
+        second = mgr.save(step=2, model=model, optimizer=optimizer)
+        mgr.flush()
+
+        before = {t["name"]: t["hash_raw"] for t in mgr.describe(first)["tensors"]}
+        after = {t["name"]: t["hash_raw"] for t in mgr.describe(second)["tensors"]}
+
+        assert all(len(value) == 32 for value in after.values())
+        assert after["model/bias"] == before["model/bias"], (
+            "an unchanged tensor's hash moved when it was stored as a delta"
+        )
+        assert after["model/weight"] != before["model/weight"]
+
     def test_a_cast_tensor_reports_the_dtype_a_load_would_give_back(self, tmp_path):
         """`dtype` is what comes back, `stored_dtype` is what is on disk.
 

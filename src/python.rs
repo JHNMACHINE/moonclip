@@ -323,6 +323,7 @@ fn description_dict<'py>(
         e.set_item("alias_of", t.alias_of.clone())?;
         e.set_item("raw_size", t.raw_size)?;
         e.set_item("compressed_size", t.compressed_size)?;
+        e.set_item("hash_raw", &t.hash_raw)?;
         tensors.push(e);
     }
     d.set_item("tensors", tensors)?;

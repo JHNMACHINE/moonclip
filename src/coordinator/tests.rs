@@ -2051,6 +2051,49 @@ fn describe_reports_the_shapes_without_touching_storage() {
     assert_eq!(by_name["meta"].shape, vec![64]);
 }
 
+/// `hash_raw` lets a caller identify a snapshot's content without opening
+/// `manifest.json`, which on Windows can make the writer's next rename fail
+/// (GPU-93, GPU-128). So it has to be the real hash of the bytes saved, and it
+/// has to hash what a tensor holds rather than how it was stored: unchanged
+/// through a delta that stored nothing for it, different once a value moves.
+#[test]
+fn describe_reports_each_tensors_raw_hash() {
+    let dir = tempfile::tempdir().unwrap();
+    let coord = make_coordinator(dir.path());
+
+    let saved = mixed_state(1);
+    let first = coord.save(1, saved.clone(), HashMap::new()).unwrap();
+    let unchanged = coord.save(2, mixed_state(1), HashMap::new()).unwrap();
+    let changed = coord.save(3, mixed_state(2), HashMap::new()).unwrap();
+    coord.flush().unwrap();
+
+    let hashes = |snap| -> HashMap<String, String> {
+        coord
+            .describe(snap)
+            .unwrap()
+            .tensors
+            .into_iter()
+            .map(|t| (t.name, t.hash_raw))
+            .collect()
+    };
+    let (first, unchanged, changed) = (hashes(first), hashes(unchanged), hashes(changed));
+
+    for tensor in &saved {
+        assert_eq!(
+            first[&tensor.name],
+            crate::hash::hash_hex(&tensor.data),
+            "{} does not report the hash of the bytes that were saved",
+            tensor.name
+        );
+    }
+    assert_eq!(
+        unchanged, first,
+        "a step that changed nothing reported different hashes"
+    );
+    assert_ne!(changed["w"], first["w"]);
+    assert_ne!(changed["meta"], first["meta"]);
+}
+
 /// The shapes have to keep coming back once the snapshot is a delta, because
 /// that is what a run of any length actually holds — and a delta's rank entry
 /// lists every tensor, including the ones it stored nothing for.
