@@ -23,6 +23,30 @@
   Not cryptographic, and said so on the field: it detects corruption and an
   accidental swap, not a collision constructed on purpose.
 
+### Fixed
+
+- **On Windows, a reader holding `manifest.json` open no longer costs the
+  save being written (GPU-128).** Moonclip persists the manifest — and every
+  pack — by renaming a temp file over the old one, and Windows refuses a rename
+  over a file someone has open: *Access denied*, even when the reader shared
+  read, write and delete, which was measured with `CreateFileW` directly. The
+  background writer reported "Background save failed" and the checkpoint was
+  gone. Nothing a reader does differently avoids it, and the readers are not
+  all ours: an antivirus scanning a file that just changed is one, a search
+  indexer another.
+
+  The rename is now retried while Windows gives that refusal, with a pause
+  that doubles up to 100 ms, for at most five seconds. Past that the error is
+  the one the rename gave, the temp file is removed, and the old file is
+  untouched. A write that is not refused pays nothing.
+
+  The trade, stated: a real permission problem also answers *Access denied*,
+  and from here the two cannot be told apart, so such a write now fails after
+  five seconds instead of at once. Elsewhere a rename over an open file
+  succeeds and nothing changes. Covered by a test that holds the manifest open
+  while a save goes through the whole pipeline and then reopens the store to
+  find it — Windows-only, so Linux CI does not run it.
+
 ## 0.1.0 — 2026-08-31
 
 Two of the three background threads could take the whole process down with

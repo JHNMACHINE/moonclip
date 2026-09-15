@@ -47,6 +47,37 @@ fn single_rank_save_load() {
     assert_eq!(loaded["w"], vec![42u8; 8192]);
 }
 
+/// GPU-128 along the whole save path, not one `put`: on Windows a reader
+/// holding `manifest.json` open while the background writer persisted the next
+/// snapshot failed that save — "Background save failed ... Access denied" —
+/// and the checkpoint was gone. Five runs in five, from Ravex's audit trail.
+///
+/// The assertion that matters is the last one. A fresh coordinator on the same
+/// directory knows about the snapshot only through the manifest on disk, so
+/// it finds it only if the rename that was being refused went through.
+#[cfg(windows)]
+#[test]
+fn a_reader_holding_the_manifest_open_does_not_cost_a_save() {
+    let dir = tempfile::tempdir().unwrap();
+    let coord = make_coordinator(dir.path());
+    coord.save(1, sample_tensors(1), HashMap::new()).unwrap();
+    coord.flush().unwrap();
+
+    let held = std::fs::File::open(dir.path().join("manifest.json")).unwrap();
+    let reader = thread::spawn(move || {
+        thread::sleep(std::time::Duration::from_millis(300));
+        drop(held);
+    });
+
+    let snap_id = coord.save(2, sample_tensors(2), HashMap::new()).unwrap();
+    coord.flush().unwrap();
+    reader.join().unwrap();
+    drop(coord);
+
+    let reopened = make_coordinator(dir.path());
+    assert_eq!(reopened.load(snap_id).unwrap()["w"], vec![2u8; 8192]);
+}
+
 #[test]
 fn sync_save_mode_roundtrips() {
     let dir = tempfile::tempdir().unwrap();

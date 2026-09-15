@@ -165,6 +165,72 @@ fn create_dirs_recording_new(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
     Ok(created)
 }
 
+/// How long a write waits for whoever holds its target open. See
+/// [`persist_retrying`].
+///
+/// Long enough for the readers that actually do this — an antivirus scanning a
+/// file that just changed, a search indexer, a backup agent, someone typing
+/// `type manifest.json` — which hold a file for milliseconds to a second or
+/// two. Short enough that a target that stays locked is reported while the run
+/// can still do something about it. The price is paid only by a write that is
+/// being refused, never by one that is not.
+const PERSIST_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Rename `tmp` over `path`, waiting out a reader that holds `path` open.
+///
+/// On Windows a rename over an open file fails — with *access denied*, even
+/// when the reader opened it sharing read, write and delete — and nothing the
+/// reader could have done differently would have helped (GPU-128). The writer
+/// was the one losing: the save the rename was finishing failed, and with it
+/// the checkpoint. And the readers are not ours to fix: an antivirus opens
+/// every file that changes.
+///
+/// So the refusal is retried, with a pause that doubles up to 100 ms, until
+/// `budget` is spent. Past it the error is the one the rename gave, and the
+/// temp file is removed; the old file was never touched.
+///
+/// *Access denied* is also what a real permission problem looks like, and the
+/// two cannot be told apart from here. Such a write now fails after `budget`
+/// rather than at once — the same failure, reported later — which is the
+/// trade for not losing checkpoints to a scanner.
+///
+/// Elsewhere a rename over an open file succeeds, so there is nothing to wait
+/// for and every error is returned as it comes.
+fn persist_retrying(
+    mut tmp: tempfile::NamedTempFile,
+    path: &Path,
+    budget: std::time::Duration,
+) -> std::result::Result<(), tempfile::PersistError> {
+    let start = std::time::Instant::now();
+    let mut pause = std::time::Duration::from_millis(1);
+    loop {
+        match tmp.persist(path) {
+            Ok(_) => return Ok(()),
+            Err(e) if held_open_elsewhere(&e.error) && start.elapsed() + pause <= budget => {
+                tmp = e.file;
+                std::thread::sleep(pause);
+                pause = (pause * 2).min(std::time::Duration::from_millis(100));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Whether a failed rename is Windows refusing because the target is open.
+///
+/// `ERROR_ACCESS_DENIED` (5) is what `MoveFileExW` returns for a target open
+/// with sharing, and is what was measured; `ERROR_SHARING_VIOLATION` (32) is
+/// the same refusal for a target opened without it.
+#[cfg(windows)]
+fn held_open_elsewhere(e: &std::io::Error) -> bool {
+    matches!(e.raw_os_error(), Some(5) | Some(32))
+}
+
+#[cfg(not(windows))]
+fn held_open_elsewhere(_e: &std::io::Error) -> bool {
+    false
+}
+
 impl StorageBackend for LocalStorage {
     fn put(&self, rel_path: &str, data: &[u8]) -> Result<()> {
         self.put_parts(rel_path, &[data])
@@ -203,7 +269,7 @@ impl StorageBackend for LocalStorage {
                 file.sync_all()?;
             }
         }
-        tmp.persist(&path).map_err(|e| {
+        persist_retrying(tmp, &path, PERSIST_RETRY_BUDGET).map_err(|e| {
             MoonclipError::Storage(format!("Failed to persist {}: {}", path.display(), e))
         })?;
         // And the rename itself, which is a change to the directory rather
@@ -434,6 +500,59 @@ mod tests {
         // Past EOF → truncated, not an error
         assert_eq!(store.get_range("range.bin", 250, 100).unwrap(), &data[250..]);
         assert!(store.get_range("missing.bin", 0, 10).is_err());
+    }
+
+    /// Regression (GPU-128): on Windows a rename over a file someone holds
+    /// open fails, and the save that rename was finishing is lost. Every
+    /// reader of `manifest.json` could do it — an antivirus, an indexer, a
+    /// person typing `type manifest.json` — at the wrong moment.
+    ///
+    /// `File::open` in std shares read, write *and delete*, the most a reader
+    /// can concede, and the rename fails against it all the same: measured on
+    /// 2026-09-14 with `CreateFileW` directly. So a reader that lets go in
+    /// time has to be waited for, not blamed.
+    #[cfg(windows)]
+    #[test]
+    fn a_reader_holding_the_target_open_does_not_cost_the_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalStorage::new_unaligned(dir.path()).unwrap();
+        store.put("manifest.json", b"old").unwrap();
+
+        // Opened here, before the write starts, so the write cannot win a race
+        // against the thread and pass for the wrong reason.
+        let held = std::fs::File::open(dir.path().join("manifest.json")).unwrap();
+        let reader = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            drop(held);
+        });
+
+        store.put("manifest.json", b"new").unwrap();
+        reader.join().unwrap();
+        assert_eq!(store.get("manifest.json").unwrap(), b"new");
+    }
+
+    /// The wait is a wait and not a hang: a reader that never lets go still
+    /// fails the write, once the budget is spent, and the file it was
+    /// replacing is untouched.
+    #[cfg(windows)]
+    #[test]
+    fn a_reader_that_never_lets_go_fails_the_write_within_the_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("manifest.json");
+        std::fs::write(&path, b"old").unwrap();
+        let _held = std::fs::File::open(&path).unwrap();
+
+        let tmp = tempfile::NamedTempFile::new_in(dir.path()).unwrap();
+        let budget = std::time::Duration::from_millis(200);
+        let start = std::time::Instant::now();
+        let err = persist_retrying(tmp, &path, budget).unwrap_err();
+        let took = start.elapsed();
+
+        assert!(held_open_elsewhere(&err.error), "unexpected error: {err}");
+        // At least the budget less one pause, which is capped at 100 ms.
+        assert!(took >= budget / 2, "gave up after {took:?} without waiting");
+        assert!(took < budget * 5, "kept retrying for {took:?} on a {budget:?} budget");
+        assert_eq!(std::fs::read(&path).unwrap(), b"old");
     }
 
 }
