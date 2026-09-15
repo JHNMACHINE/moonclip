@@ -39,33 +39,47 @@ jobs:
           git clone ${{ forgejo.server_url }}/${{ forgejo.repository }}.git .
           git checkout ${{ forgejo.sha }}
 
-      # MinIO runs as a plain background process rather than a `services:`
-      # container. A service block cannot pass the `server /data` argument the
-      # official image needs, and working around that means depending on a
-      # third-party image or on how a particular runner implements services.
-      # The binary is self-contained, so this needs neither.
+      # The S3 server runs as a plain background process rather than a
+      # `services:` container: a service block cannot pass the arguments the
+      # server needs, and working around that means depending on how a
+      # particular runner implements services. The binary is self-contained.
       #
-      # The bucket is made by creating the directory before startup: MinIO
-      # serves each top-level directory under its data root as a bucket, which
-      # avoids pulling in `mc` just to create one. Same trick as
-      # tests/minio_up.sh.
-      - name: Start MinIO
+      # **versitygw, not MinIO, since 2026-09-15.** MinIO's open-source server
+      # is archived and dl.min.io answers `410 Gone` for every binary, archived
+      # releases included. This step used to save that notice as
+      # /usr/local/bin/minio and try to execute it. versitygw is maintained,
+      # ships a static binary, and every test in tests/s3_minio.rs passed
+      # against it in this same image: 19 passed, 1 ignored, as with MinIO.
+      # Pinned, and fetched with `curl -f`, so the next download that turns
+      # into a web page stops here instead of being run.
+      #
+      # The bucket is made by creating the directory before startup: the posix
+      # backend serves each top-level directory under its root as a bucket, the
+      # same trick MinIO allowed. The credentials keep MinIO's names because the
+      # tests read them from the environment and nothing else cares.
+      - name: Start the S3 server
         run: |
-          curl -sSLo /usr/local/bin/minio \
-            https://dl.min.io/server/minio/release/linux-amd64/minio
-          chmod +x /usr/local/bin/minio
-          mkdir -p /tmp/minio-data/moonclip-test
-          MINIO_ROOT_USER=minioadmin MINIO_ROOT_PASSWORD=minioadmin \
-            minio server /tmp/minio-data --address :9000 >/tmp/minio.log 2>&1 &
+          set -eu
+          VGW=1.8.0
+          curl -sSfL -o /tmp/vgw.tgz \
+            "https://github.com/versity/versitygw/releases/download/v${VGW}/versitygw_v${VGW}_Linux_x86_64.tar.gz"
+          tar -xzf /tmp/vgw.tgz -C /tmp
+          install -m 0755 "/tmp/versitygw_v${VGW}_Linux_x86_64/versitygw" /usr/local/bin/versitygw
+          mkdir -p /tmp/s3-data/moonclip-test
+          versitygw --access minioadmin --secret minioadmin --port :9000 \
+            posix /tmp/s3-data >/tmp/s3.log 2>&1 &
           for _ in $(seq 1 30); do
-            if curl -sf http://127.0.0.1:9000/minio/health/live >/dev/null; then
-              echo "MinIO is up"
+            # Unauthenticated, the root answers 403: any status at all means
+            # the server is listening.
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:9000/ || true)
+            if [ "$code" != "000" ]; then
+              echo "versitygw is up (HTTP $code)"
               exit 0
             fi
             sleep 1
           done
-          echo "MinIO did not become healthy:" >&2
-          cat /tmp/minio.log >&2
+          echo "versitygw did not come up:" >&2
+          cat /tmp/s3.log >&2
           exit 1
 
       # Without these variables tests/s3_minio.rs skips itself, so a failure
