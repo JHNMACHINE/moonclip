@@ -1012,6 +1012,92 @@ fn the_total_cap_still_prunes_a_history_of_fulls() {
     assert_eq!(steps, vec![4, 5], "the cap should keep the newest two");
 }
 
+/// `keep_last: 1` must keep the *last* one.
+///
+/// Every snapshot after the first is a delta against it, so the store is a
+/// full and a delta, and "drop the oldest delta" dropped the only one there
+/// was - the newest. What survived was the full, the run's *first*
+/// checkpoint, and a resume went back to it without a word. Seen from ravex
+/// on 2026-09-21 as an audit entry with a null fingerprint (GPU-136).
+#[test]
+fn a_cap_of_one_keeps_the_newest_step() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(dir.path()).unwrap());
+    let coord = Coordinator::new(
+        Arc::clone(&storage),
+        CoordinatorConfig {
+            compression: CompressionAlgo::Zstd { level: 1 },
+            retention: RetentionPolicy {
+                max_full_snapshots: 5,
+                max_deltas_per_full: 10,
+                full_snapshot_every_steps: 5000,
+                max_total_snapshots: Some(1),
+            },
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    for step in 1..4u64 {
+        coord.save(step, evolving_state(step), HashMap::new()).unwrap();
+    }
+    coord.flush().unwrap();
+
+    let snaps = coord.list_snapshots();
+    let steps: Vec<u64> = snaps.iter().map(|s| s.step).collect();
+    assert_eq!(steps, vec![3], "a cap of one keeps the newest step");
+    let loaded = coord.load(snaps[0].id).unwrap();
+    assert_eq!(loaded.get("w").unwrap()[0], 3, "the survivor holds step 3's bytes");
+}
+
+/// A delta newer than a full it does not depend on is not the oldest thing
+/// in the store, whatever its kind.
+///
+/// A second full arrives on its own schedule (`full_snapshot_every_steps`),
+/// and from then on the store is `[old full, new full, delta]`. Preferring
+/// deltas regardless of age removed the delta - the newest step - and did it
+/// again on every save after, until the next scheduled full: a `keep_last: 2`
+/// run past that point kept two checkpoints that stopped moving.
+#[test]
+fn a_cap_does_not_prefer_a_new_delta_over_an_old_full() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(dir.path()).unwrap());
+    let coord = Coordinator::new(
+        Arc::clone(&storage),
+        CoordinatorConfig {
+            compression: CompressionAlgo::Zstd { level: 1 },
+            retention: RetentionPolicy {
+                max_full_snapshots: 5,
+                max_deltas_per_full: 10,
+                full_snapshot_every_steps: 3, // fulls at 1 and 4
+                max_total_snapshots: Some(2),
+            },
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    for step in 1..7u64 {
+        coord.save(step, evolving_state(step), HashMap::new()).unwrap();
+    }
+    coord.flush().unwrap();
+
+    let snaps = coord.list_snapshots();
+    assert_eq!(
+        snaps.last().unwrap().step,
+        6,
+        "the newest step was pruned: {:?}",
+        snaps.iter().map(|s| s.step).collect::<Vec<_>>()
+    );
+    assert_eq!(snaps.len(), 2, "the cap is two, so two survive");
+    for info in &snaps {
+        let loaded = coord.load(info.id).unwrap_or_else(|e| {
+            panic!("step {} survived the cap but cannot be read: {e}", info.step)
+        });
+        assert_eq!(loaded.get("w").unwrap()[0], info.step as u8);
+    }
+}
+
 #[test]
 fn every_snapshot_left_after_retention_still_loads() {
     let dir = tempfile::tempdir().unwrap();

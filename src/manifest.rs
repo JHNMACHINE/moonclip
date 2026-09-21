@@ -251,6 +251,13 @@ impl Manifest {
             return true;
         }
 
+        // A cap of one keeps one snapshot, so a delta would be written
+        // against a base that retention is about to remove - and the
+        // delta cannot outlive it. Only a full can be the one that stays.
+        if self.retention.effective_total_cap() <= 1 {
+            return true;
+        }
+
         if let Some(last_full) = self.last_full_snapshot() {
             if step.saturating_sub(last_full.step) >= self.retention.full_snapshot_every_steps {
                 return true;

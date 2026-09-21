@@ -1671,62 +1671,57 @@ impl Core {
 
         // ── Pass 2: Cap total snapshot count ─────────────────────────
         //
-        // Oldest *delta* first, one at a time. Removing whole groups here is
-        // what the cap used to do, and it is catastrophic in the configuration
-        // that matters: every delta is computed against the last full, so an
-        // ordinary run is a single group thousands of steps long. Dropping
-        // "the oldest group" to get under the cap then deletes the base and
-        // every delta hanging off it — the entire history, not its oldest
-        // slice. Measured: three snapshots with `max_total_snapshots: 2` left
-        // **zero**, and `keep_last` is exactly this knob.
+        // Oldest *removable* snapshot first, one at a time, where removable
+        // means nothing is left pointing at it: a delta is always a leaf, a
+        // full only once its deltas are gone.
         //
-        // A delta is a leaf: nothing is stored against it, so dropping the
-        // oldest costs one restore point and nothing else. The full stays for
-        // as long as a delta still needs it as a base — which means the oldest
-        // surviving step may be a full older than the cap would suggest, and
+        // Removing whole groups here is what the cap used to do, and it is
+        // catastrophic in the configuration that matters: every delta is
+        // computed against the last full, so an ordinary run is a single group
+        // thousands of steps long. Dropping "the oldest group" to get under the
+        // cap then deletes the base and every delta hanging off it - the entire
+        // history, not its oldest slice. Measured: three snapshots with
+        // `max_total_snapshots: 2` left **zero**, and `keep_last` is exactly
+        // this knob.
+        //
+        // What replaced it, "oldest delta first", was wrong the other way: it
+        // looked at the kind before the age. With a cap of one the only delta
+        // is the newest step, and with a second full in the store
+        // (`[old full, new full, delta]`) the delta is still the newest - so
+        // it removed the one checkpoint a resume would take, and did it again
+        // on every save after. Seen on 2026-09-21: `keep_last: 1` left the
+        // run's *first* checkpoint (GPU-136).
+        //
+        // So age decides, dependencies constrain, and the newest step is never
+        // a candidate: if the cap cannot be met without it, the store stays
+        // over the cap rather than losing it. The oldest surviving step may be
+        // a full older than the cap suggests, because a delta still needs it;
         // that is the honest answer rather than an unreadable checkpoint.
         loop {
-            let total = manifest.snapshots.iter().filter(|s| s.finalized).count();
-            if total <= max_total {
+            let finalized: Vec<&Snapshot> =
+                manifest.snapshots.iter().filter(|s| s.finalized).collect();
+            if finalized.len() <= max_total {
                 break;
             }
+            let Some(newest) = finalized.last().map(|s| s.id) else {
+                break;
+            };
 
-            let oldest_delta = manifest
-                .snapshots
+            let candidate = finalized
                 .iter()
                 .find(|s| {
-                    s.base_snapshot_id.is_some()
-                        && s.finalized
+                    s.id != newest
                         && !rollback_ids.contains(&s.id)
+                        && (s.base_snapshot_id.is_some()
+                            || !manifest
+                                .snapshots
+                                .iter()
+                                .any(|d| d.base_snapshot_id == Some(s.id)))
                 })
                 .map(|s| s.id);
 
-            if let Some(delta_id) = oldest_delta {
-                evicted.extend(self.remove_snapshots(manifest, &[delta_id])?);
-                continue;
-            }
-
-            // Nothing but fulls left, so a group is now a single snapshot and
-            // removing one loses only itself. Never the last one though: a cap
-            // of one means one checkpoint, not none.
-            let removable_fulls: Vec<Uuid> = manifest
-                .snapshots
-                .iter()
-                .filter(|s| {
-                    s.base_snapshot_id.is_none()
-                        && s.finalized
-                        && !rollback_ids.contains(&s.id)
-                })
-                .map(|s| s.id)
-                .collect();
-
-            if max_total >= 1 && removable_fulls.len() <= 1 {
-                break;
-            }
-            match removable_fulls.first() {
-                Some(&oldest_id) => {
-                    evicted.extend(self.remove_snapshot_group(manifest, oldest_id)?)
-                }
+            match candidate {
+                Some(id) => evicted.extend(self.remove_snapshots(manifest, &[id])?),
                 None => break,
             }
         }

@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **A tight snapshot cap no longer removes the newest snapshot (GPU-141).**
+  Retention's total cap removed the *oldest delta* first, whatever its age.
+  With a cap of one the store is a full and one delta against it, and that
+  delta is the newest step: it went, and the run's **first** checkpoint was
+  what survived, so a resume went back to it silently. With a larger cap the
+  same happened after every scheduled full (`[old full, new full, delta]`):
+  each new delta was removed as it landed, until the next full. No error in
+  either case.
+
+  The cap now removes the oldest snapshot that can go without orphaning a
+  delta, never the newest and never a rollback-protected one. A cap of one
+  writes every snapshot full, since a delta cannot outlive the base retention
+  is about to remove. From Ravex this is `keep_last: 1`, and `keep_last: 2` or
+  more on runs past `full_snapshot_every_steps`.
+
 ## 0.1.1 — 2026-09-20
 
 ### Added
