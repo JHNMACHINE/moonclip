@@ -1236,6 +1236,134 @@ fn a_rollback_interval_of_zero_does_not_bring_down_the_save() {
     assert!(!coord.list_snapshots().is_empty());
 }
 
+/// A pinned step outlives a cap that would otherwise take it (GPU-154).
+///
+/// `keep_last: 1` is the sharpest version of the question: everything except
+/// the newest step is a candidate, and the pin is the only reason one of them
+/// is still there.
+#[test]
+fn a_pinned_snapshot_survives_the_tightest_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(dir.path()).unwrap());
+    let config = CoordinatorConfig {
+        world_size: 1,
+        rank: 0,
+        compression: CompressionAlgo::Zstd { level: 1 },
+        retention: RetentionPolicy {
+            max_full_snapshots: 2,
+            max_deltas_per_full: 2,
+            full_snapshot_every_steps: 0,
+            max_total_snapshots: Some(1),
+        },
+        lineage: LineageConfig {
+            rollback_interval_steps: 0,
+            max_rollback_snapshots: 0,
+        },
+        delta_max_ratio: 0.95,
+        ..Default::default()
+    };
+    let coord = Coordinator::new(storage, config).unwrap();
+
+    coord.save(1, evolving_state(1), HashMap::new()).unwrap();
+    coord.flush().unwrap();
+    assert!(coord.pin(1).unwrap(), "step 1 is in the store");
+    assert_eq!(coord.pinned_steps(), vec![1]);
+
+    for step in 2..6u64 {
+        coord.save(step, evolving_state(step), HashMap::new()).unwrap();
+    }
+    coord.flush().unwrap();
+
+    let steps: Vec<u64> = coord.list_snapshots().iter().map(|s| s.step).collect();
+    assert!(steps.contains(&1), "the pinned step went: {steps:?}");
+    assert!(steps.contains(&5), "the newest step went: {steps:?}");
+
+    // Listed is not enough: a pinned delta whose base was pruned is bytes
+    // nothing can read, which is the failure this is guarding against.
+    let pinned = coord
+        .list_snapshots()
+        .into_iter()
+        .find(|s| s.step == 1)
+        .unwrap();
+    let loaded = coord.load(pinned.id).unwrap();
+    assert_eq!(loaded.get("w").unwrap()[0], 1u8);
+}
+
+/// Unpinning gives it back to retention, and the next save collects it.
+#[test]
+fn unpinning_lets_retention_have_it_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(dir.path()).unwrap());
+    let config = CoordinatorConfig {
+        world_size: 1,
+        rank: 0,
+        compression: CompressionAlgo::Zstd { level: 1 },
+        retention: RetentionPolicy {
+            max_full_snapshots: 2,
+            max_deltas_per_full: 2,
+            full_snapshot_every_steps: 0,
+            max_total_snapshots: Some(1),
+        },
+        lineage: LineageConfig {
+            rollback_interval_steps: 0,
+            max_rollback_snapshots: 0,
+        },
+        delta_max_ratio: 0.95,
+        ..Default::default()
+    };
+    let coord = Coordinator::new(storage, config).unwrap();
+
+    coord.save(1, evolving_state(1), HashMap::new()).unwrap();
+    coord.flush().unwrap();
+    coord.pin(1).unwrap();
+    coord.save(2, evolving_state(2), HashMap::new()).unwrap();
+    coord.flush().unwrap();
+    assert!(coord.list_snapshots().iter().any(|s| s.step == 1));
+
+    assert!(coord.unpin(1).unwrap());
+    assert!(coord.pinned_steps().is_empty());
+    coord.save(3, evolving_state(3), HashMap::new()).unwrap();
+    coord.flush().unwrap();
+
+    let steps: Vec<u64> = coord.list_snapshots().iter().map(|s| s.step).collect();
+    assert!(!steps.contains(&1), "unpinned and still kept: {steps:?}");
+}
+
+/// Pinning a step the store does not hold is an answer, not an error: the
+/// caller wants to say so, not to stop.
+#[test]
+fn pinning_a_step_that_is_not_there_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(dir.path()).unwrap());
+    let coord = Coordinator::new(storage, CoordinatorConfig::default()).unwrap();
+    assert!(!coord.pin(4242).unwrap());
+    assert!(coord.pinned_steps().is_empty());
+}
+
+/// A pin is for a fork that outlives the process that made it, so it has to
+/// be in the manifest and not in memory.
+#[test]
+fn a_pin_survives_reopening_the_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(dir.path()).unwrap());
+    // Built twice rather than cloned: `CoordinatorConfig` is not `Clone`.
+    let config = || CoordinatorConfig {
+        world_size: 1,
+        rank: 0,
+        compression: CompressionAlgo::Zstd { level: 1 },
+        delta_max_ratio: 0.95,
+        ..Default::default()
+    };
+    {
+        let coord = Coordinator::new(Arc::clone(&storage), config()).unwrap();
+        coord.save(7, evolving_state(7), HashMap::new()).unwrap();
+        coord.flush().unwrap();
+        coord.pin(7).unwrap();
+    }
+    let reopened = Coordinator::new(storage, config()).unwrap();
+    assert_eq!(reopened.pinned_steps(), vec![7]);
+}
+
 /// Snapshots on the rollback interval are meant to outlive the ordinary
 /// retention cap — that is the whole point of keeping them.
 #[test]

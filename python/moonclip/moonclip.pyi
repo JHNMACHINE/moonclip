@@ -352,6 +352,26 @@ class MoonclipManager:
         """
         ...
 
+    def pin(self, step: int) -> bool:
+        """
+        Keep the snapshot at ``step`` whatever retention says, until it is
+        unpinned. For the checkpoint a fork starts from, or one somebody asked
+        to come back to: retention counts, it does not ask why a snapshot
+        matters. Returns whether that step is in this store.
+        """
+        ...
+
+    def unpin(self, step: int) -> bool:
+        """
+        Let retention have the snapshot at ``step`` back. Returns whether that
+        step is in this store.
+        """
+        ...
+
+    def pinned_steps(self) -> list[int]:
+        """Every pinned step in this store, oldest first."""
+        ...
+
     def restore_from_remote(self) -> bool:
         """
         Fill an empty store from the remote. Returns whether anything came.

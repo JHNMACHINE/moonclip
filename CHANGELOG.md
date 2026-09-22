@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **`pin(step)` / `unpin(step)`: keep a snapshot whatever retention says
+  (GPU-154).** Retention counts; it does not ask why a snapshot matters, and
+  the one that matters most is exactly the one a long run's cap is about to
+  reach - the checkpoint a fork starts from, or the step somebody asked to
+  come back to. Rollback protection does not cover this: it is periodic, and a
+  fork's step lands where it lands. A pin is recorded in the manifest, so it
+  outlives the process that made it, and it covers the base a pinned delta is
+  computed against, because a delta without its base is bytes nothing can
+  read. `pinned_steps()` lists them. Pinning a step the store does not hold
+  returns `False` rather than raising.
+
 ## 0.1.2 — 2026-09-22
 
 ### Added

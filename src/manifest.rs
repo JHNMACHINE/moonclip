@@ -137,6 +137,17 @@ pub struct Snapshot {
     pub compression: CompressionAlgo,
     /// Whether all ranks have finished saving (for multi-rank coordination).
     pub finalized: bool,
+    /// Kept whatever retention says, until somebody unpins it (GPU-154).
+    ///
+    /// Rollback protection is periodic - every Nth step deserves it - and that
+    /// is a different question from "this one". A fork starts from the step
+    /// somebody chose, which almost never lands on the interval, and the base
+    /// disappearing under it is a run with no way back.
+    ///
+    /// `serde(default)` because stores written before this field exist and
+    /// must keep opening.
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 // ─── Lineage ────────────────────────────────────────────────────────
@@ -283,6 +294,26 @@ impl Manifest {
     /// prunes in its own order. Which is what the two knobs mean together:
     /// `rollback_interval_steps` says which snapshots deserve protection,
     /// `max_rollback_snapshots` says how far back it reaches.
+    /// Every snapshot retention must leave alone: pinned, rollback-protected,
+    /// and the base a pinned delta is computed against.
+    ///
+    /// The base is the part worth spelling out. Pinning step 1200 protects the
+    /// delta that *is* step 1200, and a delta without its base is bytes
+    /// nothing can read - so the pin has to reach one step further back than
+    /// the thing that was pinned.
+    pub fn protected_snapshot_ids(&self) -> Vec<Uuid> {
+        let mut ids = self.rollback_snapshot_ids();
+        for snapshot in self.snapshots.iter().filter(|s| s.pinned) {
+            ids.push(snapshot.id);
+            if let Some(base) = snapshot.base_snapshot_id {
+                ids.push(base);
+            }
+        }
+        ids.sort();
+        ids.dedup();
+        ids
+    }
+
     pub fn rollback_snapshot_ids(&self) -> Vec<Uuid> {
         // Zero disables rollback protection, the same meaning zero carries
         // for `merge_stride`, `compression_level` and `sync_every_n_saves`.
@@ -347,6 +378,7 @@ mod tests {
 
     fn make_full_snapshot(step: u64) -> Snapshot {
         Snapshot {
+            pinned: false,
             id: Uuid::new_v4(), step, created_at: Utc::now(),
             ranks: HashMap::new(), base_snapshot_id: None,
             metadata: HashMap::new(), compression: CompressionAlgo::default(),
@@ -356,6 +388,7 @@ mod tests {
 
     fn make_delta_snapshot(step: u64, base_id: Uuid) -> Snapshot {
         Snapshot {
+            pinned: false,
             id: Uuid::new_v4(), step, created_at: Utc::now(),
             ranks: HashMap::new(), base_snapshot_id: Some(base_id),
             metadata: HashMap::new(), compression: CompressionAlgo::default(),

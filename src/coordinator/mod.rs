@@ -432,6 +432,33 @@ impl Coordinator {
         self.core.sync_prefix(prefix)
     }
 
+    /// Keep the snapshot at `step` whatever retention says, until it is unpinned.
+    ///
+    /// For the checkpoint a fork starts from, and for the one somebody asked to
+    /// come back to: retention counts, it does not ask why a snapshot matters,
+    /// and the one that matters most is exactly the one a long run's cap is
+    /// about to reach. Rollback protection does not cover this - it is
+    /// periodic, and a fork's step lands where it lands.
+    ///
+    /// Returns whether that step is in this store. Pinning a step that is not
+    /// there is `false`, not an error: the caller usually wants to know in
+    /// order to say so, not to stop.
+    ///
+    /// Not behind `wait_idle`: it takes the manifest lock like any save does.
+    pub fn pin(&self, step: u64) -> Result<bool> {
+        self.core.set_pinned(step, true)
+    }
+
+    /// Let retention have the snapshot at `step` back.
+    pub fn unpin(&self, step: u64) -> Result<bool> {
+        self.core.set_pinned(step, false)
+    }
+
+    /// Every pinned step in this store, oldest first.
+    pub fn pinned_steps(&self) -> Vec<u64> {
+        self.core.pinned_steps()
+    }
+
     /// Pull this store back from the remote, for a machine that has none.
     ///
     /// Returns whether anything was restored. The caller decides when: only it
@@ -589,6 +616,7 @@ impl Core {
             self.save_rank_tensors(snap_id, &snap_dir, &base_snap, tensors, &context)?;
 
         let snapshot = Snapshot {
+            pinned: false,
             id: snap_id,
             step,
             created_at,
@@ -674,6 +702,7 @@ impl Core {
         drop(manifest);
 
         let snapshot = Snapshot {
+            pinned: false,
             id: snap_id,
             step,
             created_at: Utc::now(),
@@ -1166,6 +1195,50 @@ impl Core {
         Ok(out)
     }
 
+    /// Keep - or stop keeping - the snapshot at `step`, whatever retention says.
+    ///
+    /// Returns whether a snapshot was found to change. A step can appear twice
+    /// if a run was restarted and rewrote it; the newest write is the one a
+    /// resume takes, so it is the one pinned.
+    fn set_pinned(&self, step: u64, pinned: bool) -> Result<bool> {
+        let mut manifest = self.lock_manifest();
+        let target = manifest
+            .snapshots
+            .iter()
+            .rev()
+            .find(|s| s.step == step && s.finalized)
+            .map(|s| s.id);
+        let Some(id) = target else {
+            return Ok(false);
+        };
+        let mut changed = false;
+        for snapshot in manifest.snapshots.iter_mut() {
+            if snapshot.id == id && snapshot.pinned != pinned {
+                snapshot.pinned = pinned;
+                changed = true;
+            }
+        }
+        if changed {
+            // Written now, not at the next save: a pin exists to survive this
+            // process, and a fork can be created by something that then exits.
+            self.persist_manifest(&manifest)?;
+        }
+        Ok(true)
+    }
+
+    fn pinned_steps(&self) -> Vec<u64> {
+        let manifest = self.lock_manifest();
+        let mut steps: Vec<u64> = manifest
+            .snapshots
+            .iter()
+            .filter(|s| s.pinned && s.finalized)
+            .map(|s| s.step)
+            .collect();
+        steps.sort_unstable();
+        steps.dedup();
+        steps
+    }
+
     fn list_snapshots(&self) -> Vec<SnapshotInfo> {
         let manifest = self.lock_manifest();
         manifest
@@ -1651,7 +1724,9 @@ impl Core {
     fn apply_retention(&self, manifest: &mut Manifest) -> Result<Vec<Snapshot>> {
         let max_full = manifest.retention.max_full_snapshots;
         let max_total = manifest.retention.effective_total_cap();
-        let rollback_ids = manifest.rollback_snapshot_ids();
+        // Pinned snapshots join the rollback-protected ones: same exemption,
+        // different question - see `Manifest::protected_snapshot_ids`.
+        let rollback_ids = manifest.protected_snapshot_ids();
         let mut evicted: Vec<Snapshot> = Vec::new();
 
         // ── Pass 1: Cap full snapshot count ──────────────────────────

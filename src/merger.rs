@@ -864,6 +864,7 @@ pub(crate) fn do_full_merge_within(
     }
 
     let merged_snap = Snapshot {
+        pinned: false,
         id: merged_id,
         step: merged_step,
         created_at: merged_created_at,
@@ -1156,6 +1157,7 @@ mod tests {
         storage.put_parts(&pack, &refs).unwrap();
 
         Snapshot {
+            pinned: false,
             id,
             step,
             created_at: chrono::Utc::now(),

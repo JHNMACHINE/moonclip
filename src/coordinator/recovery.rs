@@ -49,6 +49,9 @@ fn rebuild_from_packs(
     }
 
     Some(Snapshot {
+        // A snapshot recovered from its sidecars was pinned or not; the pin
+        // lives in the manifest that was lost, so this starts unpinned.
+        pinned: false,
         id: first.snapshot_id,
         step: first.step,
         created_at: first.created_at,

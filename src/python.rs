@@ -664,6 +664,18 @@ impl MoonclipManager {
     fn sync_prefix(&self, prefix: &str) -> PyResult<()> {
         Ok(self.inner.sync_prefix(prefix)?)
     }
+
+    fn pin(&self, step: u64) -> PyResult<bool> {
+        Ok(self.inner.pin(step)?)
+    }
+
+    fn unpin(&self, step: u64) -> PyResult<bool> {
+        Ok(self.inner.unpin(step)?)
+    }
+
+    fn pinned_steps(&self) -> PyResult<Vec<u64>> {
+        Ok(self.inner.pinned_steps())
+    }
 }
 
 #[pymodule]
