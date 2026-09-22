@@ -660,6 +660,10 @@ impl MoonclipManager {
         py.detach(|| self.inner.sync_now())?;
         Ok(())
     }
+
+    fn sync_prefix(&self, prefix: &str) -> PyResult<()> {
+        Ok(self.inner.sync_prefix(prefix)?)
+    }
 }
 
 #[pymodule]

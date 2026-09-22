@@ -247,6 +247,41 @@ impl RemoteSyncer {
         }
     }
 
+    /// Queue the upload of everything under `prefix`, and return at once.
+    ///
+    /// For files a caller writes into the store directory beside the
+    /// checkpoints, which the periodic sync never looks at: it walks
+    /// `snapshots/` and the manifest and nothing else. Ravex writes its metrics
+    /// there, and a dashboard reading the bucket needs them while the run is
+    /// still going, not when it ends.
+    ///
+    /// Pass the narrowest path that covers what changed. A file already on the
+    /// remote is skipped by name after an `exists` round trip, so a prefix over
+    /// a directory that keeps growing pays one request per file it holds,
+    /// every call. A single file's path pays one. The same rule makes this
+    /// right only for files that are never rewritten after they appear.
+    ///
+    /// Runs on the syncer's own thread, in order with the periodic syncs and
+    /// `sync_now`. A failure is logged there, as the periodic one's is. An
+    /// `Err` here means only that the syncer is gone.
+    pub fn sync_prefix(&self, prefix: &str) -> Result<()> {
+        let Some(ref tx) = self.sender else {
+            return Ok(());
+        };
+        if tx
+            .lock()
+            .unwrap()
+            .send(SyncCommand::SyncPrefix(prefix.to_string()))
+            .is_err()
+        {
+            self.dead.store(true, std::sync::atomic::Ordering::Relaxed);
+            return Err(MoonclipError::Storage(
+                "Remote sync thread is gone; nothing was queued".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Force an immediate sync of everything, and wait for it.
     ///
     /// This blocks and returns the outcome, unlike the periodic sync that
@@ -654,6 +689,41 @@ mod tests {
         // no sleep, and no flake.
         assert_eq!(dst.get("snapshots/a/t1.bin").unwrap(), b"data");
         syncer.shutdown();
+    }
+
+    /// One file, named by a path with directories in it, goes up alone: the
+    /// file beside it, which the caller did not name, stays where it is.
+    #[test]
+    fn a_prefix_that_names_one_file_uploads_that_file() {
+        let (_s, _d, src, dst) = two_stores();
+        src.put("metrics/seg/000001.jsonl", b"one").unwrap();
+        src.put("metrics/seg/000002.jsonl", b"two").unwrap();
+
+        let mut syncer = RemoteSyncer::new(
+            Arc::clone(&src),
+            Arc::clone(&dst),
+            RemoteSyncConfig::default(),
+            nothing_deleted(),
+        );
+        syncer.sync_prefix("metrics/seg/000001.jsonl").unwrap();
+        // Shutdown joins the thread, which drains the channel in order first.
+        syncer.shutdown();
+
+        assert_eq!(dst.get("metrics/seg/000001.jsonl").unwrap(), b"one");
+        assert!(!dst.exists("metrics/seg/000002.jsonl").unwrap());
+    }
+
+    #[test]
+    fn a_prefix_after_shutdown_is_a_no_op() {
+        let (_s, _d, src, dst) = two_stores();
+        let mut syncer = RemoteSyncer::new(
+            src,
+            dst,
+            RemoteSyncConfig::default(),
+            nothing_deleted(),
+        );
+        syncer.shutdown();
+        syncer.sync_prefix("metrics").unwrap();
     }
 
     /// Retention bounds the local disk. Before 0.0.6 it bounded nothing on the

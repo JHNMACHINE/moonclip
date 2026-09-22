@@ -340,6 +340,18 @@ class MoonclipManager:
         """
         ...
 
+    def sync_prefix(self, prefix: str) -> None:
+        """
+        Queue the upload of everything under ``prefix`` to the remote, and
+        return without waiting. For files written into the store directory
+        beside the checkpoints, which the periodic sync does not look at.
+
+        A file already on the remote is skipped by name, so this is right only
+        for files that are never rewritten, and cheapest when ``prefix`` names
+        one file. A no-op without a remote.
+        """
+        ...
+
     def restore_from_remote(self) -> bool:
         """
         Fill an empty store from the remote. Returns whether anything came.

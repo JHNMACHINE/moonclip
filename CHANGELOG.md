@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Added
+
+- **`MoonclipManager.sync_prefix(prefix)`: upload files the caller wrote into
+  the store directory (GPU-152).** The periodic sync walks `snapshots/` and the
+  manifest and nothing else, so files placed beside the checkpoints reached the
+  remote only at a forced `sync_now()`, usually the end of the run. Ravex writes
+  its metrics there, and a dashboard reading the bucket needs them while the
+  run goes on. The upload is queued on the existing sync thread and the call
+  returns at once. A file already on the remote is skipped by name, so this is
+  for files that are never rewritten, and a path naming one file costs one
+  request.
+
 ### Fixed
 
 - **A tight snapshot cap no longer removes the newest snapshot (GPU-141).**

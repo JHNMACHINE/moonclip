@@ -422,6 +422,16 @@ impl Coordinator {
         self.core.sync_now()
     }
 
+    /// Queue the upload of what is under `prefix`, without waiting.
+    ///
+    /// For files written into the store beside the checkpoints; see
+    /// [`RemoteSyncer::sync_prefix`] for which paths make this cheap. Not
+    /// behind `wait_idle`: it does not touch a snapshot, so there is nothing a
+    /// save in progress could change under it. A no-op without a remote.
+    pub fn sync_prefix(&self, prefix: &str) -> Result<()> {
+        self.core.sync_prefix(prefix)
+    }
+
     /// Pull this store back from the remote, for a machine that has none.
     ///
     /// Returns whether anything was restored. The caller decides when: only it
@@ -1201,6 +1211,13 @@ impl Core {
     fn sync_now(&self) -> Result<()> {
         match self.syncer {
             Some(ref syncer) => syncer.sync_now(),
+            None => Ok(()),
+        }
+    }
+
+    fn sync_prefix(&self, prefix: &str) -> Result<()> {
+        match self.syncer {
+            Some(ref syncer) => syncer.sync_prefix(prefix),
             None => Ok(()),
         }
     }
