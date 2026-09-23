@@ -38,7 +38,7 @@ jobs:
     runs-on: ubuntu-latest
     container:
       # Matches ci.yml and checks.yml. Bump all three together.
-      image: rust:1.97.1-bookworm
+      image: rust:1.98.1-bookworm
     steps:
       - name: Install git
         run: |

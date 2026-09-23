@@ -54,7 +54,7 @@ echo
 echo "=== building Moonclip (needs Rust; this is the slow part) ==="
 if ! command -v cargo >/dev/null 2>&1; then
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-        | sh -s -- -y --default-toolchain 1.90.0 --profile minimal
+        | sh -s -- -y --default-toolchain 1.98.1 --profile minimal
     . "$HOME/.cargo/env"
 fi
 pip install --quiet maturin

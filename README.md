@@ -243,7 +243,7 @@ cargo clippy --all-targets -- -D warnings       # what CI gates on
 seconds. The full matrix (MinIO, the PyTorch adapter, CPython 3.11–3.14) waits
 for `main`, in `ci.yml`.
 
-Both pin `rust:1.97.1-bookworm`, and `rust-toolchain.toml` pins the same
+Both pin `rust:1.98.1-bookworm`, and `rust-toolchain.toml` pins the same
 version for a local build, so a red `cargo clippy` here means the gate is red
 too. That agreement is the point of the file: the two used to differ — CI on
 1.90, development on 1.97 — and the crate spent a while green in CI and red

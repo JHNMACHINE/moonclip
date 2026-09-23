@@ -7,13 +7,13 @@
 # so a red `cargo clippy` did not mean "you broke something" and a green CI did
 # not mean "the next image bump will pass".
 #
-# Keep this in step with the `image:` in `.forgejo/workflows/*.yml`. Those pin
+# Keep this in step with the `image:` in `.github/workflows/*.yml`. Those pin
 # the same version and are what actually runs the gate; this makes a
 # contributor's rustup agree with it rather than find out later.
 #
-# The patch number is not decoration. Inside `rust:1.97.1-bookworm` the
-# installed toolchain is named `1.97.1-x86_64-unknown-linux-gnu`, so a
-# `channel = "1.97"` here does not match it: rustup syncs the 1.97 channel and
+# The patch number is not decoration. Inside `rust:1.98.1-bookworm` the
+# installed toolchain is named `1.98.1-x86_64-unknown-linux-gnu`, so a
+# `channel = "1.98"` here does not match it: rustup syncs the 1.98 channel and
 # downloads a second copy of the same compiler, on every job of every workflow.
 # Measured in that container: 31s and four components against 1.4s. Both the
 # image tag and this line carry the patch version so they cannot drift apart.
@@ -22,7 +22,7 @@
 # a claim about what a *consumer* of the published crate needs — a
 # rust-toolchain.toml only applies inside this directory, so it does not raise
 # the floor for anyone depending on moonclip. It does mean nothing verifies the
-# 1.83 claim any more: CI compiles on 1.97 and would not notice code that needs
+# 1.83 claim any more: CI compiles on 1.98 and would not notice code that needs
 # it. Bumping `rust-version` or adding an MSRV job are both reasonable answers;
 # neither has been done.
 #
@@ -30,5 +30,5 @@
 # toolchain. That is the trade: a required download against two versions
 # disagreeing without saying so.
 [toolchain]
-channel = "1.97.1"
+channel = "1.98.1"
 components = ["clippy"]

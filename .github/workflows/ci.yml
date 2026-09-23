@@ -26,7 +26,7 @@ jobs:
   rust:
     runs-on: ubuntu-latest
     container:
-      image: rust:1.97.1-bookworm
+      image: rust:1.98.1-bookworm
     steps:
       - name: Install deps
         run: |
@@ -113,7 +113,7 @@ jobs:
           apt-get update -qq
           apt-get install -y -qq git build-essential
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --default-toolchain 1.90.0 --profile minimal
+            | sh -s -- -y --default-toolchain 1.98.1 --profile minimal
 
       # Not shallow, and the checkout is allowed to fail the job. `--depth 1`
       # fetches only the default branch's tip, so a pull request's own commit is
@@ -163,7 +163,7 @@ jobs:
           # Debian bookworm packages rustc 1.63; this crate needs 1.83 (see
           # rust-version in Cargo.toml), so the toolchain comes from rustup.
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --default-toolchain 1.90.0 --profile minimal
+            | sh -s -- -y --default-toolchain 1.98.1 --profile minimal
 
       # Not shallow, and the checkout is allowed to fail the job. `--depth 1`
       # fetches only the default branch's tip, so a pull request's own commit is
