@@ -15,6 +15,16 @@
   read. `pinned_steps()` lists them. Pinning a step the store does not hold
   returns `False` rather than raising.
 
+  **Pins hold across processes**, which is where they are needed: a fork pins
+  its parent's step from its own process while the parent keeps training. The
+  pin used to live only in the manifest, and every process holds the manifest
+  in memory and writes it whole at its next save - so the parent's next save
+  erased a pin it had never seen, and retention could then take the fork's
+  base. Pins are now also kept in `pins.json` beside the manifest, re-read
+  before every retention pass; when it exists it decides, so an `unpin` from
+  another process counts too. A store from before the file keeps using the
+  manifest's flags.
+
 ## 0.1.2 — 2026-09-22
 
 ### Added

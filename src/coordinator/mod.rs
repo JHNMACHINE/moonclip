@@ -23,6 +23,16 @@ mod saver;
 use recovery::{load_manifest, recover_or_reclaim_orphans, snapshot_is_whole};
 use saver::{AsyncSaver, SaveJob};
 
+/// Where pins live besides the manifest (GPU-154, and GPU-149 for why).
+///
+/// The manifest is held in memory by every process that has the store open and
+/// written whole at each save, so a pin written by one process is erased by the
+/// next save of another. Found by a fork that pinned its parent's step while
+/// the parent kept training: at the end the parent's store had no pins at all.
+/// This file is re-read before every retention pass, so every process honours
+/// what any of them pinned.
+const PINS_FILE: &str = "pins.json";
+
 #[cfg(test)]
 mod tests;
 
@@ -1223,11 +1233,67 @@ impl Core {
             // process, and a fork can be created by something that then exits.
             self.persist_manifest(&manifest)?;
         }
+        // And in the pins file, whatever the manifest said: that is what
+        // another process with this store open reads, and its own manifest -
+        // held in memory, written whole at its next save - would otherwise
+        // erase the pin without ever having seen it.
+        let mut steps = match self.read_pins()? {
+            Some(steps) => steps,
+            None => manifest.snapshots.iter().filter(|s| s.pinned && s.finalized).map(|s| s.step).collect(),
+        };
+        steps.retain(|s| *s != step);
+        if pinned {
+            steps.push(step);
+        }
+        steps.sort_unstable();
+        steps.dedup();
+        self.write_pins(&steps)?;
         Ok(true)
     }
 
+    /// The pinned steps as ``pins.json`` has them, or ``None`` for a store
+    /// that predates the file - whose pins are only the manifest's flags.
+    fn read_pins(&self) -> Result<Option<Vec<u64>>> {
+        match self.storage.get(PINS_FILE) {
+            // Local storage pads files to a page with zeros, as it does the
+            // manifest; the JSON is what comes before them.
+            Ok(bytes) => {
+                let end = bytes.iter().rposition(|&b| b != 0).map(|i| i + 1).unwrap_or(0);
+                serde_json::from_slice::<Vec<u64>>(&bytes[..end])
+                    .map(Some)
+                    .map_err(|e| MoonclipError::Serialization(e.to_string()))
+            }
+            Err(MoonclipError::NotFound(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn write_pins(&self, steps: &[u64]) -> Result<()> {
+        let json = serde_json::to_vec(steps).map_err(|e| MoonclipError::Serialization(e.to_string()))?;
+        self.storage.put(PINS_FILE, &json)
+    }
+
+    /// Bring the manifest's pin flags in line with ``pins.json``.
+    ///
+    /// Before every retention pass, because the file can have changed under
+    /// this process: a fork pins its parent's step from its own process while
+    /// the parent keeps training, and the parent's manifest never hears of it.
+    /// When the file exists it decides - an unpin from elsewhere counts as
+    /// much as a pin - and when it does not, the manifest's flags stand.
+    fn sync_pins(&self, manifest: &mut Manifest) -> Result<()> {
+        let Some(steps) = self.read_pins()? else {
+            return Ok(());
+        };
+        for snapshot in manifest.snapshots.iter_mut().filter(|s| s.finalized) {
+            snapshot.pinned = steps.contains(&snapshot.step);
+        }
+        Ok(())
+    }
+
     fn pinned_steps(&self) -> Vec<u64> {
-        let manifest = self.lock_manifest();
+        let mut manifest = self.lock_manifest();
+        // What another process pinned counts: the file first, then the flags.
+        let _ = self.sync_pins(&mut manifest);
         let mut steps: Vec<u64> = manifest
             .snapshots
             .iter()
@@ -1722,6 +1788,9 @@ impl Core {
     /// unlink waits for readers and that wait deadlocks under this lock. See
     /// [`Core::remove_snapshots`].
     fn apply_retention(&self, manifest: &mut Manifest) -> Result<Vec<Snapshot>> {
+        // Pins set by another process with this store open, before anything
+        // is chosen for removal - see `Core::sync_pins`.
+        self.sync_pins(manifest)?;
         let max_full = manifest.retention.max_full_snapshots;
         let max_total = manifest.retention.effective_total_cap();
         // Pinned snapshots join the rollback-protected ones: same exemption,

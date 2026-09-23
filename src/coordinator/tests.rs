@@ -2518,3 +2518,61 @@ fn load_tensors_follows_an_alias_to_the_bytes() {
     let got = coord.load_tensors(snap, std::slice::from_ref(&alias.name)).unwrap();
     assert_eq!(got[&alias.name], shared, "the alias came back as the wrong bytes");
 }
+
+
+/// A pin made by another process with the store open survives this one's
+/// saves. Two coordinators on one storage stand for the two processes: the
+/// parent training, and a fork pinning the step it starts from. The parent's
+/// manifest never hears of the pin - before `pins.json` its next save wrote
+/// the manifest back without it, and retention took the step (GPU-149).
+#[test]
+fn a_pin_from_another_process_survives_this_ones_saves() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(dir.path()).unwrap());
+    let config = || CoordinatorConfig {
+        world_size: 1,
+        rank: 0,
+        compression: CompressionAlgo::Zstd { level: 1 },
+        retention: RetentionPolicy {
+            max_full_snapshots: 2,
+            max_deltas_per_full: 2,
+            full_snapshot_every_steps: 0,
+            max_total_snapshots: Some(2),
+        },
+        lineage: LineageConfig {
+            rollback_interval_steps: 0,
+            max_rollback_snapshots: 0,
+        },
+        delta_max_ratio: 0.95,
+        ..Default::default()
+    };
+    let parent = Coordinator::new(Arc::clone(&storage), config()).unwrap();
+    for step in 1..=3u64 {
+        parent.save(step, evolving_state(step), HashMap::new()).unwrap();
+    }
+    parent.flush().unwrap();
+
+    // The fork, in its own process, pins step 3 of the parent's store.
+    let fork = Coordinator::new(Arc::clone(&storage), config()).unwrap();
+    assert!(fork.pin(3).unwrap());
+    drop(fork);
+
+    // The parent carries on, knowing nothing, under a cap of two.
+    for step in 4..=8u64 {
+        parent.save(step, evolving_state(step), HashMap::new()).unwrap();
+    }
+    parent.flush().unwrap();
+
+    let steps: Vec<u64> = parent.list_snapshots().iter().map(|s| s.step).collect();
+    assert!(steps.contains(&3), "the fork's pin was lost to the parent's saves: {steps:?}");
+    let reopened = Coordinator::new(Arc::clone(&storage), config()).unwrap();
+    assert_eq!(reopened.pinned_steps(), vec![3]);
+
+    // And an unpin from elsewhere counts as much: the next save collects it.
+    assert!(reopened.unpin(3).unwrap());
+    drop(reopened);
+    parent.save(9, evolving_state(9), HashMap::new()).unwrap();
+    parent.flush().unwrap();
+    let steps: Vec<u64> = parent.list_snapshots().iter().map(|s| s.step).collect();
+    assert!(!steps.contains(&3), "unpinned elsewhere, still kept: {steps:?}");
+}
