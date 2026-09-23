@@ -12,6 +12,11 @@ on:
   # into a real release.
   workflow_dispatch:
 
+# The job token only reads: nothing here pushes, tags or comments, and releases
+# go out with their own PyPI and crates.io tokens.
+permissions:
+  contents: read
+
 # One job per artifact, and the split is not cosmetic. Codeberg's hosted runners
 # enforce a per-job time and memory budget, and the memory quota counts
 # filesystem writes — so `target/` counts too. A single job building six release
@@ -32,7 +37,7 @@ jobs:
   # uploaded, the version number is free on both indexes and the same tag can be
   # pushed again.
   crate:
-    runs-on: codeberg-medium
+    runs-on: ubuntu-latest
     container:
       # Cargo already inside, so no rustup step. The verification build compiles
       # without `extension-module`, so it needs no Python interpreter to link
@@ -49,21 +54,20 @@ jobs:
       # Not shallow: the check below has to prove the tagged commit is on main,
       # and a truncated history cannot answer that.
       - name: Checkout
-        run: |
-          set -eu
-          git clone ${{ forgejo.server_url }}/${{ forgejo.repository }}.git .
-          git checkout ${{ forgejo.sha }}
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
 
       # A tag can be pushed from any commit, including one on a branch nobody
       # reviewed. Note what this does *not* check: provenance, not freshness. A
       # tag pointing at an older commit *of* main passes — which is how 0.0.4
       # nearly went out without its own README.
       - name: Tag must be on main
-        if: ${{ forgejo.event_name == 'push' }}
+        if: ${{ github.event_name == 'push' }}
         run: |
           set -eu
           if ! git merge-base --is-ancestor HEAD origin/main; then
-            echo "Tag ${{ forgejo.ref_name }} points at $(git rev-parse --short HEAD)," >&2
+            echo "Tag ${{ github.ref_name }} points at $(git rev-parse --short HEAD)," >&2
             echo "which is not reachable from main. Merge the branch first, then" >&2
             echo "tag the merge commit. Nothing has been published." >&2
             exit 1
@@ -73,12 +77,12 @@ jobs:
       # Costs a grep, and rules out the one mistake that cannot be taken back.
       # Ahead of every build for that reason.
       - name: Tag must match the package version
-        if: ${{ forgejo.event_name == 'push' }}
+        if: ${{ github.event_name == 'push' }}
         run: |
           set -eu
           VERSION=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
           PY_VERSION=$(grep -m1 '^version = ' pyproject.toml | cut -d'"' -f2)
-          TAG="${{ forgejo.ref_name }}"
+          TAG="${{ github.ref_name }}"
           echo "Cargo.toml $VERSION, pyproject.toml $PY_VERSION, tag $TAG"
           if [ "$VERSION" != "$PY_VERSION" ]; then
             echo "Cargo.toml and pyproject.toml disagree" >&2
@@ -130,13 +134,13 @@ jobs:
       # complaint is lost.
       - name: Publish to crates.io
         env:
-          # Left name: what cargo itself reads. Right name: the Codeberg secret.
+          # Left name: what cargo itself reads. Right name: the repository secret.
           CARGO_REGISTRY_TOKEN: ${{ secrets.MOONCLIP_CARGO_TOKEN }}
         run: |
           set -eu
           VERSION=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
 
-          if [ "${{ forgejo.event_name }}" != "push" ]; then
+          if [ "${{ github.event_name }}" != "push" ]; then
             echo "rehearsal: packaging and compiling the crate, not uploading it"
             cargo publish --dry-run --locked
             exit 0
@@ -166,7 +170,7 @@ jobs:
   # stops here, no wheel has gone out and the version number is still free.
   sdist:
     needs: crate
-    runs-on: codeberg-medium
+    runs-on: ubuntu-latest
     container:
       image: quay.io/pypa/manylinux_2_28_x86_64
     steps:
@@ -183,18 +187,17 @@ jobs:
             | sh -s -- -y --default-toolchain 1.90.0 --profile minimal
 
       - name: Checkout
-        run: |
-          set -eu
-          git clone ${{ forgejo.server_url }}/${{ forgejo.repository }}.git .
-          git checkout ${{ forgejo.sha }}
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
 
       - name: Tag must match the package version
-        if: ${{ forgejo.event_name == 'push' }}
+        if: ${{ github.event_name == 'push' }}
         run: |
           set -eu
           VERSION=$(grep -m1 '^version = ' pyproject.toml | cut -d'"' -f2)
-          if [ "v$VERSION" != "${{ forgejo.ref_name }}" ]; then
-            echo "Tag ${{ forgejo.ref_name }} does not match version $VERSION" >&2
+          if [ "v$VERSION" != "${{ github.ref_name }}" ]; then
+            echo "Tag ${{ github.ref_name }} does not match version $VERSION" >&2
             exit 1
           fi
 
@@ -214,7 +217,7 @@ jobs:
           ls "$tmp"/*/pyproject.toml "$tmp"/*/Cargo.toml "$tmp"/*/src/lib.rs
 
       - name: Upload to PyPI
-        if: ${{ forgejo.event_name == 'push' }}
+        if: ${{ github.event_name == 'push' }}
         env:
           TWINE_USERNAME: __token__
           TWINE_PASSWORD: ${{ secrets.MOONCLIP_PYPI_TOKEN }}
@@ -232,7 +235,7 @@ jobs:
   # `--skip-existing` means a re-run cannot repair it.
   wheels:
     needs: sdist
-    runs-on: codeberg-medium
+    runs-on: ubuntu-latest
     container:
       # The PyPA manylinux image ships every supported CPython under
       # /opt/python/cp3XX-cp3XX/bin/, each with pip — and, unlike plain bookworm,
@@ -253,21 +256,20 @@ jobs:
             | sh -s -- -y --default-toolchain 1.90.0 --profile minimal
 
       - name: Checkout
-        run: |
-          set -eu
-          git clone ${{ forgejo.server_url }}/${{ forgejo.repository }}.git .
-          git checkout ${{ forgejo.sha }}
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
 
       # Cheap, and repeated here on purpose: these jobs can be re-run
       # individually, and a wheel whose metadata disagrees with the tag is
       # exactly what the check in the crate job exists to prevent.
       - name: Tag must match the package version
-        if: ${{ forgejo.event_name == 'push' }}
+        if: ${{ github.event_name == 'push' }}
         run: |
           set -eu
           VERSION=$(grep -m1 '^version = ' pyproject.toml | cut -d'"' -f2)
-          if [ "v$VERSION" != "${{ forgejo.ref_name }}" ]; then
-            echo "Tag ${{ forgejo.ref_name }} does not match version $VERSION" >&2
+          if [ "v$VERSION" != "${{ github.ref_name }}" ]; then
+            echo "Tag ${{ github.ref_name }} does not match version $VERSION" >&2
             exit 1
           fi
 
@@ -292,7 +294,7 @@ jobs:
           twine check dist/*.whl
 
       - name: Upload to PyPI
-        if: ${{ forgejo.event_name == 'push' }}
+        if: ${{ github.event_name == 'push' }}
         env:
           TWINE_USERNAME: __token__
           TWINE_PASSWORD: ${{ secrets.MOONCLIP_PYPI_TOKEN }}

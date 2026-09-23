@@ -24,13 +24,18 @@ on:
   # unchanged main is how you find out how much of a delta is just the runner.
   workflow_dispatch:
 
+# The job token only reads: nothing here pushes, tags or comments, and releases
+# go out with their own PyPI and crates.io tokens.
+permissions:
+  contents: read
+
 jobs:
   bench:
-    # Not `codeberg-small`. The bench holds base, target and a distinct copy of
-    # base at 256 MB each, plus a transient output buffer per call, so it peaks
-    # near 1.1 GB — and on these runners the memory quota counts filesystem
-    # writes, so a release `target/` is spending from the same budget.
-    runs-on: codeberg-medium
+    # The bench holds base, target and a distinct copy of base at 256 MB each,
+    # plus a transient output buffer per call, so it peaks near 1.1 GB. That
+    # ruled out `codeberg-small` on Codeberg, whose quota also counted the
+    # release `target/`; `ubuntu-latest` has 16 GB and does not count disk.
+    runs-on: ubuntu-latest
     container:
       # Matches ci.yml and checks.yml. Bump all three together.
       image: rust:1.97.1-bookworm
@@ -44,10 +49,9 @@ jobs:
       # fetches only the default branch's tip, and a job that benchmarks a
       # commit it did not check out is worse than no job.
       - name: Checkout
-        run: |
-          set -eu
-          git clone ${{ forgejo.server_url }}/${{ forgejo.repository }}.git .
-          git checkout ${{ forgejo.sha }}
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
 
       # `--locked` because the whole value of a number here is comparing it with
       # the previous one, and a dependency that updated underneath makes that

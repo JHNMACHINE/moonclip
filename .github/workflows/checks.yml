@@ -15,9 +15,14 @@ on:
     branches-ignore: [main]
   workflow_dispatch:
 
+# The job token only reads: nothing here pushes, tags or comments, and releases
+# go out with their own PyPI and crates.io tokens.
+permissions:
+  contents: read
+
 jobs:
   checks:
-    runs-on: codeberg-small
+    runs-on: ubuntu-latest
     container:
       # Matches ci.yml. Bump both together.
       image: rust:1.97.1-bookworm
@@ -32,10 +37,9 @@ jobs:
       # so the pushed commit is not in the clone and the job silently tests
       # main instead. A green tick for code nobody built is worse than no tick.
       - name: Checkout
-        run: |
-          set -eu
-          git clone ${{ forgejo.server_url }}/${{ forgejo.repository }}.git .
-          git checkout ${{ forgejo.sha }}
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
 
       - name: Clippy
         run: |

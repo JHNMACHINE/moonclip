@@ -17,9 +17,14 @@ on:
   # Replay it without inventing a commit — the same reason ravex has one.
   workflow_dispatch:
 
+# The job token only reads: nothing here pushes, tags or comments, and releases
+# go out with their own PyPI and crates.io tokens.
+permissions:
+  contents: read
+
 jobs:
   rust:
-    runs-on: codeberg-small
+    runs-on: ubuntu-latest
     container:
       image: rust:1.97.1-bookworm
     steps:
@@ -34,10 +39,9 @@ jobs:
       # swallowed it, and the job tested main instead. Every PR check was a
       # green tick for code nobody had built.
       - name: Checkout
-        run: |
-          set -eu
-          git clone ${{ forgejo.server_url }}/${{ forgejo.repository }}.git .
-          git checkout ${{ forgejo.sha }}
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
 
       # The S3 server runs as a plain background process rather than a
       # `services:` container: a service block cannot pass the arguments the
@@ -100,7 +104,7 @@ jobs:
   # users actually call, and it is where the multi-rank save flow lives, so it
   # gets one job of its own with a real torch in it.
   torch-adapter:
-    runs-on: codeberg-medium
+    runs-on: ubuntu-latest
     container:
       image: python:3.12-bookworm
     steps:
@@ -117,10 +121,9 @@ jobs:
       # swallowed it, and the job tested main instead. Every PR check was a
       # green tick for code nobody had built.
       - name: Checkout
-        run: |
-          set -eu
-          git clone ${{ forgejo.server_url }}/${{ forgejo.repository }}.git .
-          git checkout ${{ forgejo.sha }}
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
 
       - name: Build and test with PyTorch
         run: |
@@ -138,7 +141,7 @@ jobs:
           pytest tests/ -v
 
   python:
-    runs-on: codeberg-medium
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
@@ -168,10 +171,9 @@ jobs:
       # swallowed it, and the job tested main instead. Every PR check was a
       # green tick for code nobody had built.
       - name: Checkout
-        run: |
-          set -eu
-          git clone ${{ forgejo.server_url }}/${{ forgejo.repository }}.git .
-          git checkout ${{ forgejo.sha }}
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
 
       - name: Build and test on Python ${{ matrix.python }}
         run: |
