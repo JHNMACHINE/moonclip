@@ -184,7 +184,7 @@ jobs:
       - name: Install Rust
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --default-toolchain 1.98.1 --profile minimal
+            | sh -s -- -y --default-toolchain 1.98.1 --profile minimal --component clippy
 
       - name: Checkout
         uses: actions/checkout@v5
@@ -253,7 +253,7 @@ jobs:
       - name: Install Rust
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --default-toolchain 1.98.1 --profile minimal
+            | sh -s -- -y --default-toolchain 1.98.1 --profile minimal --component clippy
 
       - name: Checkout
         uses: actions/checkout@v5

@@ -29,6 +29,14 @@
 # The cost of this file is that anyone building here downloads this exact
 # toolchain. That is the trade: a required download against two versions
 # disagreeing without saying so.
+# **Install clippy with the toolchain, not after it.** `components` below makes
+# rustup add clippy the first time cargo runs here if the install did not
+# include it - and under `pip install`, maturin starts cargo more than once at
+# a time, so two proxies race to add the same component and one fails with
+# "detected conflict: bin/cargo-clippy". On GitHub that failed two of four
+# matrix jobs with identical configuration. Every rustup line in this
+# repository therefore passes `--profile minimal --component clippy`.
+#
 [toolchain]
 channel = "1.98.1"
 components = ["clippy"]
