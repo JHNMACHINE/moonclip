@@ -78,24 +78,24 @@ pip install moonclip
 Wheels are built for **Linux x86_64 (manylinux_2_28), CPython 3.11-3.14** — the
 platform training actually runs on. No Rust toolchain needed there; the
 extension is compiled. What changed between versions is in
-[CHANGELOG.md](https://codeberg.org/JHNMACHINE/moonclip/src/branch/main/CHANGELOG.md).
+[CHANGELOG.md](https://github.com/JHNMACHINE/moonclip/blob/main/CHANGELOG.md).
 
 On any other platform (Windows, macOS, aarch64) `pip` finds no wheel and stops.
 Build it yourself instead, which needs a [Rust toolchain](https://rustup.rs/):
 
 ```bash
-pip install git+https://codeberg.org/JHNMACHINE/moonclip.git
+pip install git+https://github.com/JHNMACHINE/moonclip.git
 
 # On a cloud instance without Rust (Vast.ai, RunPod, Lambda, …)
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 source $HOME/.cargo/env
-pip install git+https://codeberg.org/JHNMACHINE/moonclip.git
+pip install git+https://github.com/JHNMACHINE/moonclip.git
 ```
 
 ### Build from source
 
 ```bash
-git clone https://codeberg.org/JHNMACHINE/moonclip.git
+git clone https://github.com/JHNMACHINE/moonclip.git
 cd moonclip
 pip install maturin
 maturin develop --release
@@ -172,7 +172,7 @@ same time.
 Two layers, and the line between them is the whole design. The Rust crate
 stores *named tensors* and has never heard of PyTorch; everything that knows
 what a `state_dict` is lives in the Python package on top. That is why
-Moonclip can sit under a runtime like [Ravex](https://codeberg.org/JHNMACHINE/ravex)
+Moonclip can sit under a runtime like [Ravex](https://github.com/JHNMACHINE/ravex)
 without either one owning the other — and why `import moonclip` does not
 import torch.
 

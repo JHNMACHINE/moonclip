@@ -33,13 +33,13 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://codeberg.org/JHNMACHINE/moonclip"
-Repository = "https://codeberg.org/JHNMACHINE/moonclip"
-Issues = "https://codeberg.org/JHNMACHINE/moonclip/issues"
+Homepage = "https://github.com/JHNMACHINE/moonclip"
+Repository = "https://github.com/JHNMACHINE/moonclip"
+Issues = "https://github.com/JHNMACHINE/moonclip/issues"
 # PyPI shows these as "Project links", which is where someone deciding whether
 # to upgrade goes looking. A relative link in the README would not do: PyPI does
 # not resolve relative paths against the repository.
-Changelog = "https://codeberg.org/JHNMACHINE/moonclip/src/branch/main/CHANGELOG.md"
+Changelog = "https://github.com/JHNMACHINE/moonclip/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 torch = ["torch>=2.0"]

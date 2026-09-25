@@ -8,7 +8,7 @@ edition = "2021"
 rust-version = "1.83"
 description = "High-performance checkpoint management for ML training"
 license = "Apache-2.0"
-repository = "https://codeberg.org/JHNMACHINE/moonclip"
+repository = "https://github.com/JHNMACHINE/moonclip"
 readme = "README.md"
 
 # What crates.io distributes is the Rust library. The Python package, its
