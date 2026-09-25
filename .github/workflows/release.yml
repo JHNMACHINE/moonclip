@@ -66,6 +66,11 @@ jobs:
         if: ${{ github.event_name == 'push' }}
         run: |
           set -eu
+          # actions/checkout trusts the workspace only for its own git calls.
+          # This container runs as root over a tree the runner user owns, so
+          # every git command here stops at "dubious ownership" - and with
+          # `git rev-parse` empty, the message below blamed the tag instead.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           if ! git merge-base --is-ancestor HEAD origin/main; then
             echo "Tag ${{ github.ref_name }} points at $(git rev-parse --short HEAD)," >&2
             echo "which is not reachable from main. Merge the branch first, then" >&2
