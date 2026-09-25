@@ -25,6 +25,18 @@ pub trait StorageBackend: Send + Sync {
         self.put(rel_path, &buf)
     }
 
+    /// Write exactly `data`, byte for byte, whatever this backend does to
+    /// the files it writes for itself.
+    ///
+    /// For copies: a file the remote sync brings down belongs to whoever
+    /// wrote it, and must come back as it left. The local store pads what it
+    /// writes to a page with zeros, which Moonclip's own readers strip - and a
+    /// caller's JSON beside the checkpoints does not survive. Most backends
+    /// write what they are given anyway, hence the default.
+    fn put_exact(&self, rel_path: &str, data: &[u8]) -> Result<()> {
+        self.put(rel_path, data)
+    }
+
     /// Read bytes from the given relative path.
     fn get(&self, rel_path: &str) -> Result<Vec<u8>>;
 
@@ -231,12 +243,10 @@ fn held_open_elsewhere(_e: &std::io::Error) -> bool {
     false
 }
 
-impl StorageBackend for LocalStorage {
-    fn put(&self, rel_path: &str, data: &[u8]) -> Result<()> {
-        self.put_parts(rel_path, &[data])
-    }
-
-    fn put_parts(&self, rel_path: &str, parts: &[&[u8]]) -> Result<()> {
+impl LocalStorage {
+    /// Write `parts` atomically, padded with zeros to a multiple of
+    /// `page_size` - 0 for none.
+    fn write_parts(&self, rel_path: &str, parts: &[&[u8]], page_size: usize) -> Result<()> {
         use std::io::Write;
 
         let path = self.full_path(rel_path);
@@ -257,8 +267,8 @@ impl StorageBackend for LocalStorage {
                 total += part.len();
             }
             // Pad to page boundary for SSD longevity
-            if self.page_size > 0 && total % self.page_size != 0 {
-                let pad = self.page_size - total % self.page_size;
+            if page_size > 0 && total % page_size != 0 {
+                let pad = page_size - total % page_size;
                 file.write_all(&vec![0u8; pad])?;
             }
             file.flush()?;
@@ -294,6 +304,20 @@ impl StorageBackend for LocalStorage {
             }
         }
         Ok(())
+    }
+}
+
+impl StorageBackend for LocalStorage {
+    fn put(&self, rel_path: &str, data: &[u8]) -> Result<()> {
+        self.put_parts(rel_path, &[data])
+    }
+
+    fn put_parts(&self, rel_path: &str, parts: &[&[u8]]) -> Result<()> {
+        self.write_parts(rel_path, parts, self.page_size)
+    }
+
+    fn put_exact(&self, rel_path: &str, data: &[u8]) -> Result<()> {
+        self.write_parts(rel_path, &[data], 0)
     }
 
     fn get(&self, rel_path: &str) -> Result<Vec<u8>> {

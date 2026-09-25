@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **`restore_from_remote` brings a caller's files back as they were
+  (GPU-159).** The local store pads every file it writes to a 4 KiB page
+  with zeros, and Moonclip's own readers strip them; a restore wrote the
+  files it brought down the same way, so everything a caller keeps beside
+  the checkpoints - Ravex's `run.json`, `status.json`, its metrics - came
+  back with a tail of zeros and stopped parsing. A fork on a machine that
+  never held its parent lost the parent's id, and a resume there its run's.
+  Copies made by the sync are now written byte for byte
+  (`StorageBackend::put_exact`); what the store writes for itself is padded
+  as before.
+
 ## 0.1.3 — 2026-09-25
 
 ### Added

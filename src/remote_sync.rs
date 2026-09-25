@@ -424,7 +424,7 @@ fn sync_prefix_skipping(
     if !prefix.is_empty() && !prefix.contains('/') && prefix.contains('.') {
         match from.get(prefix) {
             Ok(data) => {
-                to.put(prefix, &data)?;
+                to.put_exact(prefix, &data)?;
                 return Ok(());
             }
             Err(MoonclipError::NotFound(_)) => return Ok(()),
@@ -450,8 +450,10 @@ fn sync_prefix_skipping(
             Err(_) => {} // If we cannot check, copy anyway
         }
 
+        // Exact: a copy is the file as it was, not as this side would have
+        // written it (see `StorageBackend::put_exact`).
         let data = from.get(file)?;
-        to.put(file, &data)?;
+        to.put_exact(file, &data)?;
         synced += 1;
     }
 
@@ -534,6 +536,33 @@ mod tests {
         assert_eq!(dst.get("snapshots/a/t1.bin").unwrap(), b"data1");
         assert_eq!(dst.get("snapshots/a/t2.bin").unwrap(), b"data2");
         assert_eq!(dst.get("manifest.json").unwrap(), b"{}");
+    }
+
+    /// A restore onto the usual, page-aligned local store brings a caller's
+    /// files back byte for byte. It used to pad them to 4096 with zeros, as
+    /// the store does with its own: Ravex's `run.json` came back unreadable,
+    /// so a fork on another machine lost its parent's id and a resume there
+    /// its run's.
+    #[test]
+    fn restore_brings_back_a_callers_files_unpadded() {
+        let remote_dir = tempfile::tempdir().unwrap();
+        let local_dir = tempfile::tempdir().unwrap();
+        let remote: Arc<dyn StorageBackend> =
+            Arc::new(LocalStorage::new_unaligned(remote_dir.path()).unwrap());
+        let local: Arc<dyn StorageBackend> =
+            Arc::new(LocalStorage::new(local_dir.path()).unwrap());
+
+        let run = br#"{"run_id": "r-1"}"#;
+        remote.put("manifest.json", b"{}").unwrap();
+        remote.put("run.json", run).unwrap();
+        remote.put("metrics/x/000000.jsonl", b"{\"step\": 1}\n").unwrap();
+
+        assert!(restore_from_remote(&local, &remote).unwrap());
+        assert_eq!(std::fs::read(local_dir.path().join("run.json")).unwrap(), run);
+        assert_eq!(
+            std::fs::read(local_dir.path().join("metrics/x/000000.jsonl")).unwrap(),
+            b"{\"step\": 1}\n"
+        );
     }
 
     #[test]
