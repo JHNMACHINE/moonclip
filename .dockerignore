@@ -1,0 +1,9 @@
+# moonclip as a Docker build context (smith builds it from a checkout with
+# LIBS=source): the build tree and the venvs are gigabytes, and the image
+# compiles the crate itself anyway.
+.git
+.venv
+.claude
+.pytest_cache
+**/__pycache__
+target
