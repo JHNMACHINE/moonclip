@@ -80,3 +80,6 @@ docs/_build/
 # Training artifacts
 moonclip_*_ckpts/
 .claude
+
+# Notes for the agent working here: kept local, not published.
+CLAUDE.md
