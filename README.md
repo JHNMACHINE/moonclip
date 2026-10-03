@@ -258,5 +258,4 @@ clippy, and running `cargo fmt` over it produces a diff nobody asked for.
 
 ## License
 
-[PolyForm Noncommercial 1.0.0](LICENSE): free for non-commercial use.
-For anything else, get in touch via [GPU Zero](https://gpuzero.dev).
+Apache-2.0 — [GPU Zero](https://gpuzero.dev)

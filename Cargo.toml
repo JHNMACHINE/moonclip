@@ -7,7 +7,7 @@ edition = "2021"
 # error from deep inside a dependency.
 rust-version = "1.83"
 description = "High-performance checkpoint management for ML training"
-license-file = "LICENSE"
+license = "Apache-2.0"
 repository = "https://github.com/JHNMACHINE/moonclip"
 readme = "README.md"
 

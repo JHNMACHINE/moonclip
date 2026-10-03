@@ -7,7 +7,7 @@ name = "moonclip"
 version = "0.1.4"
 description = "High-performance ML checkpoint management — per-tensor delta tracking, Rust-native compression, rank-aware distributed saves"
 requires-python = ">=3.11"
-license = {text = "PolyForm-Noncommercial-1.0.0"}
+license = {text = "Apache-2.0"}
 authors = [
     {name = "Jonathan Vecchione", email = "vecchionejonathan@gmail.com"},
 ]
@@ -20,7 +20,7 @@ classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
-    "License :: Other/Proprietary License",
+    "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Rust",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
