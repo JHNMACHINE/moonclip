@@ -260,4 +260,4 @@ clippy, and running `cargo fmt` over it produces a diff nobody asked for.
 
 ## License
 
-Apache-2.0 — [Minya AI](https://minya.ai)
+Apache-2.0 — [GPU Zero](https://gpuzero.dev)
