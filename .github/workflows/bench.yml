@@ -33,7 +33,7 @@ jobs:
   bench:
     # The bench holds base, target and a distinct copy of base at 256 MB each,
     # plus a transient output buffer per call, so it peaks near 1.1 GB. That
-    # ruled out `codeberg-small` on Codeberg, whose quota also counted the
+    # ruled out Codeberg's small runners, whose quota also counted the
     # release `target/`; `ubuntu-latest` has 16 GB and does not count disk.
     runs-on: ubuntu-latest
     container:

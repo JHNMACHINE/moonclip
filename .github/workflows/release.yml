@@ -17,17 +17,13 @@ on:
 permissions:
   contents: read
 
-# One job per artifact, and the split is not cosmetic. Codeberg's hosted runners
-# enforce a per-job time and memory budget, and the memory quota counts
-# filesystem writes — so `target/` counts too. A single job building six release
-# wheels was killed mid-build on `codeberg-small` (2 cores, 2 GB, a few minutes)
-# with the container torn out from under it: `context deadline exceeded` on the
-# podman socket. Six smaller jobs each fit inside `codeberg-medium`'s ten minutes
-# on their own.
+# One job per artifact. The split dates from when releases ran on Codeberg's
+# hosted runners, whose per-job time and memory quota counted filesystem writes
+# (so `target/` too): a single job building six wheels was killed mid-build.
+# It stayed because a failed wheel is retried alone instead of rebuilding all.
 #
 # The cost is that the dependency tree compiles once per interpreter instead of
-# once in total. That is what per-job quotas buy, and queue time is cheaper than
-# a release that cannot finish at all.
+# once in total, and queue time is cheaper than a release that cannot finish.
 jobs:
   # The crate first, deliberately. Neither artifact depends on the other — the
   # wheel carries the compiled extension and never fetches the crate — so the

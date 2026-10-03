@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- **The licence is PolyForm Noncommercial 1.0.0, free for non-commercial use.**
+  It replaces Apache-2.0 for what is published from here on; versions already
+  on PyPI and crates.io keep the licence they were released under. Package
+  metadata, `LICENSE` and the README say so.
+- The author contact in `pyproject.toml` no longer points at the old minya.ai
+  domain, and the README and workflow comments no longer describe the CI as
+  Forgejo/Codeberg.
+
 ## 0.1.4 — 2026-09-30
 
 ### Fixed

@@ -6,7 +6,7 @@
 # Named for MinIO, which it ran until 2026-09-15. MinIO's open-source server is
 # archived: its binaries answer `410 Gone` and its image is no longer pullable.
 # This is versitygw now, the same server and version CI runs — see the "Start
-# the S3 server" step in .forgejo/workflows/ci.yml, where the whole of
+# the S3 server" step in .github/workflows/ci.yml, where the whole of
 # tests/s3_minio.rs was checked against it.
 #
 # Idempotent: re-running replaces the container. Data lives in the container

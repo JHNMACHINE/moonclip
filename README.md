@@ -48,8 +48,8 @@ checkpoint), 10 saves, CPU (`bench/benchmark_checkpoints.py`):
 Saves are asynchronous by default: `save()` returns as soon as the tensor
 data has been copied, while hashing, delta detection, zstd compression and
 the disk write run on a background thread and overlap with training. Call
-`flush()` when you need the checkpoint on disk — as of 0.0.6 that means
-`fsync`ed, not merely written; loads and
+`flush()` when you need the checkpoint on disk — that means `fsync`ed, not
+merely written; loads and
 `list_snapshots()` wait for pending saves automatically. Pass
 `async_save=False` for fully synchronous saves.
 
@@ -142,10 +142,9 @@ rank writes to a directory of its own — one store per process, no coordination
 mgr = CheckpointManager(f"./checkpoints/rank_{rank}", world_size=1, rank=0)
 ```
 
-Until 0.0.9 the launcher's variables were adopted whenever nothing was stated.
-That is no longer the default: leaving it unsaid under a multi-rank launcher
-is an error naming both numbers and the ways forward. A single process is
-unaffected and still needs no configuration.
+Leaving the topology unsaid under a multi-rank launcher is an error naming
+both numbers and the ways forward; the launcher's variables are never adopted
+silently. A single process is unaffected and needs no configuration.
 
 ## Tuning
 
@@ -223,13 +222,12 @@ python/moonclip/
 | `benches/` | Criterion microbenchmarks for the delta path |
 | `bench/` | End-to-end checkpoint benchmarks, and the GPU scripts behind them |
 | `examples/` | Runnable: plain model, transformer, DDP, S3 |
-| `.forgejo/workflows/` | `checks.yml` on branches, `ci.yml` on main, `bench.yml`, `release.yml` |
+| `.github/workflows/` | `checks.yml` on branches, `ci.yml` on main, `bench.yml`, `release.yml` |
 
-As of 0.1.0 that is about 15.6k lines of Rust across 22 files and 1.4k of
-Python, covered by 222 crate tests, 19 more against a live MinIO, and 108
-Python ones. Roughly half of the Rust is `#[cfg(test)]`: `coordinator/`
-carries 2.2k lines of tests against 2.3k of code, which is why it is the one
-part of the crate laid out as a directory.
+That is about 16k lines of Rust across 22 files and 1.4k of Python. Roughly
+half of the Rust is `#[cfg(test)]`: `coordinator/` carries about as many lines
+of tests as of code, which is why it is the one part of the crate laid out as
+a directory.
 
 ## Development
 
@@ -260,4 +258,5 @@ clippy, and running `cargo fmt` over it produces a diff nobody asked for.
 
 ## License
 
-Apache-2.0 — [GPU Zero](https://gpuzero.dev)
+[PolyForm Noncommercial 1.0.0](LICENSE): free for non-commercial use.
+For anything else, get in touch via [GPU Zero](https://gpuzero.dev).
