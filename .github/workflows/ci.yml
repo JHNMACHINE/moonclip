@@ -188,3 +188,40 @@ jobs:
           pip install --quiet maturin pytest
           maturin develop
           pytest tests/ -v
+
+  # The free-threaded build of 3.14, which release.yml ships a cp314t wheel for
+  # (GPU-189). Its own job rather than a fifth matrix entry: the official
+  # `python:3.14` image has the GIL, and no official image has 3.14t, so uv
+  # fetches the interpreter instead of the image providing it.
+  python-free-threaded:
+    runs-on: ubuntu-latest
+    container:
+      image: python:3.14-bookworm
+    steps:
+      - name: Install git and Rust
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq git build-essential
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.98.1 --profile minimal --component clippy
+
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Test on Python 3.14t
+        run: |
+          set -eu
+          . "$HOME/.cargo/env"
+          pip install --quiet uv
+          uv venv --python 3.14t /opt/venv
+          export VIRTUAL_ENV=/opt/venv
+          export PATH="/opt/venv/bin:$PATH"
+          python -VV
+          uv pip install --quiet -e . pytest
+          # The point of the job, checked on its own. A module that does not
+          # declare itself safe without the GIL makes 3.14t turn the GIL back
+          # on at import, with a warning and nothing else: every test below
+          # would pass, on what is then an ordinary interpreter.
+          python -c "import sys, moonclip; assert not sys._is_gil_enabled(), 'importing moonclip re-enabled the GIL'"
+          pytest tests -v

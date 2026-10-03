@@ -249,7 +249,10 @@ jobs:
       # leaves a half-published release with no way to finish it.
       fail-fast: false
       matrix:
-        python: [cp311, cp312, cp313, cp314]
+        # cp314t is 3.14's free-threaded build (GPU-189). PyO3 0.29 declares
+        # the module safe without the GIL by default, so the same source
+        # builds it; without this wheel a 3.14t user compiles from the sdist.
+        python: [cp311, cp312, cp313, cp314, cp314t]
     steps:
       - name: Install Rust
         run: |
@@ -278,7 +281,11 @@ jobs:
         run: |
           set -eu
           . "$HOME/.cargo/env"
-          PY="/opt/python/${{ matrix.python }}-${{ matrix.python }}/bin/python"
+          # The directory is `cp314-cp314t` for the free-threaded build, not
+          # `cp314t-cp314t`: the first half is the interpreter's version and
+          # the second its ABI, and only the ABI carries the `t`.
+          ABI="${{ matrix.python }}"
+          PY="/opt/python/${ABI%t}-${ABI}/bin/python"
           test -x "$PY" || { echo "interpreter missing: $PY" >&2; exit 1; }
 
           /opt/python/cp312-cp312/bin/pip install --quiet maturin twine
@@ -290,7 +297,9 @@ jobs:
           ls -la dist/
           # The ABI tag has to be this interpreter's. A plain count would pass
           # even if every job had built the same wheel.
-          ls dist/ | grep -q "${{ matrix.python }}" || {
+          # Both tags, not a substring: `cp314` alone also matches a cp314t
+          # wheel, so the GIL job could pass on the other job's output.
+          ls dist/ | grep -q -- "-${ABI%t}-${ABI}-" || {
             echo "no ${{ matrix.python }} wheel in dist/" >&2; exit 1; }
           twine check dist/*.whl
 
