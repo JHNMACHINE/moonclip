@@ -16,6 +16,18 @@
   domain, and the README and workflow comments no longer describe the CI as
   Forgejo/Codeberg.
 
+### Fixed
+
+- **A file deleted while a sync walks the store no longer aborts the sync
+  (GPU-209).** The sync lists the files and then reads them one by one, while
+  retention and the merger delete on their own threads. A file gone between
+  the two was an error that stopped the walk: every file after it stayed off
+  the remote until the next sync, while the manifest, queued on its own, went
+  up naming them. With a save per step and the merger folding the deltas, 20
+  syncs of 50 failed this way. The file is skipped now - nothing references
+  it, and its remote copy is already queued for deletion - and the line the
+  sync logs counts it.
+
 ## 0.1.4 — 2026-09-30
 
 ### Fixed
