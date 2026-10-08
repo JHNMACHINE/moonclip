@@ -1387,6 +1387,16 @@ impl Core {
         fresh
             .snapshots
             .retain(|snapshot| snapshot_is_whole(storage.as_ref(), snapshot));
+        // A delta is only as whole as its base. Its own pack can arrive while
+        // the base's did not, and then it is listed, chosen as the newest step
+        // and fails at the first load, which is the failure the filter above
+        // exists to prevent. Bases are fulls, never deltas, so one pass sees
+        // every base that survived.
+        let kept: std::collections::HashSet<Uuid> =
+            fresh.snapshots.iter().map(|s| s.id).collect();
+        fresh.snapshots.retain(|snapshot| {
+            snapshot.base_snapshot_id.is_none_or(|base| kept.contains(&base))
+        });
         let dropped = before - fresh.snapshots.len();
         if dropped > 0 {
             eprintln!(

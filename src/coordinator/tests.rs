@@ -2576,3 +2576,82 @@ fn a_pin_from_another_process_survives_this_ones_saves() {
     let steps: Vec<u64> = parent.list_snapshots().iter().map(|s| s.step).collect();
     assert!(!steps.contains(&3), "unpinned elsewhere, still kept: {steps:?}");
 }
+
+// ─── the way back from the bucket ───────────────────────────────────
+
+/// A store whose remote is another directory, syncing on every save.
+fn remote_config(remote: &Arc<dyn StorageBackend>) -> CoordinatorConfig {
+    CoordinatorConfig {
+        compression: CompressionAlgo::Zstd { level: 1 },
+        // One full, then deltas against it: the shape a run has between
+        // forced fulls, and the one a resume has to reconstruct.
+        retention: RetentionPolicy {
+            full_snapshot_every_steps: 1000,
+            ..Default::default()
+        },
+        remote_storage: Some(Arc::clone(remote)),
+        remote_sync: Some(crate::remote_sync::RemoteSyncConfig {
+            sync_every_n_saves: 1,
+        }),
+        ..Default::default()
+    }
+}
+
+/// Saves a base and four deltas, pushes them, and returns their ids.
+fn push_base_and_deltas(remote: &Arc<dyn StorageBackend>) -> (tempfile::TempDir, Vec<Uuid>) {
+    let dir = tempfile::tempdir().unwrap();
+    let local: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(dir.path()).unwrap());
+    let coord = Coordinator::new(Arc::clone(&local), remote_config(remote)).unwrap();
+    for step in 0..5 {
+        coord.save(step, evolving_state(step), HashMap::new()).unwrap();
+    }
+    coord.flush().unwrap();
+    coord.sync_now().unwrap();
+    let snaps = coord.list_snapshots();
+    assert!(!snaps[0].is_delta, "the first save is the base");
+    assert!(snaps[1..].iter().all(|s| s.is_delta), "the rest are deltas");
+    (dir, snaps.iter().map(|s| s.id).collect())
+}
+
+/// A machine that lost its disk pulls the store back and resumes from the
+/// newest delta, which has to resolve against the base it names.
+#[test]
+fn a_store_pulled_from_the_remote_resumes_from_its_newest_delta() {
+    let remote_dir = tempfile::tempdir().unwrap();
+    let remote: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(remote_dir.path()).unwrap());
+    let (_old_disk, ids) = push_base_and_deltas(&remote);
+
+    let new_disk = tempfile::tempdir().unwrap();
+    let local: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(new_disk.path()).unwrap());
+    let coord = Coordinator::new(local, remote_config(&remote)).unwrap();
+    assert!(coord.list_snapshots().is_empty());
+    assert!(coord.restore_from_remote().unwrap());
+
+    let (latest, state) = coord.load_latest().unwrap();
+    assert_eq!(latest, ids[4]);
+    assert_eq!(state["w"], evolving_state(4)[0].data);
+    for (step, id) in ids.iter().enumerate() {
+        let state = coord.load(*id).unwrap();
+        assert_eq!(state["w"], evolving_state(step as u64)[0].data, "step {step}");
+    }
+}
+
+/// A delta is not whole when its base is missing, even with its own pack in
+/// place: the restore has to leave it out with the base.
+#[test]
+fn a_delta_whose_base_never_reached_the_remote_is_left_out() {
+    let remote_dir = tempfile::tempdir().unwrap();
+    let remote: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(remote_dir.path()).unwrap());
+    let (_old_disk, ids) = push_base_and_deltas(&remote);
+    for file in snapshot_files(remote.as_ref(), &ids[0].to_string()) {
+        remote.delete(&file).unwrap();
+    }
+
+    let new_disk = tempfile::tempdir().unwrap();
+    let local: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(new_disk.path()).unwrap());
+    let coord = Coordinator::new(local, remote_config(&remote)).unwrap();
+    let usable = coord.restore_from_remote().unwrap();
+
+    assert!(!usable, "nothing here can be loaded, so nothing should be claimed");
+    assert!(coord.list_snapshots().is_empty());
+}
