@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.6 — 2026-10-08
+
+### Fixed
+
+- **A delta whose full is missing is not offered as a checkpoint (GPU-206).**
+  A store pulled back from the remote keeps only the snapshots whose packs
+  arrived, and a delta could pass that check with its own pack there and its
+  full's not: it was then listed, taken as the newest step, and failed at the
+  first load - the failure the check exists to prevent. A delta is now kept
+  only if the full it was taken against is kept too.
+
 ## 0.1.5 — 2026-10-08
 
 ### Added
