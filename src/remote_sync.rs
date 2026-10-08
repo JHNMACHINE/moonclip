@@ -435,6 +435,7 @@ fn sync_prefix_skipping(
     let files = from.list(prefix)?;
     let mut synced = 0u64;
     let mut skipped = 0u64;
+    let mut vanished = 0u64;
 
     for file in &files {
         if skip.contains(&file.as_str()) {
@@ -450,17 +451,33 @@ fn sync_prefix_skipping(
             Err(_) => {} // If we cannot check, copy anyway
         }
 
+        // A file listed a moment ago can be gone by now: retention and the
+        // merger delete on their own threads, while this walk runs. It was
+        // an error, and it aborted the walk - every file after it stayed off
+        // the remote until the next sync, while the manifest, queued on its
+        // own, went up naming them. Seen on 2026-10-08 with a delta per step
+        // and the merger folding them: 20 syncs of 50 (GPU-209). A file
+        // deleted here is one nothing references any more, and its remote
+        // copy, if it has one, is already in `PendingDeletes`.
+        //
         // Exact: a copy is the file as it was, not as this side would have
         // written it (see `StorageBackend::put_exact`).
-        let data = from.get(file)?;
+        let data = match from.get(file) {
+            Ok(data) => data,
+            Err(MoonclipError::NotFound(_)) => {
+                vanished += 1;
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
         to.put_exact(file, &data)?;
         synced += 1;
     }
 
-    if synced > 0 {
+    if synced > 0 || vanished > 0 {
         eprintln!(
-            "[Moonclip sync] Copied {} files, skipped {} (prefix: '{}')",
-            synced, skipped, prefix
+            "[Moonclip sync] Copied {} files, skipped {}, {} deleted since listed (prefix: '{}')",
+            synced, skipped, vanished, prefix
         );
     }
 
@@ -563,6 +580,74 @@ mod tests {
             std::fs::read(local_dir.path().join("metrics/x/000000.jsonl")).unwrap(),
             b"{\"step\": 1}\n"
         );
+    }
+
+    /// A local store whose `list` deletes the first file it lists right after
+    /// listing it: what retention or the merger does on their own threads
+    /// while a sync walks the files it has just listed. The first, so that
+    /// every other file comes after it in the walk.
+    struct DeletesAfterListing {
+        inner: LocalStorage,
+        deleted: Mutex<Option<String>>,
+    }
+
+    impl StorageBackend for DeletesAfterListing {
+        fn put(&self, rel_path: &str, data: &[u8]) -> Result<()> {
+            self.inner.put(rel_path, data)
+        }
+        fn get(&self, rel_path: &str) -> Result<Vec<u8>> {
+            self.inner.get(rel_path)
+        }
+        fn exists(&self, rel_path: &str) -> Result<bool> {
+            self.inner.exists(rel_path)
+        }
+        fn delete(&self, rel_path: &str) -> Result<()> {
+            self.inner.delete(rel_path)
+        }
+        fn list(&self, prefix: &str) -> Result<Vec<String>> {
+            let listed = self.inner.list(prefix)?;
+            if let Some(first) = listed.first() {
+                self.inner.delete(first)?;
+                *self.deleted.lock().unwrap() = Some(first.clone());
+            }
+            Ok(listed)
+        }
+    }
+
+    /// GPU-209: a file deleted between the listing and its read is skipped,
+    /// and the walk goes on. It used to abort it, leaving every file after
+    /// it off the remote while the manifest went up naming them.
+    #[test]
+    fn a_file_deleted_mid_sync_does_not_stop_the_others() {
+        let src_dir = tempfile::tempdir().unwrap();
+        let dst_dir = tempfile::tempdir().unwrap();
+
+        let inner = LocalStorage::new_unaligned(src_dir.path()).unwrap();
+        for name in ["a", "b", "c", "d"] {
+            inner.put(&format!("snapshots/{name}/rank_0.pack"), name.as_bytes()).unwrap();
+        }
+        let source = Arc::new(DeletesAfterListing {
+            inner,
+            deleted: Mutex::new(None),
+        });
+        let src: Arc<dyn StorageBackend> = Arc::clone(&source) as _;
+        let dst: Arc<dyn StorageBackend> =
+            Arc::new(LocalStorage::new_unaligned(dst_dir.path()).unwrap());
+
+        sync_prefix(&src, &dst, "snapshots").unwrap();
+
+        let deleted = source.deleted.lock().unwrap().clone().unwrap();
+        assert!(!dst.exists(&deleted).unwrap());
+        for name in ["a", "b", "c", "d"] {
+            let file = format!("snapshots/{name}/rank_0.pack");
+            if file != deleted {
+                assert_eq!(
+                    dst.get(&file).unwrap(),
+                    name.as_bytes(),
+                    "{file} was listed after the deleted file and never sent"
+                );
+            }
+        }
     }
 
     #[test]
