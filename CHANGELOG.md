@@ -1,5 +1,32 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- **S3 requests are signed by `rusty-s3`, not by a SigV4 of our own
+  (GPU-203).** It signs and does nothing else - no I/O, no checksum
+  headers, which GCS and R2 refuse - so retries, multipart uploads and
+  their abort, range reads and listing stay as they were. Every request is
+  now a presigned URL with an unsigned payload; integrity is the manifest's
+  hashes, as before. `hmac`, `sha2` and `hex` are no longer dependencies.
+- **Breaking for Rust callers:** `S3Config` has a new field,
+  `session_token`, so a struct literal needs it (`None` for a long-lived
+  key).
+- The minimum Rust is 1.85, `rusty-s3`'s.
+
+### Added
+
+- **Temporary credentials.** `S3Config::session_token`, and
+  `s3_session_token` from Python (the last argument, so no other moves):
+  the token goes into every signature, which is what short-lived
+  credentials scoped to a prefix - R2's temporary credentials, S3's
+  `AssumeRole` - need.
+
+### Removed
+
+- `tests/debug_s3_signing.py`, which replayed the old signing in Python.
+
 ## 0.1.6 — 2026-10-08
 
 ### Fixed

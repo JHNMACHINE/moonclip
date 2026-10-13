@@ -1,52 +1,55 @@
-//! S3-compatible storage over a hand-written SigV4.
+//! S3-compatible storage, signed by `rusty-s3` (GPU-203).
 //!
-//! Signing is ours rather than the AWS SDK's, and that is a decision rather
-//! than an accident: the SDK speaks the same one protocol this does — it is
-//! not a multi-cloud abstraction — while bringing a dependency tree into a
-//! library that is deliberately thin. Its recent defaults also send checksum
-//! headers that GCS and other S3-compatible services reject, so adopting it
-//! would cost configuration to get back where we already are. Reconsider if
-//! the list below stops being short.
+//! The signing is `rusty-s3`'s, not ours: until 0.2 this module carried a
+//! SigV4 written by hand, which is exactly the kind of cryptography that is
+//! easy to get subtly wrong at the edges. `rusty-s3` signs and nothing else -
+//! it does no I/O - so it brings neither the AWS SDK's dependency tree nor
+//! its defaults, whose checksum headers GCS and other S3-compatible services
+//! reject. What stays ours is what is ours: the requests themselves (`ureq`),
+//! retries, the multipart upload of large checkpoints and its abort, reads of
+//! a byte range, and the little XML the answers need.
+//!
+//! Every request is a **presigned URL**: the signature is in its query
+//! string, made the moment the request is sent, and the body is not hashed
+//! into it (`UNSIGNED-PAYLOAD`). Integrity is covered a layer up - every
+//! tensor carries its own hash in the manifest - as it was before.
 //!
 //! # What is not covered
 //!
-//! Written down because ten integration tests against MinIO make this module
-//! look more complete than it is. MinIO is forgiving in the places real S3 is
-//! not, and the next person here should not start from the assumption that
-//! everything is handled.
+//! Written down because ten integration tests against an S3 gateway make
+//! this module look more complete than it is. Gateways are forgiving in the
+//! places real S3 is not, and the next person here should not start from the
+//! assumption that everything is handled.
 //!
-//! * **Temporary credentials.** Only a long-lived access key and secret. No
-//!   `x-amz-security-token` header is signed or sent, so anything issuing
-//!   session credentials — `AssumeRole`, EC2 instance profiles, IRSA on EKS,
-//!   any OIDC federation — cannot be used. The credentials have to be static.
+//! * **Temporary credentials** *are* covered since 0.2: a session token
+//!   ([`S3Config::session_token`]) goes into every signature, which is what
+//!   short-lived credentials scoped to a prefix need. Refreshing them is the
+//!   caller's: one that expires mid-run fails like a wrong key.
 //! * **Very large objects.** Handled, but by a second path worth knowing
 //!   about: past `SINGLE_PUT_LIMIT` a write becomes a multipart upload rather
 //!   than one `PUT`, because S3 refuses a single `PUT` over 5 GiB and a
 //!   gathered checkpoint of a large model reaches that on its own. The
-//!   multipart path is the one the integration tests exercise least — MinIO
-//!   accepts far larger single `PUT`s than S3 does, so the threshold that
-//!   matters in production is one the suite never crosses on its own.
+//!   multipart path is the one the integration tests exercise least — the
+//!   gateways accept far larger single `PUT`s than S3 does, so the threshold
+//!   that matters in production is one the suite never crosses on its own.
 //! * **Clock skew.** The signature is stamped with the local clock and a
 //!   `RequestTimeTooSkewed` is treated as any other error. A host more than
 //!   fifteen minutes off signs requests that will never be accepted, and the
 //!   error does not say so in those words.
-//! * **Checksum headers.** None are sent (`Content-MD5`, `x-amz-checksum-*`).
-//!   Integrity is covered a layer up — every tensor carries its own hash in
-//!   the manifest — so this is a deliberate omission, and it is also why the
-//!   module works unmodified against GCS and R2.
+//! * **Checksum headers.** None are sent (`Content-MD5`, `x-amz-checksum-*`):
+//!   a deliberate omission, and why the module works unmodified against GCS
+//!   and R2.
 //!
 //! Path-style versus virtual-hosted addressing, percent-encoding of key names,
 //! and `ListObjectsV2` pagination *are* handled; see [`S3Config`] and the
-//! `uri_encode` and `list` implementations.
+//! `bucket_of` and `list` implementations.
 
-use hmac::{Hmac, Mac};
-use sha2::{Digest, Sha256};
+use rusty_s3::{Bucket, Credentials, Method, UrlStyle};
 use std::fmt::Write as FmtWrite;
+use url::Url;
 
 use crate::error::{Result, MoonclipError};
 use crate::storage::StorageBackend;
-
-type HmacSha256 = Hmac<Sha256>;
 
 // ─── S3 Configuration ───────────────────────────────────────────────
 
@@ -69,6 +72,10 @@ pub struct S3Config {
     pub access_key: String,
     /// AWS secret access key.
     pub secret_key: String,
+    /// The session token of temporary credentials, which come as three
+    /// values rather than two: S3's `AssumeRole`, or R2's temporary
+    /// credentials scoped to a prefix. None for a long-lived key.
+    pub session_token: Option<String>,
     /// Use path-style URLs (required for MinIO, optional for AWS).
     /// If true:  http://endpoint/bucket/key
     /// If false: http://bucket.endpoint/key (virtual-hosted)
@@ -116,87 +123,38 @@ impl S3Config {
     fn object_key(&self, rel_path: &str) -> String {
         format!("{}{}", self.normalized_prefix(), rel_path)
     }
-
-    /// Build the host for requests.
-    #[allow(dead_code)]
-    fn host(&self) -> String {
-        let default_endpoint = format!("https://s3.{}.amazonaws.com", self.region);
-        let base = self.endpoint.as_deref().unwrap_or(&default_endpoint);
-
-        let base = base
-            .trim_end_matches('/')
-            .replace("https://", "")
-            .replace("http://", "");
-
-        if self.path_style {
-            base.to_string()
-        } else {
-            format!("{}.{}", self.bucket, base)
-        }
-    }
-
-    /// Build the base URL for requests.
-    #[allow(dead_code)]
-    fn base_url(&self) -> String {
-        let default_endpoint = format!("https://s3.{}.amazonaws.com", self.region);
-        let endpoint = self.endpoint.as_deref().unwrap_or(&default_endpoint);
-        let endpoint = endpoint.trim_end_matches('/');
-
-        if self.path_style {
-            format!("{}/{}", endpoint, self.bucket)
-        } else {
-            // Insert bucket as subdomain
-            let scheme_end = endpoint.find("://").map(|i| i + 3).unwrap_or(0);
-            let (scheme, rest) = endpoint.split_at(scheme_end);
-            format!("{}{}.{}", scheme, self.bucket, rest)
-        }
-    }
 }
 
-// ─── AWS Signature V4 ───────────────────────────────────────────────
+// ─── Addressing and signing ─────────────────────────────────────────
 
-fn sha256_hex(data: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(data);
-    let result = hasher.finalize();
-    let mut s = String::with_capacity(64);
-    for byte in result {
-        write!(s, "{:02x}", byte).unwrap();
+/// How long a signed request stays valid. It is signed the moment it is
+/// sent, so this only has to cover the request starting: an hour leaves room
+/// for a slow connection to open, and none for a URL found in a log later.
+const SIGNED_FOR_SECS: u64 = 3600;
+
+/// The bucket as `rusty-s3` addresses it: AWS's endpoint for the region when
+/// none is given, path-style or virtual-hosted as configured.
+fn bucket_of(config: &S3Config) -> Result<Bucket> {
+    let mut endpoint = config
+        .endpoint
+        .clone()
+        .unwrap_or_else(|| format!("https://s3.{}.amazonaws.com", config.region));
+    // The bucket's address is joined onto this one, and a join replaces the
+    // last segment of a path that has no trailing slash: an endpoint with a
+    // path of its own would lose it.
+    if !endpoint.ends_with('/') {
+        endpoint.push('/');
     }
-    s
-}
-
-fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
-    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC key length");
-    mac.update(data);
-    mac.finalize().into_bytes().to_vec()
-}
-
-/// Build a signing key for AWS SigV4.
-fn signing_key(secret: &str, date: &str, region: &str, service: &str) -> Vec<u8> {
-    let k_date = hmac_sha256(format!("AWS4{}", secret).as_bytes(), date.as_bytes());
-    let k_region = hmac_sha256(&k_date, region.as_bytes());
-    let k_service = hmac_sha256(&k_region, service.as_bytes());
-    hmac_sha256(&k_service, b"aws4_request")
-}
-
-/// URL-encode a string per AWS rules (encode everything except unreserved chars).
-fn uri_encode(s: &str, encode_slash: bool) -> String {
-    let mut result = String::with_capacity(s.len() * 2);
-    for byte in s.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                result.push(byte as char);
-            }
-            b'/' if !encode_slash => {
-                result.push('/');
-            }
-            _ => {
-                write!(result, "%{:02X}", byte).unwrap();
-            }
-        }
-    }
-    result
+    let url = Url::parse(&endpoint).map_err(|e| {
+        MoonclipError::Storage(format!("S3 endpoint {endpoint:?} is not an address: {e}"))
+    })?;
+    let style = if config.path_style {
+        UrlStyle::Path
+    } else {
+        UrlStyle::VirtualHost
+    };
+    Bucket::new(url, style, config.bucket.clone(), config.region.clone())
+        .map_err(|e| MoonclipError::Storage(format!("S3 bucket {:?}: {e}", config.bucket)))
 }
 
 /// Above this, one `PUT` is not allowed and the upload has to be split.
@@ -226,151 +184,12 @@ fn part_size_for(total: usize) -> usize {
     MIN_PART_SIZE.max(spread)
 }
 
-struct SignedRequest {
-    url: String,
-    headers: Vec<(String, String)>,
-}
-
-/// Sign an S3 request using AWS Signature V4.
-fn sign_request(
-    config: &S3Config,
-    method: &str,
-    key: &str,
-    payload_hash: &str,
-    query_params: &[(&str, &str)],
-    content_length: Option<usize>,
-) -> SignedRequest {
-    let now = chrono::Utc::now();
-    let date_stamp = now.format("%Y%m%d").to_string();
-    let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
-
-    // Canonical URI – key encoded, slashes kept
-    let encoded_key = uri_encode(key, false);
-    let canonical_uri = if config.path_style {
-        format!("/{}/{}", config.bucket, encoded_key)
-    } else {
-        format!("/{}", encoded_key)
-    };
-
-    // Canonical query string
-    let mut sorted_params: Vec<(&str, &str)> = query_params.to_vec();
-    sorted_params.sort_by_key(|(k, _)| *k);
-    let canonical_qs: String = sorted_params
-        .iter()
-        .map(|(k, v)| format!("{}={}", uri_encode(k, true), uri_encode(v, true)))
-        .collect::<Vec<_>>()
-        .join("&");
-
-    // Build URL (using encoded key)
-    let default_endpoint = format!("https://s3.{}.amazonaws.com", config.region);
-    let endpoint = config.endpoint.as_deref().unwrap_or(&default_endpoint);
-    let endpoint = endpoint.trim_end_matches('/');
-
-    let url = if config.path_style {
-        if canonical_qs.is_empty() {
-            format!("{}/{}/{}", endpoint, config.bucket, encoded_key)
-        } else {
-            format!(
-                "{}/{}/{}?{}",
-                endpoint, config.bucket, encoded_key, canonical_qs
-            )
-        }
-    } else {
-        let scheme_end = endpoint.find("://").map(|i| i + 3).unwrap_or(0);
-        let (scheme, rest) = endpoint.split_at(scheme_end);
-        if canonical_qs.is_empty() {
-            format!("{}{}.{}/{}", scheme, config.bucket, rest, encoded_key)
-        } else {
-            format!(
-                "{}{}.{}/{}?{}",
-                scheme, config.bucket, rest, encoded_key, canonical_qs
-            )
-        }
-    };
-
-    // Extract the host from the URL (lowercase, exactly what ureq will send)
-    let host = url
-        .split("://")
-        .nth(1)
-        .unwrap_or("")
-        .split('/')
-        .next()
-        .unwrap_or("")
-        .to_lowercase();
-
-    // ─── Build canonical headers in **alphabetical order** ──────────
-    // Store (lowercase_name, original_value) pairs.
-    let mut headers_to_sign: Vec<(String, String)> = Vec::new();
-
-    // Always include these three
-    headers_to_sign.push(("host".into(), host.clone()));
-    headers_to_sign.push(("x-amz-content-sha256".into(), payload_hash.to_string()));
-    headers_to_sign.push(("x-amz-date".into(), amz_date.clone()));
-
-    // Add content-length only if a body is present
-    if let Some(len) = content_length {
-        headers_to_sign.push(("content-length".into(), len.to_string()));
-    }
-
-    // Sort by the lowercased header name (required by SigV4)
-    headers_to_sign.sort_by_key(|h| h.0.to_lowercase());
-
-    // Build canonical_headers string
-    let canonical_headers: String = headers_to_sign
-        .iter()
-        .map(|(name, value)| format!("{}:{}\n", name.to_lowercase(), value))
-        .collect();
-
-    // Build signed_headers list (alphabetically)
-    let signed_headers: String = headers_to_sign
-        .iter()
-        .map(|(name, _)| name.to_lowercase())
-        .collect::<Vec<_>>()
-        .join(";");
-
-    // ─── Canonical request ──────────────────────────────────────────
-    let canonical_request = format!(
-        "{}\n{}\n{}\n{}\n{}\n{}",
-        method, canonical_uri, canonical_qs, canonical_headers, signed_headers, payload_hash
-    );
-
-    // ─── String to sign ─────────────────────────────────────────────
-    let credential_scope = format!("{}/{}/s3/aws4_request", date_stamp, config.region);
-    let string_to_sign = format!(
-        "AWS4-HMAC-SHA256\n{}\n{}\n{}",
-        amz_date,
-        credential_scope,
-        sha256_hex(canonical_request.as_bytes())
-    );
-
-    // ─── Signature ──────────────────────────────────────────────────
-    let sig_key = signing_key(&config.secret_key, &date_stamp, &config.region, "s3");
-    let signature_bytes = hmac_sha256(&sig_key, string_to_sign.as_bytes());
-    let signature = hex::encode(signature_bytes);
-
-    let authorization = format!(
-        "AWS4-HMAC-SHA256 Credential={}/{}, SignedHeaders={}, Signature={}",
-        config.access_key, credential_scope, signed_headers, signature
-    );
-
-    // ─── Headers to send ────────────────────────────────────────────
-    // Note: we do NOT set "Host" or "Content-Length" manually;
-    // ureq will set them automatically based on the URL and body.
-
-    SignedRequest {
-        url,
-        headers: vec![
-            ("Authorization".into(), authorization),
-            ("x-amz-content-sha256".into(), payload_hash.into()),
-            ("x-amz-date".into(), amz_date),
-        ],
-    }
-}
-
 // ─── S3 Storage Backend ─────────────────────────────────────────────
 
 pub struct S3Storage {
     config: S3Config,
+    bucket: Bucket,
+    credentials: Credentials,
     agent: ureq::Agent,
 }
 
@@ -381,8 +200,59 @@ impl S3Storage {
             .timeout_read(std::time::Duration::from_secs(config.timeout_secs * 10))
             .timeout_write(std::time::Duration::from_secs(config.timeout_secs * 10))
             .build();
+        let bucket = bucket_of(&config)?;
+        let credentials = match &config.session_token {
+            Some(token) => Credentials::new_with_token(&config.access_key, &config.secret_key, token),
+            None => Credentials::new(&config.access_key, &config.secret_key),
+        };
 
-        Ok(S3Storage { config, agent })
+        Ok(S3Storage {
+            config,
+            bucket,
+            credentials,
+            agent,
+        })
+    }
+
+    /// The address of one request to `key`, signed now: `rusty-s3`'s
+    /// SigV4, in the query string, with the session token when there is one.
+    ///
+    /// `query` is any of S3's own parameters (`uploads`, `partNumber`...).
+    /// `rusty-s3` merges them with its `X-Amz-*` ones as two runs already in
+    /// order, so they are sorted here first: out of order, the URL would carry
+    /// them in an order other than the one the signature covers.
+    fn signed_url(
+        &self,
+        method: &str,
+        key: &str,
+        query: &[(&str, &str)],
+    ) -> std::result::Result<Url, MoonclipError> {
+        let method = match method {
+            "GET" => Method::Get,
+            "PUT" => Method::Put,
+            "DELETE" => Method::Delete,
+            "HEAD" => Method::Head,
+            "POST" => Method::Post,
+            _ => return Err(MoonclipError::Storage(format!("Unknown method: {method}"))),
+        };
+        let url = self
+            .bucket
+            .object_url(key)
+            .map_err(|e| MoonclipError::Storage(format!("S3 key {key:?} is not a path: {e}")))?;
+        let mut query = query.to_vec();
+        query.sort_unstable();
+        Ok(rusty_s3::signing::sign(
+            &jiff::Timestamp::now(),
+            method,
+            url,
+            self.credentials.key(),
+            self.credentials.secret(),
+            self.credentials.token(),
+            self.bucket.region(),
+            SIGNED_FOR_SECS,
+            query.iter().copied(),
+            std::iter::empty(),
+        ))
     }
 
     /// One attempt, retried on the failures that are worth retrying.
@@ -428,34 +298,17 @@ impl S3Storage {
         body: Option<&[u8]>,
         query_params: &[(&str, &str)],
     ) -> std::result::Result<ureq::Response, MoonclipError> {
-        let payload_hash = match body {
-            Some(data) => sha256_hex(data),
-            None => sha256_hex(b""),
-        };
-
-        let content_length = body.map(|d| d.len());
-
-        let signed = sign_request(
-            &self.config,
-            method,
-            key,
-            &payload_hash,
-            query_params,
-            content_length,
-        );
-
-        let mut req = match method {
-            "GET" => self.agent.get(&signed.url),
-            "PUT" => self.agent.put(&signed.url),
-            "DELETE" => self.agent.delete(&signed.url),
-            "HEAD" => self.agent.head(&signed.url),
-            "POST" => self.agent.post(&signed.url),
+        let url = self.signed_url(method, key, query_params)?;
+        // Nothing to set beyond the URL: the signature covers only the host,
+        // and ureq sends that and the body's length on its own.
+        let req = match method {
+            "GET" => self.agent.get(url.as_str()),
+            "PUT" => self.agent.put(url.as_str()),
+            "DELETE" => self.agent.delete(url.as_str()),
+            "HEAD" => self.agent.head(url.as_str()),
+            "POST" => self.agent.post(url.as_str()),
             _ => return Err(MoonclipError::Storage(format!("Unknown method: {method}"))),
         };
-
-        for (k, v) in &signed.headers {
-            req = req.set(k, v);
-        }
 
         let response = if let Some(data) = body {
             req.send_bytes(data)
@@ -650,9 +503,9 @@ impl S3Storage {
     /// The trait's default implementation downloads the whole object and
     /// slices it. On local storage that is a seek; on S3 it was the entire
     /// checkpoint pulled over the network to read one tensor's few hundred
-    /// kilobytes — once per tensor. `Range` is not part of the signed header
-    /// set (host, x-amz-date and x-amz-content-sha256 are), so it can be
-    /// attached after signing.
+    /// kilobytes — once per tensor. `Range` is not part of what is signed -
+    /// a presigned URL covers the host alone - so it can be attached after
+    /// signing.
     fn ranged_get(&self, key: &str, offset: u64, len: usize) -> Result<Vec<u8>> {
         use std::io::Read;
 
@@ -665,13 +518,8 @@ impl S3Storage {
         let mut attempt = 0;
         loop {
             attempt += 1;
-            let signed = sign_request(&self.config, "GET", key, &sha256_hex(b""), &[], None);
-            let mut req = self.agent.get(&signed.url);
-            for (k, v) in &signed.headers {
-                req = req.set(k, v);
-            }
-
-            match req.set("Range", &range).call() {
+            let url = self.signed_url("GET", key, &[])?;
+            match self.agent.get(url.as_str()).set("Range", &range).call() {
                 Ok(resp) => {
                     // A server is allowed to ignore `Range` and answer 200 with
                     // the whole object. Truncating that to `len` would hand
@@ -896,14 +744,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_uri_encode() {
-        assert_eq!(uri_encode("hello world", true), "hello%20world");
-        assert_eq!(uri_encode("path/to/file", false), "path/to/file");
-        assert_eq!(uri_encode("path/to/file", true), "path%2Fto%2Ffile");
-        assert_eq!(uri_encode("file-name_v2.bin", true), "file-name_v2.bin");
-    }
-
-    #[test]
     fn test_object_key() {
         let config = S3Config {
             bucket: "my-bucket".into(),
@@ -912,6 +752,7 @@ mod tests {
             endpoint: None,
             access_key: "AK".into(),
             secret_key: "SK".into(),
+            session_token: None,
             path_style: false,
             timeout_secs: 30,
             single_put_limit: SINGLE_PUT_LIMIT,
@@ -932,6 +773,7 @@ mod tests {
             endpoint: None,
             access_key: "AK".into(),
             secret_key: "SK".into(),
+            session_token: None,
             path_style: false,
             timeout_secs: 30,
             single_put_limit: SINGLE_PUT_LIMIT,
@@ -1088,46 +930,83 @@ mod tests {
         assert!(is_retryable(&real_failure));
     }
 
-    #[test]
-    fn test_signing_deterministic() {
-        // Verify that the signing key derivation is deterministic
-        let key1 = signing_key("secret", "20240101", "us-east-1", "s3");
-        let key2 = signing_key("secret", "20240101", "us-east-1", "s3");
-        assert_eq!(key1, key2);
-
-        // Different date → different key
-        let key3 = signing_key("secret", "20240102", "us-east-1", "s3");
-        assert_ne!(key1, key3);
-    }
-
-    #[test]
-    fn test_host_generation() {
-        let mut config = S3Config {
+    fn config(endpoint: Option<&str>, path_style: bool) -> S3Config {
+        S3Config {
             bucket: "my-bucket".into(),
             prefix: "".into(),
             region: "eu-west-1".into(),
-            endpoint: None,
+            endpoint: endpoint.map(Into::into),
             access_key: "AK".into(),
             secret_key: "SK".into(),
-            path_style: false,
+            session_token: None,
+            path_style,
             timeout_secs: 30,
             single_put_limit: SINGLE_PUT_LIMIT,
-        };
+        }
+    }
 
-        // Virtual-hosted style (AWS default)
-        assert_eq!(config.host(), "my-bucket.s3.eu-west-1.amazonaws.com");
+    /// Where requests go, both ways of naming a bucket, with and without an
+    /// endpoint of one's own.
+    #[test]
+    fn the_bucket_is_addressed_as_configured() {
+        let address = |endpoint, path_style| bucket_of(&config(endpoint, path_style)).unwrap().base_url().to_string();
+        // Virtual-hosted, AWS's default.
+        assert_eq!(address(None, false), "https://my-bucket.s3.eu-west-1.amazonaws.com/");
+        assert_eq!(address(None, true), "https://s3.eu-west-1.amazonaws.com/my-bucket/");
+        // A gateway, path-style as they want.
+        assert_eq!(address(Some("http://localhost:9000"), true), "http://localhost:9000/my-bucket/");
+        assert_eq!(address(Some("http://localhost:9000/"), true), "http://localhost:9000/my-bucket/");
+        // An endpoint with a path of its own keeps it.
+        assert_eq!(address(Some("https://gw.example/s3"), true), "https://gw.example/s3/my-bucket/");
+        assert!(bucket_of(&config(Some("not an address"), true)).is_err());
+    }
 
-        // Path style (MinIO etc.)
-        config.path_style = true;
-        assert_eq!(config.host(), "s3.eu-west-1.amazonaws.com");
+    /// A key is encoded as SigV4 wants it in the path: everything but the
+    /// unreserved characters and `/`. `&`, `+` and spaces are what shard and
+    /// metadata names hold.
+    #[test]
+    fn a_key_is_encoded_into_the_path() {
+        let store = S3Storage::new(config(Some("http://localhost:9000"), true)).unwrap();
+        let url = store.signed_url("GET", "runs/a&b c+d/rank_0.pack", &[]).unwrap();
+        assert_eq!(url.path(), "/my-bucket/runs/a%26b%20c%2Bd/rank_0.pack");
+    }
 
-        // Custom endpoint with path style
-        config.endpoint = Some("http://localhost:9000".into());
-        assert_eq!(config.host(), "localhost:9000");
+    /// Long-lived keys sign without a token; temporary credentials put
+    /// theirs in every request, inside what is signed.
+    #[test]
+    fn a_session_token_goes_into_every_signature() {
+        let plain = S3Storage::new(config(None, false)).unwrap();
+        let url = plain.signed_url("PUT", "a/t1.bin", &[]).unwrap();
+        assert!(url.query().unwrap().contains("X-Amz-Credential=AK%2F"));
+        assert!(!url.query().unwrap().contains("X-Amz-Security-Token"));
 
-        // Custom endpoint with virtual-hosted
-        config.path_style = false;
-        assert_eq!(config.host(), "my-bucket.localhost:9000");
+        let mut temporary = config(None, false);
+        temporary.session_token = Some("session/token+1".into());
+        let url = S3Storage::new(temporary).unwrap().signed_url("PUT", "a/t1.bin", &[]).unwrap();
+        let query = url.query().unwrap();
+        assert!(query.contains("X-Amz-Security-Token=session%2Ftoken%2B1"));
+        let signed = query.find("X-Amz-Signature=").unwrap();
+        assert!(query.find("X-Amz-Security-Token").unwrap() < signed, "the token is signed over");
+    }
+
+    /// S3's own parameters reach the URL, whatever order they are given in:
+    /// `rusty-s3` merges them as an ordered run, so they are sorted first.
+    #[test]
+    fn the_parameters_of_a_request_are_signed_in_order() {
+        let store = S3Storage::new(config(Some("http://localhost:9000"), true)).unwrap();
+        let url = store
+            .signed_url("PUT", "k", &[("uploadId", "u-1"), ("partNumber", "3")])
+            .unwrap();
+        let query = url.query().unwrap();
+        let names: Vec<&str> = query.split('&').map(|pair| pair.split('=').next().unwrap()).collect();
+        // The signature last, and everything it covers in order before it.
+        let (last, signed) = names.split_last().unwrap();
+        assert_eq!(*last, "X-Amz-Signature");
+        assert!(signed.windows(2).all(|pair| pair[0] <= pair[1]), "{names:?}");
+        assert!(query.contains("partNumber=3") && query.contains("uploadId=u-1"));
+        // An empty value, as `?uploads` is.
+        let url = store.signed_url("POST", "k", &[("uploads", "")]).unwrap();
+        assert!(url.query().unwrap().contains("uploads="));
     }
 
     #[test]
@@ -1140,6 +1019,7 @@ mod tests {
             endpoint: None,
             access_key: "AK".into(),
             secret_key: "SK".into(),
+            session_token: None,
             path_style: false,
             timeout_secs: 30,
             single_put_limit: SINGLE_PUT_LIMIT,
@@ -1155,6 +1035,7 @@ mod tests {
             endpoint: Some("http://172.17.0.2:9000".into()),
             access_key: "AK".into(),
             secret_key: "SK".into(),
+            session_token: None,
             path_style: false,
             timeout_secs: 30,
             single_put_limit: SINGLE_PUT_LIMIT,
@@ -1170,6 +1051,7 @@ mod tests {
             endpoint: Some("http://localhost:9000".into()),
             access_key: "AK".into(),
             secret_key: "SK".into(),
+            session_token: None,
             path_style: true,
             timeout_secs: 30,
             single_put_limit: SINGLE_PUT_LIMIT,

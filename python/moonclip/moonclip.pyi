@@ -36,6 +36,7 @@ class MoonclipManager:
         save_dtype: Union[str, Mapping[str, str], None] = None,
         async_save: bool = True,
         keep_base_in_memory: bool = True,
+        s3_session_token: Optional[str] = None,
     ) -> None:
         """
         Initialize the MoonclipManager.
@@ -134,6 +135,9 @@ class MoonclipManager:
                 next delta does not read and decompress a base this process
                 just wrote. Costs one retained copy of the saved state in host
                 memory — turn it off where memory is the binding constraint.
+            s3_session_token: The session token of temporary credentials,
+                which come with one beside the access key and the secret.
+                Last, so no earlier argument moves.
         """
         ...
 

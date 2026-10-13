@@ -364,6 +364,7 @@ impl MoonclipManager {
         save_dtype = None,
         async_save = true,
         keep_base_in_memory = true,
+        s3_session_token = None,
     ))]
     fn new(
         storage_root: &str,
@@ -390,6 +391,7 @@ impl MoonclipManager {
         save_dtype: Option<&Bound<'_, PyAny>>,
         async_save: bool,
         keep_base_in_memory: bool,
+        s3_session_token: Option<&str>,
     ) -> PyResult<Self> {
         let compression = if compression_level == 0 {
             CompressionAlgo::None
@@ -449,6 +451,7 @@ impl MoonclipManager {
                     endpoint: s3_endpoint.map(|s| s.into()),
                     access_key: ak.into(),
                     secret_key: sk.into(),
+                    session_token: s3_session_token.map(Into::into),
                     path_style: s3_path_style,
                     timeout_secs: 30,
                     single_put_limit: crate::s3::SINGLE_PUT_LIMIT,

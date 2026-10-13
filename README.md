@@ -195,7 +195,7 @@ src/
 ├── merger.rs        # Background consolidation of delta chains
 ├── inflight.rs      # Which snapshots a read holds, so a merge cannot delete them
 ├── storage.rs       # StorageBackend trait + LocalStorage (4KB aligned)
-├── s3.rs            # S3-compatible storage (AWS SigV4, no SDK)
+├── s3.rs            # S3-compatible storage (signed by rusty-s3, no SDK)
 ├── remote_sync.rs   # Batched sync to the remote backend
 ├── pool.rs          # Moonclip's private rayon pool — see Tuning
 ├── hash.rs          # xxHash3-128 integrity

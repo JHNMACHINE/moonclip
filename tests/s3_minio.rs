@@ -1,10 +1,10 @@
 //! The S3 backend against a real S3 API.
 //!
-//! Everything in `src/s3.rs`'s own test module is a pure function: URI
-//! encoding, key building, signature determinism. None of it sends a request,
-//! so none of it can tell whether the SigV4 signature this code produces is
-//! one a server will actually accept. That was verified once by hand, with
-//! `tests/debug_s3_signing.py` against MinIO, and never again.
+//! Everything in `src/s3.rs`'s own test module is a pure function: key
+//! building, the bucket's address, what a signed URL carries. None of it
+//! sends a request, so none of it can tell whether a server accepts what
+//! `rusty-s3` signs for this code (GPU-203) - the encoding of a key, the
+//! order of the parameters, an empty `?uploads`.
 //!
 //! These tests close that gap. They are the difference between "the signature
 //! is stable" and "the checkpoint reached the bucket".
@@ -57,6 +57,8 @@ fn backend_config(prefix: &str) -> Option<S3Config> {
         endpoint: Some(endpoint),
         access_key: std::env::var("MOONCLIP_S3_ACCESS_KEY").unwrap_or_else(|_| "minioadmin".into()),
         secret_key: std::env::var("MOONCLIP_S3_SECRET_KEY").unwrap_or_else(|_| "minioadmin".into()),
+        // Set when the suite runs on temporary credentials, as R2's are.
+        session_token: std::env::var("MOONCLIP_S3_SESSION_TOKEN").ok(),
         path_style: true,
         timeout_secs: 30,
         // Overridable so one test can watch `put` choose the multipart path

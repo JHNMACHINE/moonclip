@@ -88,8 +88,8 @@ jobs:
 
       # Without these variables tests/s3_minio.rs skips itself, so a failure
       # here means the S3 backend broke — not that the environment is missing.
-      # That distinction is the point of running it in CI at all: the SigV4
-      # signing was verified by hand exactly once before this existed.
+      # That distinction is the point of running it in CI at all: whether a
+      # server accepts what rusty-s3 signs is only known by sending it.
       - name: Rust tests
         env:
           MOONCLIP_S3_ENDPOINT: http://127.0.0.1:9000
@@ -160,7 +160,7 @@ jobs:
         run: |
           apt-get update -qq
           apt-get install -y -qq git build-essential
-          # Debian bookworm packages rustc 1.63; this crate needs 1.83 (see
+          # Debian bookworm packages rustc 1.63; this crate needs 1.85 (see
           # rust-version in Cargo.toml), so the toolchain comes from rustup.
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
             | sh -s -- -y --default-toolchain 1.98.1 --profile minimal --component clippy
