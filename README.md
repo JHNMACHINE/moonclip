@@ -222,7 +222,7 @@ python/moonclip/
 | `benches/` | Criterion microbenchmarks for the delta path |
 | `bench/` | End-to-end checkpoint benchmarks, and the GPU scripts behind them |
 | `examples/` | Runnable: plain model, transformer, DDP, S3 |
-| `.github/workflows/` | `checks.yml` on branches, `ci.yml` on main, `bench.yml`, `release.yml` |
+| `.github/workflows/` | `checks.yml` on branches, `ci.yml` on main, `bench.yml`, `deploy.yml` on the deploy branch, which tags the version and runs `release.yml` |
 
 That is about 16k lines of Rust across 22 files and 1.4k of Python. Roughly
 half of the Rust is `#[cfg(test)]`: `coordinator/` carries about as many lines

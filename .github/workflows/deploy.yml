@@ -1,0 +1,83 @@
+name: Deploy
+
+# A push to the deploy branch is a release: `git push origin main:deploy`
+# tags the version Cargo.toml and pyproject.toml carry, and publishes it with
+# release.yml - the crate to crates.io, the sdist and the wheels to PyPI. The
+# same branch the other projects deploy from, so no tag is ever typed by hand.
+#
+# The version is chosen by the commit (a `release: moonclip x.y.z` commit on
+# main bumps both files and the CHANGELOG), never here. A push whose version is
+# already tagged fails rather than doing nothing: the only reason to push here
+# is to publish, and a version that already went out is a bump that was
+# forgotten.
+on:
+  push:
+    branches: [deploy]
+
+# Two pushes in a row each get their run, the second after the first: neither
+# may stop the other halfway through an upload.
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    # The one job that writes: it pushes the tag. Everything that publishes
+    # runs in release.yml, with its own tokens and a read-only job token.
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      # Not shallow: the check below has to prove the commit is on main.
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      # The same provenance check release.yml makes of a tag: deploy publishes
+      # what main has, not a commit pushed there from a branch nobody merged.
+      - name: The commit must be on main
+        run: |
+          set -eu
+          if ! git merge-base --is-ancestor HEAD origin/main; then
+            echo "deploy is at $(git rev-parse --short HEAD), which is not on main." >&2
+            echo "Push main to it: git push origin main:deploy. Nothing was tagged." >&2
+            exit 1
+          fi
+
+      - name: Tag the version
+        id: tag
+        run: |
+          set -eu
+          VERSION=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          PY_VERSION=$(grep -m1 '^version = ' pyproject.toml | cut -d'"' -f2)
+          if [ "$VERSION" != "$PY_VERSION" ]; then
+            echo "Cargo.toml says $VERSION and pyproject.toml $PY_VERSION." >&2
+            exit 1
+          fi
+          TAG="v$VERSION"
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            echo "$TAG is already released, at $(git rev-list -n1 "$TAG" | cut -c1-7)." >&2
+            echo "Bump the version in a release commit on main, then push main:deploy again." >&2
+            exit 1
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "moonclip $VERSION"
+          git push origin "refs/tags/$TAG"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "tagged $TAG at $(git rev-parse --short HEAD)"
+
+  # Called rather than triggered: a tag pushed with the job token starts no
+  # other workflow, so the tag above would otherwise publish nothing.
+  release:
+    needs: tag
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ needs.tag.outputs.tag }}
+    secrets: inherit
