@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **A store written with temporary credentials can be restored on R2
+  (GPU-217).** R2 refuses the session token in the query of a listing
+  ("ListObjectsV2 search parameter X-Amz-Security-Token not implemented"),
+  and takes it as a signed header of a presigned URL on no request, so a
+  store saved with keys scoped to its bucket could not be listed, restored
+  or pruned. With a session token, a listing of the bucket is now signed in
+  the `Authorization` header with the token as `x-amz-security-token`;
+  every other request is still a presigned URL. `rusty-s3` 0.10 signs only
+  those, so this SigV4 is our own, checked against AWS's example and on R2.
+  `hmac` and `sha2` are dependencies again, at the versions `rusty-s3`
+  already brings.
+
 ## 0.2.0 — 2026-10-13
 
 ### Changed

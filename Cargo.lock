@@ -464,12 +464,14 @@ name = "moonclip"
 version = "0.2.0"
 dependencies = [
  "chrono",
+ "hmac",
  "jiff",
  "pyo3",
  "rayon",
  "rusty-s3",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror 1.0.69",
  "ureq",

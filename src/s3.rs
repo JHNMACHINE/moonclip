@@ -11,7 +11,10 @@
 //!
 //! Every request is a **presigned URL**: the signature is in its query
 //! string, made the moment the request is sent, and the body is not hashed
-//! into it (`UNSIGNED-PAYLOAD`). Integrity is covered a layer up - every
+//! into it (`UNSIGNED-PAYLOAD`). One exception: a listing with temporary
+//! credentials is signed in the `Authorization` header, by a small SigV4 of
+//! our own, because R2 refuses the session token in a listing's query and
+//! `rusty-s3` signs only presigned URLs (`S3Storage::listed`). Integrity is covered a layer up - every
 //! tensor carries its own hash in the manifest - as it was before.
 //!
 //! # What is not covered
@@ -24,7 +27,8 @@
 //! * **Temporary credentials** *are* covered since 0.2: a session token
 //!   ([`S3Config::session_token`]) goes into every signature, which is what
 //!   short-lived credentials scoped to a prefix need. Refreshing them is the
-//!   caller's: one that expires mid-run fails like a wrong key.
+//!   caller's: one that expires mid-run fails like a wrong key. Checked on
+//!   R2 itself, where a listing needs the token in a header (0.2.1).
 //! * **Very large objects.** Handled, but by a second path worth knowing
 //!   about: past `SINGLE_PUT_LIMIT` a write becomes a multipart upload rather
 //!   than one `PUT`, because S3 refuses a single `PUT` over 5 GiB and a
@@ -47,6 +51,8 @@
 use rusty_s3::{Bucket, Credentials, Method, UrlStyle};
 use std::fmt::Write as FmtWrite;
 use url::Url;
+use hmac::{Hmac, KeyInit, Mac};
+use sha2::{Digest, Sha256};
 
 use crate::error::{Result, MoonclipError};
 use crate::storage::StorageBackend;
@@ -291,6 +297,40 @@ impl S3Storage {
         }
     }
 
+    /// A listing of the bucket with temporary credentials, signed in the
+    /// `Authorization` header rather than in the query (GPU-217).
+    ///
+    /// R2 refuses `X-Amz-Security-Token` as a query parameter of a listing -
+    /// "ListObjectsV2 search parameter X-Amz-Security-Token not implemented",
+    /// and the same of V1 - while it takes it there on every other request,
+    /// and takes the token as a signed header of a presigned URL on none. So a
+    /// store written with keys scoped to its bucket could be saved and never
+    /// restored. `rusty-s3` 0.10 signs presigned URLs only, so this one kind
+    /// of request is signed here: SigV4 in its header form, checked against
+    /// AWS's own example below.
+    fn listed(&self, query: &[(&str, &str)]) -> std::result::Result<ureq::Response, MoonclipError> {
+        let mut url = self
+            .bucket
+            .object_url("")
+            .map_err(|e| MoonclipError::Storage(format!("S3 bucket address: {e}")))?;
+        let stamp = jiff::Timestamp::now().strftime("%Y%m%dT%H%M%SZ").to_string();
+        let (query_string, headers) = header_signed(
+            &url,
+            query,
+            &stamp,
+            self.bucket.region(),
+            self.credentials.key(),
+            self.credentials.secret(),
+            self.credentials.token(),
+        );
+        url.set_query(if query_string.is_empty() { None } else { Some(&query_string) });
+        let mut request = self.agent.get(url.as_str());
+        for (name, value) in &headers {
+            request = request.set(name, value);
+        }
+        request.call().map_err(|e| status_error("", e))
+    }
+
     fn attempt_request(
         &self,
         method: &str,
@@ -298,6 +338,9 @@ impl S3Storage {
         body: Option<&[u8]>,
         query_params: &[(&str, &str)],
     ) -> std::result::Result<ureq::Response, MoonclipError> {
+        if method == "GET" && key.is_empty() && self.config.session_token.is_some() {
+            return self.listed(query_params);
+        }
         let url = self.signed_url(method, key, query_params)?;
         // Nothing to set beyond the URL: the signature covers only the host,
         // and ureq sends that and the body's length on its own.
@@ -739,6 +782,91 @@ fn extract_xml_value(xml: &str, tag: &str) -> Option<String> {
     extract_xml_values(xml, tag).into_iter().next()
 }
 
+// ─── SigV4 in the Authorization header (GPU-217) ────────────────────
+
+/// The SHA-256 of nothing: a listing has no body.
+const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+/// SigV4 in its header form for a `GET` with no body, used only where a
+/// presigned URL cannot carry what the request needs (see
+/// `S3Storage::listed`). Returns the canonical query string, which the URL
+/// must carry exactly, and the headers to send, `Authorization` among them;
+/// `host` is signed but not returned, since the client sends it from the URL.
+fn header_signed(
+    url: &Url,
+    query: &[(&str, &str)],
+    stamp: &str,
+    region: &str,
+    key: &str,
+    secret: &str,
+    token: Option<&str>,
+) -> (String, Vec<(&'static str, String)>) {
+    let mut pairs: Vec<(String, String)> = query.iter().map(|(k, v)| (aws_encode(k), aws_encode(v))).collect();
+    pairs.sort();
+    let query_string = pairs.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("&");
+    let host = match url.port() {
+        Some(port) => format!("{}:{port}", url.host_str().unwrap_or_default()),
+        None => url.host_str().unwrap_or_default().to_string(),
+    };
+    let mut signed: Vec<(&'static str, String)> = vec![
+        ("host", host),
+        ("x-amz-content-sha256", EMPTY_SHA256.to_string()),
+        ("x-amz-date", stamp.to_string()),
+    ];
+    if let Some(token) = token {
+        signed.push(("x-amz-security-token", token.to_string()));
+    }
+    let names = signed.iter().map(|(name, _)| *name).collect::<Vec<_>>().join(";");
+
+    let mut canonical = format!("GET\n{}\n{}\n", url.path(), query_string);
+    for (name, value) in &signed {
+        let _ = writeln!(canonical, "{name}:{}", value.trim());
+    }
+    let _ = write!(canonical, "\n{names}\n{EMPTY_SHA256}");
+
+    let day = &stamp[..8];
+    let scope = format!("{day}/{region}/s3/aws4_request");
+    let to_sign = format!("AWS4-HMAC-SHA256\n{stamp}\n{scope}\n{}", hex(&Sha256::digest(canonical.as_bytes())));
+    let mut signing = hmac(format!("AWS4{secret}").as_bytes(), day.as_bytes());
+    for part in [region, "s3", "aws4_request"] {
+        signing = hmac(&signing, part.as_bytes());
+    }
+    let signature = hex(&hmac(&signing, to_sign.as_bytes()));
+
+    let mut headers: Vec<(&'static str, String)> = signed.into_iter().filter(|(name, _)| *name != "host").collect();
+    headers.push((
+        "Authorization",
+        format!("AWS4-HMAC-SHA256 Credential={key}/{scope}, SignedHeaders={names}, Signature={signature}"),
+    ));
+    (query_string, headers)
+}
+
+/// Percent-encoding as SigV4 wants it: every byte but the unreserved ones.
+fn aws_encode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            out.push(byte as char);
+        } else {
+            let _ = write!(out, "%{byte:02X}");
+        }
+    }
+    out
+}
+
+fn hmac(key: &[u8], data: &[u8]) -> Vec<u8> {
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC takes a key of any length");
+    mac.update(data);
+    mac.finalize().into_bytes().to_vec()
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().fold(String::with_capacity(bytes.len() * 2), |mut out, byte| {
+        let _ = write!(out, "{byte:02x}");
+        out
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -973,6 +1101,50 @@ mod tests {
 
     /// Long-lived keys sign without a token; temporary credentials put
     /// theirs in every request, inside what is signed.
+    #[test]
+    fn a_listing_signed_in_its_header_matches_aws_example() {
+        // "GET Bucket (List Objects)" in AWS's Signature Version 4 examples
+        // for the Authorization header.
+        let url = Url::parse("https://examplebucket.s3.amazonaws.com/").unwrap();
+        let (query, headers) = header_signed(
+            &url,
+            &[("prefix", "J"), ("max-keys", "2")],
+            "20130524T000000Z",
+            "us-east-1",
+            "AKIAIOSFODNN7EXAMPLE",
+            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            None,
+        );
+        assert_eq!(query, "max-keys=2&prefix=J");
+        let authorization = &headers.iter().find(|(name, _)| *name == "Authorization").unwrap().1;
+        assert_eq!(
+            authorization,
+            "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, \
+             SignedHeaders=host;x-amz-content-sha256;x-amz-date, \
+             Signature=34b48302e7b5fa45bde8084f4b7868a86f0a534bc59db6670ed5711ef69dc6f7"
+        );
+    }
+
+    #[test]
+    fn a_listing_with_a_session_token_signs_it_as_a_header() {
+        let url = Url::parse("https://acct.r2.cloudflarestorage.com/bucket/").unwrap();
+        let (query, headers) = header_signed(
+            &url,
+            &[("list-type", "2"), ("prefix", "runs/a b")],
+            "20261014T120000Z",
+            "auto",
+            "key",
+            "secret",
+            Some("session/token+1"),
+        );
+        assert_eq!(query, "list-type=2&prefix=runs%2Fa%20b");
+        assert!(!query.contains("Security-Token"), "never in the query: R2 refuses it there");
+        let names: Vec<&str> = headers.iter().map(|(name, _)| *name).collect();
+        assert!(names.contains(&"x-amz-security-token"));
+        let authorization = &headers.iter().find(|(name, _)| *name == "Authorization").unwrap().1;
+        assert!(authorization.contains("SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-security-token,"));
+    }
+
     #[test]
     fn a_session_token_goes_into_every_signature() {
         let plain = S3Storage::new(config(None, false)).unwrap();

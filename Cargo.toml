@@ -64,6 +64,11 @@ ureq = "2"
 rusty-s3 = { version = "0.10.2", default-features = false, features = ["rustcrypto"] }
 url = "2"
 jiff = { version = "0.2", default-features = false, features = ["std"] }
+# SigV4 in the Authorization header, for the one request a presigned URL
+# cannot make: a listing with temporary credentials on R2 (GPU-217). The
+# versions rusty-s3 already brings, so nothing new is built.
+hmac = "0.13"
+sha2 = "0.11"
 
 [[bench]]
 name = "delta_bench"
