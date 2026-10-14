@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.1 — 2026-10-14
 
 ### Fixed
 
@@ -15,6 +15,13 @@
   those, so this SigV4 is our own, checked against AWS's example and on R2.
   `hmac` and `sha2` are dependencies again, at the versions `rusty-s3`
   already brings.
+
+### Security
+
+- **The TLS stack is current.** `ureq` 2.12 with `rustls` 0.23,
+  `rustls-webpki` 0.103 and `ring` 0.17: the versions before carried
+  advisories on certificate name constraints and an unmaintained `ring`.
+  `cargo audit` reports nothing.
 
 ## 0.2.0 — 2026-10-13
 
