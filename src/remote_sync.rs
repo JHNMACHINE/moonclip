@@ -95,7 +95,13 @@ const MANIFEST: &str = "manifest.json";
 
 enum SyncCommand {
     /// Sync all files under the given prefix to remote.
-    SyncPrefix(String),
+    SyncPrefix {
+        prefix: String,
+        /// Whether a sync that went well stays out of the log. Set for the
+        /// caller's own files ([`RemoteSyncer::sync_prefix`]), clear for the
+        /// periodic checkpoint sync. See [`verbose_logging`].
+        quiet: bool,
+    },
     /// Force sync everything, reporting the outcome back to the caller.
     SyncAll(mpsc::Sender<Option<String>>),
     /// Shutdown.
@@ -142,7 +148,7 @@ impl RemoteSyncer {
                 let mut life = crate::merger::ThreadLife::new(dead_worker);
                 for cmd in rx {
                     match cmd {
-                        SyncCommand::SyncPrefix(prefix) => {
+                        SyncCommand::SyncPrefix { prefix, quiet } => {
                             // Caught for the same reason the saver and the
                             // merger catch: a panic here killed this thread,
                             // the receiver dropped, and `notify_save` went on
@@ -157,7 +163,11 @@ impl RemoteSyncer {
                                 result
                             }));
                             match outcome {
-                                Ok(Ok(())) => {}
+                                Ok(Ok(copied)) => {
+                                    if !quiet || verbose_logging() {
+                                        copied.log(&prefix);
+                                    }
+                                }
                                 Ok(Err(e)) => {
                                     eprintln!("[Moonclip sync] Error syncing '{}': {}", prefix, e)
                                 }
@@ -233,9 +243,17 @@ impl RemoteSyncer {
         if count % self.sync_every == 0 {
             if let Some(ref tx) = self.sender {
                 let tx = tx.lock().unwrap();
-                // Sync snapshots and manifest
-                let snapshots = tx.send(SyncCommand::SyncPrefix("snapshots".into()));
-                let manifest = tx.send(SyncCommand::SyncPrefix(MANIFEST.into()));
+                // Sync snapshots and manifest. Not quiet: this is one line per
+                // checkpoint, which is rare and is the only sign in a job's
+                // log that the bucket has it.
+                let snapshots = tx.send(SyncCommand::SyncPrefix {
+                    prefix: "snapshots".into(),
+                    quiet: false,
+                });
+                let manifest = tx.send(SyncCommand::SyncPrefix {
+                    prefix: MANIFEST.into(),
+                    quiet: false,
+                });
                 // A failed send means the receiver is gone, which means the
                 // worker is. Recorded rather than discarded: this call is on
                 // the save path and cannot fail loudly, but a syncer that is
@@ -264,6 +282,10 @@ impl RemoteSyncer {
     /// Runs on the syncer's own thread, in order with the periodic syncs and
     /// `sync_now`. A failure is logged there, as the periodic one's is. An
     /// `Err` here means only that the syncer is gone.
+    ///
+    /// A sync that went well says nothing, unless `MOONCLIP_LOG=debug`. Ravex
+    /// calls this for every metrics chunk, every 15 s, and a line for each was
+    /// 240 lines an hour of "Copied 1 files" burying the job's own (GPU-208).
     pub fn sync_prefix(&self, prefix: &str) -> Result<()> {
         let Some(ref tx) = self.sender else {
             return Ok(());
@@ -271,7 +293,10 @@ impl RemoteSyncer {
         if tx
             .lock()
             .unwrap()
-            .send(SyncCommand::SyncPrefix(prefix.to_string()))
+            .send(SyncCommand::SyncPrefix {
+                prefix: prefix.to_string(),
+                quiet: true,
+            })
             .is_err()
         {
             self.dead.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -386,8 +411,9 @@ fn apply_deletes(remote: &Arc<dyn StorageBackend>, deletes: &Arc<PendingDeletes>
 /// which costs some progress, while a manifest that arrived early is a
 /// checkpoint that does not load at all.
 fn sync_store(from: &Arc<dyn StorageBackend>, to: &Arc<dyn StorageBackend>) -> Result<()> {
-    sync_prefix_skipping(from, to, "", &[MANIFEST])?;
-    sync_prefix(from, to, MANIFEST)
+    sync_prefix_skipping(from, to, "", &[MANIFEST])?.log("");
+    sync_prefix(from, to, MANIFEST)?.log(MANIFEST);
+    Ok(())
 }
 
 /// Copy every file under `prefix` from one store to another.
@@ -406,7 +432,7 @@ fn sync_prefix(
     from: &Arc<dyn StorageBackend>,
     to: &Arc<dyn StorageBackend>,
     prefix: &str,
-) -> Result<()> {
+) -> Result<Copied> {
     sync_prefix_skipping(from, to, prefix, &[])
 }
 
@@ -419,15 +445,18 @@ fn sync_prefix_skipping(
     to: &Arc<dyn StorageBackend>,
     prefix: &str,
     skip: &[&str],
-) -> Result<()> {
+) -> Result<Copied> {
     // Special case: single file (e.g. "manifest.json")
     if !prefix.is_empty() && !prefix.contains('/') && prefix.contains('.') {
         match from.get(prefix) {
             Ok(data) => {
                 to.put_exact(prefix, &data)?;
-                return Ok(());
+                // Not counted: the manifest is rewritten every save, and a
+                // "Copied 1 files" for it said nothing the snapshots line had
+                // not already said. It never printed one, and still does not.
+                return Ok(Copied::default());
             }
-            Err(MoonclipError::NotFound(_)) => return Ok(()),
+            Err(MoonclipError::NotFound(_)) => return Ok(Copied::default()),
             Err(e) => return Err(e),
         }
     }
@@ -474,14 +503,54 @@ fn sync_prefix_skipping(
         synced += 1;
     }
 
-    if synced > 0 || vanished > 0 {
-        eprintln!(
-            "[Moonclip sync] Copied {} files, skipped {}, {} deleted since listed (prefix: '{}')",
-            synced, skipped, vanished, prefix
-        );
-    }
+    Ok(Copied {
+        synced,
+        skipped,
+        vanished,
+    })
+}
 
-    Ok(())
+/// What one walk of [`sync_prefix_skipping`] did.
+///
+/// Returned rather than printed where it happens, because whether it belongs
+/// in the log depends on who asked for the walk, which the walk does not know:
+/// a checkpoint's sync is worth a line, a metrics chunk's is not (GPU-208).
+/// Errors take the other road, as `Err`, and are always printed.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Copied {
+    synced: u64,
+    skipped: u64,
+    vanished: u64,
+}
+
+impl Copied {
+    /// One line on stderr, if the walk moved anything or lost a file to a
+    /// concurrent delete. A walk that found everything already there is the
+    /// steady state and says nothing.
+    fn log(&self, prefix: &str) {
+        if self.synced > 0 || self.vanished > 0 {
+            eprintln!(
+                "[Moonclip sync] Copied {} files, skipped {}, {} deleted since listed (prefix: '{}')",
+                self.synced, self.skipped, self.vanished, prefix
+            );
+        }
+    }
+}
+
+/// Whether syncs that went well are logged even when they asked to be quiet.
+///
+/// `MOONCLIP_LOG=debug` turns it on. Off by default, because the quiet syncs
+/// are the ones a caller makes for its own files, and Ravex makes one per
+/// metrics chunk (GPU-208). Read once, like `MOONCLIP_PROFILE`.
+fn verbose_logging() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| is_debug_level(std::env::var("MOONCLIP_LOG").ok().as_deref()))
+}
+
+/// The parsing half of [`verbose_logging`], apart so it can be tested
+/// without touching the process environment.
+fn is_debug_level(value: Option<&str>) -> bool {
+    value.is_some_and(|v| v.trim().eq_ignore_ascii_case("debug"))
 }
 
 /// Pull a store back from the remote onto a machine that has none.
@@ -505,7 +574,7 @@ pub fn restore_from_remote(
     // The manifest first and on its own: without it the snapshot files are
     // bytes nothing names, and if it never arrives there is nothing to restore
     // and no reason to pay for the rest.
-    sync_prefix(remote, local, MANIFEST)?;
+    sync_prefix(remote, local, MANIFEST)?.log(MANIFEST);
     if !local.exists(MANIFEST).unwrap_or(false) {
         return Ok(false);
     }
@@ -515,7 +584,7 @@ pub fn restore_from_remote(
     // and leaving them behind makes a restored store subtly different from the
     // one that was pushed. What they mean is the caller's business; that they
     // come back is not.
-    sync_prefix_skipping(remote, local, "", &[MANIFEST])?;
+    sync_prefix_skipping(remote, local, "", &[MANIFEST])?.log("");
     Ok(true)
 }
 
@@ -1111,5 +1180,63 @@ mod tests {
             !local.exists("snapshots/aaa/rank_0.pack").unwrap_or(false),
             "and no reason to have paid for the download"
         );
+    }
+
+    /// GPU-208: the walk hands back what it did instead of printing it, so
+    /// the caller can keep a metrics chunk's sync out of the log. The counts
+    /// have to be right for the line a checkpoint's sync still prints.
+    #[test]
+    fn a_sync_reports_what_it_copied_and_skipped() {
+        let src_dir = tempfile::tempdir().unwrap();
+        let dst_dir = tempfile::tempdir().unwrap();
+        let src: Arc<dyn StorageBackend> =
+            Arc::new(LocalStorage::new_unaligned(src_dir.path()).unwrap());
+        let dst: Arc<dyn StorageBackend> =
+            Arc::new(LocalStorage::new_unaligned(dst_dir.path()).unwrap());
+
+        src.put("metrics/x/000000.jsonl", b"{}\n").unwrap();
+        let first = sync_prefix(&src, &dst, "metrics/x").unwrap();
+        assert_eq!(first, Copied { synced: 1, skipped: 0, vanished: 0 });
+
+        src.put("metrics/x/000001.jsonl", b"{}\n").unwrap();
+        let second = sync_prefix(&src, &dst, "metrics/x").unwrap();
+        assert_eq!(second, Copied { synced: 1, skipped: 1, vanished: 0 });
+    }
+
+    /// Only `debug` turns the quiet syncs' lines back on; anything else, or
+    /// nothing, leaves them off.
+    #[test]
+    fn moonclip_log_debug_is_the_only_verbose_setting() {
+        assert!(is_debug_level(Some("debug")));
+        assert!(is_debug_level(Some("DEBUG")));
+        assert!(is_debug_level(Some(" debug ")));
+        assert!(!is_debug_level(None));
+        assert!(!is_debug_level(Some("")));
+        assert!(!is_debug_level(Some("info")));
+        assert!(!is_debug_level(Some("1")));
+    }
+
+    /// A quiet sync is quiet only in the log: the caller's files still reach
+    /// the remote.
+    #[test]
+    fn a_quiet_sync_still_uploads() {
+        let local_dir = tempfile::tempdir().unwrap();
+        let remote_dir = tempfile::tempdir().unwrap();
+        let local: Arc<dyn StorageBackend> =
+            Arc::new(LocalStorage::new_unaligned(local_dir.path()).unwrap());
+        let remote: Arc<dyn StorageBackend> =
+            Arc::new(LocalStorage::new_unaligned(remote_dir.path()).unwrap());
+        local.put("metrics/x/000000.jsonl", b"{}\n").unwrap();
+
+        let mut syncer = RemoteSyncer::new(
+            Arc::clone(&local),
+            Arc::clone(&remote),
+            RemoteSyncConfig::default(),
+            nothing_deleted(),
+        );
+        syncer.sync_prefix("metrics/x/000000.jsonl").unwrap();
+        syncer.shutdown();
+
+        assert_eq!(remote.get("metrics/x/000000.jsonl").unwrap(), b"{}\n");
     }
 }

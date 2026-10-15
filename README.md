@@ -155,6 +155,7 @@ Three environment variables, none required:
 | `MOONCLIP_THREADS` | Size of Moonclip's thread pool. Default: `cores / LOCAL_WORLD_SIZE`. |
 | `MOONCLIP_PROFILE=1` | Per-phase breakdown of the save path on stderr, plus a line whenever a save had to wait for the previous one to drain. |
 | `MOONCLIP_FSYNC=0` | Skip the `fsync` before a pack is renamed into place. Faster, and a machine that loses power mid-save can then come back holding a pack of the right length full of zeros — which the manifest vouches for. Only worth it where the checkpoint is not the thing being protected. |
+| `MOONCLIP_LOG=debug` | Also log the syncs a caller asks for with `sync_prefix` when they go well. Off by default, because Ravex makes one per metrics chunk; errors and the periodic checkpoint sync are logged either way. |
 
 The parallel work runs in a pool of Moonclip's own, not rayon's global one, so it
 neither claims every core on the machine nor competes with your application's

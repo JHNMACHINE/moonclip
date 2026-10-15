@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- **A caller's `sync_prefix` no longer prints a line when it goes well
+  (GPU-208).** Ravex syncs every metrics chunk this way, every 15 s, and
+  each sync wrote `[Moonclip sync] Copied 1 files ...` to stderr: some 240
+  lines an hour that buried the job's own. Errors are still printed, every
+  time, and the periodic checkpoint sync keeps its one line per checkpoint.
+  `MOONCLIP_LOG=debug` brings the quiet lines back.
+
 ## 0.2.1 — 2026-10-14
 
 ### Fixed
