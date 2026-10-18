@@ -20,7 +20,7 @@ use crate::tensor::{self, BaseCache, TensorData};
 mod recovery;
 mod saver;
 
-use recovery::{load_manifest, recover_or_reclaim_orphans, snapshot_is_whole};
+use recovery::{files_of, load_manifest, recover_or_reclaim_orphans, snapshot_is_reachable};
 use saver::{AsyncSaver, SaveJob};
 
 /// Where pins live besides the manifest (GPU-154, and GPU-149 for why).
@@ -475,6 +475,12 @@ impl Coordinator {
     /// knows whether this run means to resume, and a whole checkpoint coming
     /// down the wire is not something to discover by having built a manager.
     ///
+    /// What comes down is the manifest, every file beside the snapshots, and
+    /// the newest snapshot with its base: what a resume loads (GPU-239). Every
+    /// other snapshot the manifest names stays in the bucket, still named, and
+    /// [`Self::load`] or [`Self::load_tensors`] fetches it when asked. A store
+    /// with a merger gets everything, since a merge reads from this disk.
+    ///
     /// See [`crate::remote_sync::restore_from_remote`] for what the gap cost
     /// before this existed.
     pub fn restore_from_remote(&self) -> Result<bool> {
@@ -881,7 +887,68 @@ impl Core {
     }
 
     fn load(&self, snap_id: Uuid) -> Result<HashMap<String, Vec<u8>>> {
+        // Fetched here, outside the pool: a rayon worker waiting on the
+        // network holds a thread the load's own tensors need. The pin taken
+        // for the fetch outlives it, and `load_in_pool` nests its own inside.
+        let _pin = self.pin_and_fetch(snap_id)?;
         crate::pool::install(move || self.load_in_pool(snap_id))
+    }
+
+    /// Pin `snap_id` and its base, and bring down whatever of their files for
+    /// this rank is not on this disk. The guard holds the pin.
+    ///
+    /// GPU-239: a restore brings down only the newest snapshot and its base,
+    /// so an older one, a fork's step, say, is in the bucket and not here.
+    /// Pinned before the fetch, so retention cannot drop it from the manifest
+    /// and unlink it under the download.
+    fn pin_and_fetch(&self, snap_id: Uuid) -> Result<crate::inflight::PinGuard> {
+        let manifest = self.lock_manifest();
+        let snap = manifest
+            .find_snapshot(snap_id)
+            .ok_or_else(|| MoonclipError::NotFound(format!("Snapshot {snap_id}")))?
+            .clone();
+        let base = snap
+            .base_snapshot_id
+            .and_then(|id| manifest.find_snapshot(id).cloned());
+        let mut pinned = vec![snap.id];
+        pinned.extend(snap.base_snapshot_id);
+        let pin = self.in_flight.pin(&pinned);
+        drop(manifest);
+
+        let mut wanted = vec![snap];
+        wanted.extend(base);
+        self.fetch_absent(&wanted)?;
+        Ok(pin)
+    }
+
+    /// Bring down from the remote the files of `snapshots` this rank reads
+    /// and this disk does not have (GPU-239).
+    ///
+    /// With no remote there is nowhere to fetch from, and a missing file is
+    /// the `NotFound` the read will raise, as it always was. A file the
+    /// remote does not have either is left to the same read, which says
+    /// which one.
+    fn fetch_absent(&self, snapshots: &[Snapshot]) -> Result<()> {
+        let Some(remote) = self.config.remote_storage.as_ref() else {
+            return Ok(());
+        };
+        let absent: Vec<(String, Option<u64>)> = snapshots
+            .iter()
+            .flat_map(|snap| files_of(snap, Some(self.config.rank)))
+            .filter(|file| !self.storage.exists(file).unwrap_or(false))
+            .map(|file| (file, None))
+            .collect();
+        if absent.is_empty() {
+            return Ok(());
+        }
+        crate::remote_sync::copy_files(
+            remote,
+            &self.storage,
+            &absent,
+            crate::remote_sync::TRANSFERS,
+            crate::remote_sync::IN_FLIGHT_BYTES,
+        )?;
+        Ok(())
     }
 
     fn load_in_pool(&self, snap_id: Uuid) -> Result<HashMap<String, Vec<u8>>> {
@@ -1139,7 +1206,16 @@ impl Core {
         let mut pinned = vec![snap.id];
         pinned.extend(snap.base_snapshot_id);
         let _pin = self.in_flight.pin(&pinned);
+        let base = snap
+            .base_snapshot_id
+            .and_then(|id| manifest.find_snapshot(id).cloned());
         drop(manifest);
+        // The whole pack, not the spans: a ranged read from the bucket would
+        // need a reader that knows two places, and the pack is wanted again
+        // by whatever reads this step next (GPU-239).
+        let mut wanted = vec![snap.clone()];
+        wanted.extend(base);
+        self.fetch_absent(&wanted)?;
 
         let rank_entry = snap.ranks.get(&self.config.rank).ok_or_else(|| {
             MoonclipError::NotFound(format!(
@@ -1365,12 +1441,19 @@ impl Core {
         let Some(remote) = self.config.remote_storage.as_ref() else {
             return Ok(false);
         };
-        if !crate::remote_sync::restore_from_remote(&self.storage, remote)? {
+        if !crate::remote_sync::restore_manifest(&self.storage, remote)? {
             return Ok(false);
         }
         // The manifest in memory was read at construction, when the store was
         // empty. Everything downstream asks it, not the disk.
         let mut fresh = load_manifest(self.storage.as_ref(), &self.config)?;
+
+        // One listing of the bucket answers both questions below - what is
+        // reachable, and what to bring down - and is the list the copy works
+        // from, so none of it is asked twice.
+        let listing = remote.list_sized("")?;
+        let in_bucket: std::collections::HashSet<&str> =
+            listing.iter().map(|(key, _)| key.as_str()).collect();
 
         // And it is not to be trusted as it stands. `manifest.json` is
         // rewritten and re-uploaded on its own, while snapshot data goes up
@@ -1379,14 +1462,14 @@ impl Core {
         // restore succeeded and the first `load` then failed on a pack that
         // was in no bucket at all.
         //
-        // Dropping the entries whose files did not arrive turns that into a
-        // resume from an older step, which is the difference between losing
-        // some progress and losing the run.
+        // Dropping the entries whose files are in neither place turns that
+        // into a resume from an older step, which is the difference between
+        // losing some progress and losing the run.
         let before = fresh.snapshots.len();
         let storage = Arc::clone(&self.storage);
         fresh
             .snapshots
-            .retain(|snapshot| snapshot_is_whole(storage.as_ref(), snapshot));
+            .retain(|snapshot| snapshot_is_reachable(storage.as_ref(), &in_bucket, snapshot));
         // A delta is only as whole as its base. Its own pack can arrive while
         // the base's did not, and then it is listed, chosen as the newest step
         // and fails at the first load, which is the failure the filter above
@@ -1400,12 +1483,45 @@ impl Core {
         let dropped = before - fresh.snapshots.len();
         if dropped > 0 {
             eprintln!(
-                "[Moonclip] {dropped} snapshot(s) named by the remote manifest                  did not arrive with it and were left out; resuming from what did."
+                "[Moonclip] {dropped} snapshot(s) named by the remote manifest are in \
+                 neither the bucket nor here and were left out; resuming from what is."
             );
             if let Ok(json) = serde_json::to_vec_pretty(&fresh) {
                 let _ = self.storage.put("manifest.json", &json);
             }
         }
+
+        // What comes down now (GPU-239): every file beside the snapshots - a
+        // caller's own, Ravex's run record and metrics among them - and, of
+        // the snapshots, only the newest and the base it is computed against,
+        // which is what a resume loads. The rest stay in the bucket and a
+        // load fetches them when asked (`Core::fetch_absent`). With a delta
+        // per step that is 2 snapshots of 101: 5.8 MB of 290 on the bench of
+        // 2026-10-18. A merger folds snapshots it reads from this disk, so a
+        // store with one gets everything, as every store did before.
+        let wanted: Option<Vec<String>> = if self.merger.is_some() {
+            None
+        } else {
+            let newest = fresh.snapshots.iter().rev().find(|s| s.finalized);
+            Some(
+                newest
+                    .into_iter()
+                    .flat_map(|s| std::iter::once(s.id).chain(s.base_snapshot_id))
+                    .map(|id| format!("snapshots/{id}/"))
+                    .collect(),
+            )
+        };
+        let files: Vec<(String, Option<u64>)> = listing
+            .into_iter()
+            .filter(|(key, _)| key != "manifest.json")
+            .filter(|(key, _)| match &wanted {
+                None => true,
+                Some(dirs) => {
+                    !key.starts_with("snapshots/") || dirs.iter().any(|dir| key.starts_with(dir))
+                }
+            })
+            .collect();
+        crate::remote_sync::copy_absent(remote, &self.storage, "", files)?.log("");
 
         let usable = !fresh.snapshots.is_empty();
         *self.lock_manifest() = fresh;

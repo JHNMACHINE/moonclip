@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- **`restore_from_remote` brings down what a resume needs (GPU-239)**: the
+  manifest, every file beside the snapshots, and the newest snapshot with
+  its base. It brought down the whole bucket: with a delta per step that is
+  the whole window, 101 snapshots where a resume reads 2, 290 MB against
+  5.8 MB on the bench of 2026-10-18. Every other snapshot stays named in the
+  manifest, and `load` and `load_tensors` fetch one when it is asked for, so
+  a fork from any step of the window still works. A snapshot is dropped from
+  the restored manifest only when its files are in neither the bucket nor
+  the local store, where before anything not yet downloaded counted as
+  missing. A store with a merger still restores everything, since a merge
+  reads from the local disk.
+
 ## 0.2.3 — 2026-10-18
 
 ### Changed

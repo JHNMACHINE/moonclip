@@ -103,7 +103,7 @@ pub(crate) const TRANSFERS: usize = 8;
 /// not a speed-up but an out-of-memory kill. Small files share this; a file
 /// as large as this, or of a size the listing did not give, is copied alone,
 /// which is how every file was copied before.
-const IN_FLIGHT_BYTES: u64 = 1 << 30;
+pub(crate) const IN_FLIGHT_BYTES: u64 = 1 << 30;
 
 /// The one file that must never reach a destination ahead of the data it
 /// names.
@@ -499,8 +499,26 @@ fn sync_prefix_skipping(
         }
     }
 
-    let files = from.list_sized(prefix)?;
+    let files = from
+        .list_sized(prefix)?
+        .into_iter()
+        .filter(|(file, _)| !skip.contains(&file.as_str()))
+        .collect();
+    copy_absent(from, to, prefix, files)
+}
 
+/// Copy those of `files`, all under `prefix`, that `to` does not hold.
+///
+/// The second half of [`sync_prefix_skipping`], apart for the restore that
+/// chooses its own files from a listing it has already made (GPU-239): it
+/// lists the bucket once to decide what a resume needs, and listing it again
+/// to copy would be a second request for the same answer.
+pub(crate) fn copy_absent(
+    from: &Arc<dyn StorageBackend>,
+    to: &Arc<dyn StorageBackend>,
+    prefix: &str,
+    files: Vec<(String, Option<u64>)>,
+) -> Result<Copied> {
     // What the destination already holds, from one listing. It was an
     // `exists` per file, a request each: 303 of the 535 a node sent its bucket
     // closing a toy run, on 2026-10-18 (GPU-235). A listing that fails puts
@@ -512,9 +530,6 @@ fn sync_prefix_skipping(
     let mut skipped = 0u64;
     let mut missing = Vec::new();
     for (file, size) in files {
-        if skip.contains(&file.as_str()) {
-            continue;
-        }
         let there = match &present {
             Some(keys) => keys.contains(&file),
             None => matches!(to.exists(&file), Ok(true)),
@@ -543,7 +558,7 @@ fn sync_prefix_skipping(
 /// worker blocked on the budget could hold the work that would free it. The
 /// first error stops the files not yet started and is returned once the
 /// others have finished, so a failed sync is reported as one, as before.
-fn copy_files(
+pub(crate) fn copy_files(
     from: &Arc<dyn StorageBackend>,
     to: &Arc<dyn StorageBackend>,
     files: &[(String, Option<u64>)],
@@ -663,7 +678,7 @@ impl Drop for Held<'_> {
 /// a checkpoint's sync is worth a line, a metrics chunk's is not (GPU-208).
 /// Errors take the other road, as `Err`, and are always printed.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-struct Copied {
+pub(crate) struct Copied {
     synced: u64,
     skipped: u64,
     vanished: u64,
@@ -673,7 +688,7 @@ impl Copied {
     /// One line on stderr, if the walk moved anything or lost a file to a
     /// concurrent delete. A walk that found everything already there is the
     /// steady state and says nothing.
-    fn log(&self, prefix: &str) {
+    pub(crate) fn log(&self, prefix: &str) {
         if self.synced > 0 || self.vanished > 0 {
             eprintln!(
                 "[Moonclip sync] Copied {} files, skipped {}, {} deleted since listed (prefix: '{}')",
@@ -717,11 +732,7 @@ pub fn restore_from_remote(
     local: &Arc<dyn StorageBackend>,
     remote: &Arc<dyn StorageBackend>,
 ) -> Result<bool> {
-    // The manifest first and on its own: without it the snapshot files are
-    // bytes nothing names, and if it never arrives there is nothing to restore
-    // and no reason to pay for the rest.
-    sync_prefix(remote, local, MANIFEST)?.log(MANIFEST);
-    if !local.exists(MANIFEST).unwrap_or(false) {
+    if !restore_manifest(local, remote)? {
         return Ok(false);
     }
 
@@ -732,6 +743,21 @@ pub fn restore_from_remote(
     // come back is not.
     sync_prefix_skipping(remote, local, "", &[MANIFEST])?.log("");
     Ok(true)
+}
+
+/// Bring the remote's manifest down, alone. Whether one arrived.
+///
+/// The manifest first and on its own: without it the snapshot files are
+/// bytes nothing names, and if it never arrives there is nothing to restore
+/// and no reason to pay for the rest. What else comes after it is the
+/// caller's choice: everything in [`restore_from_remote`], what a resume
+/// needs in the coordinator's (GPU-239).
+pub(crate) fn restore_manifest(
+    local: &Arc<dyn StorageBackend>,
+    remote: &Arc<dyn StorageBackend>,
+) -> Result<bool> {
+    sync_prefix(remote, local, MANIFEST)?.log(MANIFEST);
+    Ok(local.exists(MANIFEST).unwrap_or(false))
 }
 
 #[cfg(test)]

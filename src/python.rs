@@ -644,21 +644,25 @@ impl MoonclipManager {
         Ok(())
     }
 
-    /// Push everything to remote storage and wait for it.
-    ///
-    /// Raises if the data did not reach the remote, rather than logging and
-    /// returning: a run whose checkpoints are not leaving the machine should
-    /// find out while it can still do something about it.
     /// Pull this store back from the remote. Returns whether anything came.
     ///
     /// For a machine that came up without the store it had — replaced after a
     /// preemption, or simply given a different rank than last time. Until
     /// 2026-08-19 the remote was push-only, so the bucket held the checkpoint
     /// and no path led back to it.
+    ///
+    /// Brings down the manifest, the files beside the snapshots and the newest
+    /// snapshot with its base; any other snapshot comes down when it is loaded
+    /// (GPU-239).
     fn restore_from_remote(&self, py: Python<'_>) -> PyResult<bool> {
         Ok(py.detach(|| self.inner.restore_from_remote())?)
     }
 
+    /// Push everything to remote storage and wait for it.
+    ///
+    /// Raises if the data did not reach the remote, rather than logging and
+    /// returning: a run whose checkpoints are not leaving the machine should
+    /// find out while it can still do something about it.
     fn sync_now(&self, py: Python<'_>) -> PyResult<()> {
         py.detach(|| self.inner.sync_now())?;
         Ok(())

@@ -2655,3 +2655,139 @@ fn a_delta_whose_base_never_reached_the_remote_is_left_out() {
     assert!(!usable, "nothing here can be loaded, so nothing should be claimed");
     assert!(coord.list_snapshots().is_empty());
 }
+
+// ─── a restore that brings down what a resume needs (GPU-239) ───────
+
+/// A new disk, pulled back from `remote` with `config`.
+fn restored(
+    config: CoordinatorConfig,
+) -> (tempfile::TempDir, Arc<dyn StorageBackend>, Coordinator) {
+    let disk = tempfile::tempdir().unwrap();
+    let local: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(disk.path()).unwrap());
+    let coord = Coordinator::new(Arc::clone(&local), config).unwrap();
+    assert!(coord.restore_from_remote().unwrap());
+    (disk, local, coord)
+}
+
+fn is_here(storage: &Arc<dyn StorageBackend>, id: &Uuid) -> bool {
+    !snapshot_files(storage.as_ref(), &id.to_string()).is_empty()
+}
+
+/// The restore brings down the newest snapshot and its base and no other,
+/// the manifest still names all five, and an older step comes down when it
+/// is loaded.
+#[test]
+fn a_restore_brings_down_the_newest_step_and_its_base_and_the_rest_on_load() {
+    let remote_dir = tempfile::tempdir().unwrap();
+    let remote: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(remote_dir.path()).unwrap());
+    let (_old_disk, ids) = push_base_and_deltas(&remote);
+
+    let (_disk, local, coord) = restored(remote_config(&remote));
+
+    assert_eq!(coord.list_snapshots().len(), 5, "the manifest names every step");
+    let here: Vec<bool> = ids.iter().map(|id| is_here(&local, id)).collect();
+    assert_eq!(here, vec![true, false, false, false, true]);
+
+    let state = coord.load(ids[2]).unwrap();
+    assert_eq!(state["w"], evolving_state(2)[0].data);
+    assert!(is_here(&local, &ids[2]), "a loaded step stays on the disk");
+}
+
+/// After a restore that left most snapshots in the bucket, a run that saves
+/// and syncs leaves the bucket naming every file it holds: nothing dropped
+/// from the manifest while its packs stay behind, billed and unreachable.
+#[test]
+fn the_bucket_still_names_every_snapshot_after_a_targeted_restore() {
+    let remote_dir = tempfile::tempdir().unwrap();
+    let remote: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(remote_dir.path()).unwrap());
+    let (_old_disk, ids) = push_base_and_deltas(&remote);
+
+    let (_disk, _local, coord) = restored(remote_config(&remote));
+    coord.save(5, evolving_state(5), HashMap::new()).unwrap();
+    coord.flush().unwrap();
+    coord.sync_now().unwrap();
+    drop(coord);
+
+    let (_third, _l, again) = restored(remote_config(&remote));
+    let named: std::collections::HashSet<String> =
+        again.list_snapshots().iter().map(|s| s.id.to_string()).collect();
+    for id in &ids {
+        assert!(named.contains(&id.to_string()), "{id} is no longer named");
+    }
+    let in_bucket: std::collections::HashSet<String> = remote
+        .list("snapshots")
+        .unwrap()
+        .iter()
+        .filter_map(|f| f.split('/').nth(1).map(str::to_string))
+        .collect();
+    assert_eq!(in_bucket, named, "the bucket holds snapshots its manifest does not name");
+}
+
+/// Retention dropping a snapshot that was never brought down still deletes
+/// it from the bucket: the delete goes by the manifest, not by this disk.
+#[test]
+fn retention_deletes_from_the_bucket_a_snapshot_that_never_came_down() {
+    let remote_dir = tempfile::tempdir().unwrap();
+    let remote: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(remote_dir.path()).unwrap());
+    // The cap from the first save: a restored store keeps the retention its
+    // manifest was written with.
+    let capped = || {
+        let mut config = remote_config(&remote);
+        config.retention.max_total_snapshots = Some(5);
+        config
+    };
+    let old_disk = tempfile::tempdir().unwrap();
+    let first: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(old_disk.path()).unwrap());
+    let writer = Coordinator::new(first, capped()).unwrap();
+    for step in 0..5 {
+        writer.save(step, evolving_state(step), HashMap::new()).unwrap();
+    }
+    writer.flush().unwrap();
+    writer.sync_now().unwrap();
+    let ids: Vec<Uuid> = writer.list_snapshots().iter().map(|s| s.id).collect();
+    drop(writer);
+
+    let (_disk, _local, coord) = restored(capped());
+    for step in 5..7 {
+        coord.save(step, evolving_state(step), HashMap::new()).unwrap();
+    }
+    coord.flush().unwrap();
+    coord.sync_now().unwrap();
+
+    for (index, id) in ids.iter().enumerate() {
+        let left = !snapshot_files(remote.as_ref(), &id.to_string()).is_empty();
+        assert_eq!(left, index != 1 && index != 2, "step {index} in the bucket: {left}");
+    }
+}
+
+/// A delta the remote manifest names but whose pack never reached the
+/// bucket is still left out, while the others stay.
+#[test]
+fn a_snapshot_in_neither_place_is_still_left_out() {
+    let remote_dir = tempfile::tempdir().unwrap();
+    let remote: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(remote_dir.path()).unwrap());
+    let (_old_disk, ids) = push_base_and_deltas(&remote);
+    for file in snapshot_files(remote.as_ref(), &ids[2].to_string()) {
+        remote.delete(&file).unwrap();
+    }
+
+    let (_disk, _local, coord) = restored(remote_config(&remote));
+
+    let named: Vec<Uuid> = coord.list_snapshots().iter().map(|s| s.id).collect();
+    assert_eq!(named, vec![ids[0], ids[1], ids[3], ids[4]]);
+}
+
+/// A merger folds what is on this disk, so a store with one gets every
+/// snapshot, as every store did before GPU-239.
+#[test]
+fn a_store_with_a_merger_restores_everything() {
+    let remote_dir = tempfile::tempdir().unwrap();
+    let remote: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(remote_dir.path()).unwrap());
+    let (_old_disk, ids) = push_base_and_deltas(&remote);
+
+    let mut config = remote_config(&remote);
+    config.merger = Some(crate::merger::MergerConfig::default());
+    let (_disk, local, _coord) = restored(config);
+
+    assert!(ids.iter().all(|id| is_here(&local, id)));
+}

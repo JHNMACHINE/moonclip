@@ -253,26 +253,38 @@ pub(super) fn load_manifest(storage: &dyn StorageBackend, config: &CoordinatorCo
     }
 }
 
-/// Whether every file a snapshot names is actually here.
+/// Every file `snapshot` names for `rank`, or for all its ranks with `None`:
+/// the pack, and any tensor stored in a file of its own.
+pub(super) fn files_of(snapshot: &Snapshot, rank: Option<u32>) -> Vec<String> {
+    let mut files = Vec::new();
+    for (id, entry) in &snapshot.ranks {
+        if rank.is_some_and(|r| r != *id) {
+            continue;
+        }
+        files.extend(entry.pack_file.iter().cloned());
+        files.extend(entry.tensors.iter().filter_map(|t| t.filename.clone()));
+    }
+    files
+}
+
+/// Whether every file a snapshot names is on this disk or in the bucket.
 ///
 /// Used after a restore from remote, where the manifest and the data it points
 /// at travel separately and can arrive out of step. A snapshot that is missing
 /// a pack is not a degraded snapshot, it is an unloadable one, and leaving it
 /// in the manifest turns a resume into a failure at the first read.
-pub(super) fn snapshot_is_whole(storage: &dyn StorageBackend, snapshot: &Snapshot) -> bool {
-    for rank in snapshot.ranks.values() {
-        if let Some(ref pack) = rank.pack_file {
-            if !storage.exists(pack).unwrap_or(false) {
-                return false;
-            }
-        }
-        for tensor in &rank.tensors {
-            if let Some(ref file) = tensor.filename {
-                if !storage.exists(file).unwrap_or(false) {
-                    return false;
-                }
-            }
-        }
-    }
-    true
+///
+/// The bucket counts since GPU-239: a restore brings down only what a resume
+/// needs, and a snapshot whose files are in the bucket is one a load fetches
+/// when asked. Required to be *here* it was dropped from the manifest, and the
+/// next sync uploaded a manifest that no longer named it, leaving its files in
+/// the bucket with nothing pointing at them.
+pub(super) fn snapshot_is_reachable(
+    storage: &dyn StorageBackend,
+    in_bucket: &std::collections::HashSet<&str>,
+    snapshot: &Snapshot,
+) -> bool {
+    files_of(snapshot, None)
+        .iter()
+        .all(|file| in_bucket.contains(file.as_str()) || storage.exists(file).unwrap_or(false))
 }
