@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- **The remote sync copies eight files at once, and asks the destination
+  what it holds in one listing (GPU-235).** It copied one file at a time,
+  each after an `exists` request, so a sync cost the bucket's latency times
+  its files: on 2026-10-18 a toy run of 600 steps on a RunPod node spent
+  three and a half minutes closing against R2, and two and a half restoring.
+  The files in flight share a budget of 1 GiB in memory; a file that large,
+  or one whose size the listing does not give, is copied alone, as before.
+  The manifest still goes last. Restores go the same way, and so do the
+  deletes the sync mirrors to the remote.
+- **`StorageBackend::list_sized`**, the listing with each file's size where
+  the backend learns it for free: S3 from its listing, the local store from
+  the entry walked. The default answers `None`.
+- **The S3 client keeps a connection open per transfer**, not one per host.
+
 ## 0.2.2 — 2026-10-15
 
 ### Changed

@@ -68,6 +68,19 @@ pub trait StorageBackend: Send + Sync {
 
     /// List all files under a relative prefix.
     fn list(&self, prefix: &str) -> Result<Vec<String>>;
+
+    /// [`list`](Self::list), with each file's size where the listing itself
+    /// carries it.
+    ///
+    /// For the remote sync, which copies several files at once under a cap on
+    /// the bytes held in memory (GPU-235) and has to know a file's size before
+    /// reading it. A size learned here costs nothing: S3 puts it in the
+    /// listing, a filesystem in the entry being walked. A backend that would
+    /// need a request per file to learn it answers `None`, and the sync then
+    /// copies that file alone, as it copied every file before.
+    fn list_sized(&self, prefix: &str) -> Result<Vec<(String, Option<u64>)>> {
+        Ok(self.list(prefix)?.into_iter().map(|key| (key, None)).collect())
+    }
 }
 
 // ─── Local filesystem ───────────────────────────────────────────────
@@ -370,6 +383,10 @@ impl StorageBackend for LocalStorage {
     }
 
     fn list(&self, prefix: &str) -> Result<Vec<String>> {
+        Ok(self.list_sized(prefix)?.into_iter().map(|(key, _)| key).collect())
+    }
+
+    fn list_sized(&self, prefix: &str) -> Result<Vec<(String, Option<u64>)>> {
         let search_root = self.full_path(prefix);
         if !search_root.exists() {
             return Ok(Vec::new());
@@ -381,6 +398,10 @@ impl StorageBackend for LocalStorage {
             .filter_map(|e| e.ok())
             .filter(|e| e.file_type().is_file())
         {
+            // The size as the walk saw it. A file rewritten in place since can
+            // differ, which only matters to the sync's memory cap, and the one
+            // file rewritten in place, the manifest, is copied on its own.
+            let size = entry.metadata().ok().map(|m| m.len());
             if let Ok(rel) = entry.path().strip_prefix(&self.root) {
                 // Join with '/' rather than handing back the OS separator.
                 // Every other part of this abstraction speaks '/': `put`,
@@ -396,7 +417,7 @@ impl StorageBackend for LocalStorage {
                     .map(|c| c.as_os_str().to_string_lossy())
                     .collect::<Vec<_>>()
                     .join("/");
-                files.push(key);
+                files.push((key, size));
             }
         }
         Ok(files)

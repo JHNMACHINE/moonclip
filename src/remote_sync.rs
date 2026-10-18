@@ -1,6 +1,8 @@
+use std::collections::HashSet;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
 use crate::error::{Result, MoonclipError};
@@ -84,6 +86,24 @@ impl Default for RemoteSyncConfig {
         }
     }
 }
+
+/// How many files a sync copies at once (GPU-235).
+///
+/// One at a time, a store's sync was the bucket's latency times its files:
+/// measured on 2026-10-18 from a RunPod node to R2, about 0.2 s a request and
+/// 2.5 MB/s on the one connection, so a toy run of 600 steps spent three and a
+/// half minutes closing and two and a half restoring, on a rented GPU. Several
+/// transfers overlap both the waits and the streams.
+pub(crate) const TRANSFERS: usize = 8;
+
+/// The most bytes a sync holds in memory across the files it is copying.
+///
+/// A file is read whole before it is written, and a pack is one rank's whole
+/// checkpoint, tens of gigabytes on a large model: eight of those at once is
+/// not a speed-up but an out-of-memory kill. Small files share this; a file
+/// as large as this, or of a size the listing did not give, is copied alone,
+/// which is how every file was copied before.
+const IN_FLIGHT_BYTES: u64 = 1 << 30;
 
 /// The one file that must never reach a destination ahead of the data it
 /// names.
@@ -274,10 +294,10 @@ impl RemoteSyncer {
     /// still going, not when it ends.
     ///
     /// Pass the narrowest path that covers what changed. A file already on the
-    /// remote is skipped by name after an `exists` round trip, so a prefix over
-    /// a directory that keeps growing pays one request per file it holds,
-    /// every call. A single file's path pays one. The same rule makes this
-    /// right only for files that are never rewritten after they appear.
+    /// remote is skipped by name, found in one listing of the prefix there, so
+    /// a prefix over a directory that keeps growing lists all of it, every
+    /// call. A single file's path lists one. The same rule makes this right
+    /// only for files that are never rewritten after they appear.
     ///
     /// Runs on the syncer's own thread, in order with the periodic syncs and
     /// `sync_now`. A failure is logged there, as the periodic one's is. An
@@ -377,12 +397,30 @@ fn apply_deletes(remote: &Arc<dyn StorageBackend>, deletes: &Arc<PendingDeletes>
     if keys.is_empty() {
         return;
     }
-    let mut failed = 0usize;
-    for key in &keys {
-        if remote.delete(key).is_err() {
-            failed += 1;
+    // Several at once, as the copies go (GPU-235): one at a time they were
+    // what was left of a close once the copies overlapped, 377 requests of
+    // 528 on the bench, a delta per step being a delete per step. A delete
+    // holds no bytes, so no budget.
+    let next = AtomicUsize::new(0);
+    let failures = AtomicUsize::new(0);
+    let work = || {
+        while let Some(key) = keys.get(next.fetch_add(1, Ordering::Relaxed)) {
+            if remote.delete(key).is_err() {
+                failures.fetch_add(1, Ordering::Relaxed);
+            }
         }
+    };
+    let workers = TRANSFERS.min(keys.len());
+    if workers == 1 {
+        work();
+    } else {
+        thread::scope(|scope| {
+            for _ in 0..workers {
+                scope.spawn(work);
+            }
+        });
     }
+    let failed = failures.into_inner();
     if failed > 0 {
         eprintln!(
             "[Moonclip sync] {failed} of {} deleted checkpoints could not be removed \
@@ -461,24 +499,73 @@ fn sync_prefix_skipping(
         }
     }
 
-    let files = from.list(prefix)?;
-    let mut synced = 0u64;
-    let mut skipped = 0u64;
-    let mut vanished = 0u64;
+    let files = from.list_sized(prefix)?;
 
-    for file in &files {
+    // What the destination already holds, from one listing. It was an
+    // `exists` per file, a request each: 303 of the 535 a node sent its bucket
+    // closing a toy run, on 2026-10-18 (GPU-235). A listing that fails puts
+    // the question back to each file, and a file whose answer fails is
+    // copied anyway, as it always was.
+    let present: Option<HashSet<String>> =
+        to.list(prefix).ok().map(|keys| keys.into_iter().collect());
+
+    let mut skipped = 0u64;
+    let mut missing = Vec::new();
+    for (file, size) in files {
         if skip.contains(&file.as_str()) {
             continue;
         }
-
-        match to.exists(file) {
-            Ok(true) => {
-                skipped += 1;
-                continue;
-            }
-            Ok(false) => {}
-            Err(_) => {} // If we cannot check, copy anyway
+        let there = match &present {
+            Some(keys) => keys.contains(&file),
+            None => matches!(to.exists(&file), Ok(true)),
+        };
+        if there {
+            skipped += 1;
+        } else {
+            missing.push((file, size));
         }
+    }
+
+    let (synced, vanished) = copy_files(from, to, &missing, TRANSFERS, IN_FLIGHT_BYTES)?;
+    Ok(Copied {
+        synced,
+        skipped,
+        vanished,
+    })
+}
+
+/// Copy `files` from one store to the other, up to `transfers` at once and
+/// never more than `budget` bytes of them in memory. Returns how many were
+/// copied and how many were gone by the time they were read.
+///
+/// GPU-235. On the sync's own thread when there is one file or one transfer;
+/// otherwise on scoped threads of its own, never on the rayon pool, where a
+/// worker blocked on the budget could hold the work that would free it. The
+/// first error stops the files not yet started and is returned once the
+/// others have finished, so a failed sync is reported as one, as before.
+fn copy_files(
+    from: &Arc<dyn StorageBackend>,
+    to: &Arc<dyn StorageBackend>,
+    files: &[(String, Option<u64>)],
+    transfers: usize,
+    budget: u64,
+) -> Result<(u64, u64)> {
+    let next = AtomicUsize::new(0);
+    let synced = AtomicU64::new(0);
+    let vanished = AtomicU64::new(0);
+    let failure: Mutex<Option<MoonclipError>> = Mutex::new(None);
+    let memory = Budget::new(budget);
+
+    let work = || loop {
+        if failure.lock().unwrap().is_some() {
+            return;
+        }
+        let Some((file, size)) = files.get(next.fetch_add(1, Ordering::Relaxed)) else {
+            return;
+        };
+        // Held until the copy is written, read included. A size the listing
+        // did not give is taken as the whole budget: that file goes alone.
+        let _held = memory.take(size.unwrap_or(budget));
 
         // A file listed a moment ago can be gone by now: retention and the
         // merger delete on their own threads, while this walk runs. It was
@@ -491,23 +578,82 @@ fn sync_prefix_skipping(
         //
         // Exact: a copy is the file as it was, not as this side would have
         // written it (see `StorageBackend::put_exact`).
-        let data = match from.get(file) {
-            Ok(data) => data,
-            Err(MoonclipError::NotFound(_)) => {
-                vanished += 1;
-                continue;
-            }
-            Err(e) => return Err(e),
+        let copied = match from.get(file) {
+            Ok(data) => to.put_exact(file, &data).map(|()| true),
+            Err(MoonclipError::NotFound(_)) => Ok(false),
+            Err(e) => Err(e),
         };
-        to.put_exact(file, &data)?;
-        synced += 1;
+        match copied {
+            Ok(true) => synced.fetch_add(1, Ordering::Relaxed),
+            Ok(false) => vanished.fetch_add(1, Ordering::Relaxed),
+            Err(e) => {
+                failure.lock().unwrap().get_or_insert(e);
+                return;
+            }
+        };
+    };
+
+    let workers = transfers.clamp(1, files.len().max(1));
+    if workers == 1 {
+        work();
+    } else {
+        thread::scope(|scope| {
+            // `work` borrows everything it uses, so it is `Copy`: each
+            // transfer gets its own.
+            for _ in 0..workers {
+                scope.spawn(work);
+            }
+        });
     }
 
-    Ok(Copied {
-        synced,
-        skipped,
-        vanished,
-    })
+    if let Some(e) = failure.into_inner().unwrap_or_else(|p| p.into_inner()) {
+        return Err(e);
+    }
+    Ok((synced.into_inner(), vanished.into_inner()))
+}
+
+/// Bytes a sync may hold in memory at once, shared by its transfers.
+///
+/// A transfer waits until what it asks for fits, unless nothing is held:
+/// a file larger than the whole budget still goes, alone, rather than never.
+struct Budget {
+    limit: u64,
+    used: Mutex<u64>,
+    freed: Condvar,
+}
+
+impl Budget {
+    fn new(limit: u64) -> Self {
+        Budget {
+            limit,
+            used: Mutex::new(0),
+            freed: Condvar::new(),
+        }
+    }
+
+    fn take(&self, bytes: u64) -> Held<'_> {
+        let bytes = bytes.min(self.limit);
+        let mut used = self.used.lock().unwrap();
+        while *used > 0 && *used + bytes > self.limit {
+            used = self.freed.wait(used).unwrap();
+        }
+        *used += bytes;
+        Held { budget: self, bytes }
+    }
+}
+
+/// Bytes taken from a [`Budget`], given back when dropped.
+struct Held<'a> {
+    budget: &'a Budget,
+    bytes: u64,
+}
+
+impl Drop for Held<'_> {
+    fn drop(&mut self) {
+        let mut used = self.budget.used.lock().unwrap_or_else(|p| p.into_inner());
+        *used -= self.bytes;
+        self.budget.freed.notify_all();
+    }
 }
 
 /// What one walk of [`sync_prefix_skipping`] did.
@@ -1201,6 +1347,187 @@ mod tests {
         src.put("metrics/x/000001.jsonl", b"{}\n").unwrap();
         let second = sync_prefix(&src, &dst, "metrics/x").unwrap();
         assert_eq!(second, Copied { synced: 1, skipped: 1, vanished: 0 });
+    }
+
+    /// A destination that counts the questions a sync asks it, and in its
+    /// writes how many and how many bytes are in flight at once.
+    struct Watched {
+        inner: Arc<dyn StorageBackend>,
+        exists_calls: AtomicUsize,
+        list_calls: AtomicUsize,
+        writing: Mutex<(usize, u64)>,
+        most_at_once: Mutex<(usize, u64)>,
+    }
+
+    impl Watched {
+        fn new(inner: Arc<dyn StorageBackend>) -> Self {
+            Watched {
+                inner,
+                exists_calls: AtomicUsize::new(0),
+                list_calls: AtomicUsize::new(0),
+                writing: Mutex::new((0, 0)),
+                most_at_once: Mutex::new((0, 0)),
+            }
+        }
+    }
+
+    impl StorageBackend for Watched {
+        fn put(&self, rel_path: &str, data: &[u8]) -> Result<()> {
+            {
+                let mut writing = self.writing.lock().unwrap();
+                writing.0 += 1;
+                writing.1 += data.len() as u64;
+                let mut most = self.most_at_once.lock().unwrap();
+                most.0 = most.0.max(writing.0);
+                most.1 = most.1.max(writing.1);
+            }
+            // Long enough that transfers started together overlap here.
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            let result = self.inner.put(rel_path, data);
+            let mut writing = self.writing.lock().unwrap();
+            writing.0 -= 1;
+            writing.1 -= data.len() as u64;
+            result
+        }
+        fn get(&self, rel_path: &str) -> Result<Vec<u8>> {
+            self.inner.get(rel_path)
+        }
+        fn exists(&self, rel_path: &str) -> Result<bool> {
+            self.exists_calls.fetch_add(1, Ordering::Relaxed);
+            self.inner.exists(rel_path)
+        }
+        fn delete(&self, rel_path: &str) -> Result<()> {
+            self.inner.delete(rel_path)
+        }
+        fn list(&self, prefix: &str) -> Result<Vec<String>> {
+            self.list_calls.fetch_add(1, Ordering::Relaxed);
+            self.inner.list(prefix)
+        }
+    }
+
+    /// A source whose listing gives no sizes, as a backend that would need a
+    /// request per file to learn them does.
+    struct Unsized(Arc<dyn StorageBackend>);
+
+    impl StorageBackend for Unsized {
+        fn put(&self, rel_path: &str, data: &[u8]) -> Result<()> {
+            self.0.put(rel_path, data)
+        }
+        fn get(&self, rel_path: &str) -> Result<Vec<u8>> {
+            self.0.get(rel_path)
+        }
+        fn exists(&self, rel_path: &str) -> Result<bool> {
+            self.0.exists(rel_path)
+        }
+        fn delete(&self, rel_path: &str) -> Result<()> {
+            self.0.delete(rel_path)
+        }
+        fn list(&self, prefix: &str) -> Result<Vec<String>> {
+            self.0.list(prefix)
+        }
+    }
+
+    /// GPU-235: what the destination holds comes from one listing. It was an
+    /// `exists` per file, 303 requests of the 535 a node sent closing a toy
+    /// run on R2.
+    #[test]
+    fn a_sync_lists_the_destination_once_instead_of_asking_per_file() {
+        let (_s, _d, src, dst) = two_stores();
+        for i in 0..20 {
+            src.put(&format!("snapshots/s{i}/rank_0.pack"), b"pack").unwrap();
+        }
+        for i in 0..5 {
+            dst.put(&format!("snapshots/s{i}/rank_0.pack"), b"pack").unwrap();
+        }
+        let watched = Arc::new(Watched::new(Arc::clone(&dst)));
+        let to: Arc<dyn StorageBackend> = Arc::clone(&watched) as _;
+
+        let copied = sync_prefix(&src, &to, "snapshots").unwrap();
+
+        assert_eq!(copied, Copied { synced: 15, skipped: 5, vanished: 0 });
+        assert_eq!(watched.exists_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(watched.list_calls.load(Ordering::Relaxed), 1);
+        for i in 0..20 {
+            assert!(dst.exists(&format!("snapshots/s{i}/rank_0.pack")).unwrap());
+        }
+    }
+
+    /// Several files go at once, every one of them arrives whole, and the
+    /// bytes being written never pass the budget.
+    #[test]
+    fn transfers_overlap_under_the_memory_budget() {
+        let (_s, _d, src, dst) = two_stores();
+        let mut files = Vec::new();
+        for i in 0..24 {
+            let key = format!("snapshots/s{i}/rank_0.pack");
+            src.put(&key, &[i as u8; 100]).unwrap();
+            files.push((key, Some(100)));
+        }
+        let watched = Arc::new(Watched::new(Arc::clone(&dst)));
+        let to: Arc<dyn StorageBackend> = Arc::clone(&watched) as _;
+
+        let (synced, vanished) = copy_files(&src, &to, &files, 8, 350).unwrap();
+
+        assert_eq!((synced, vanished), (24, 0));
+        for (i, (key, _)) in files.iter().enumerate() {
+            assert_eq!(dst.get(key).unwrap(), vec![i as u8; 100]);
+        }
+        let (count, bytes) = *watched.most_at_once.lock().unwrap();
+        assert!(count > 1, "the transfers never overlapped");
+        assert!(bytes <= 350, "{bytes} bytes in flight against a budget of 350");
+    }
+
+    /// A file of unknown size takes the whole budget, so it is written alone:
+    /// it could be a pack of tens of gigabytes.
+    #[test]
+    fn a_file_of_unknown_size_is_copied_alone() {
+        let (_s, _d, src, dst) = two_stores();
+        for i in 0..12 {
+            src.put(&format!("snapshots/s{i}/rank_0.pack"), b"pack").unwrap();
+        }
+        let from: Arc<dyn StorageBackend> = Arc::new(Unsized(Arc::clone(&src)));
+        let watched = Arc::new(Watched::new(Arc::clone(&dst)));
+        let to: Arc<dyn StorageBackend> = Arc::clone(&watched) as _;
+
+        let copied = sync_prefix(&from, &to, "snapshots").unwrap();
+
+        assert_eq!(copied.synced, 12);
+        assert_eq!(watched.most_at_once.lock().unwrap().0, 1);
+    }
+
+    /// A destination that refuses one file fails the sync, with every
+    /// transfer running: an upload that did not happen is a checkpoint at
+    /// risk and has to be reported.
+    #[test]
+    fn a_refused_file_among_many_fails_the_sync() {
+        let (_s, _d, src, dst) = two_stores();
+        for i in 0..16 {
+            src.put(&format!("snapshots/s{i:02}/rank_0.pack"), b"pack").unwrap();
+        }
+        let remote = Arc::new(RecordingRemote::refusing(Arc::clone(&dst), "snapshots/s07/rank_0.pack"));
+        let to: Arc<dyn StorageBackend> = Arc::clone(&remote) as _;
+
+        assert!(sync_prefix(&src, &to, "snapshots").is_err());
+    }
+
+    /// Every queued delete reaches the remote when several go at once, and the
+    /// queue is empty afterwards.
+    #[test]
+    fn many_queued_deletes_all_reach_the_remote() {
+        let (_s, _d, _src, dst) = two_stores();
+        let deletes = Arc::new(PendingDeletes::default());
+        for i in 0..40 {
+            let key = format!("snapshots/s{i}/rank_0.pack");
+            dst.put(&key, b"old").unwrap();
+            deletes.push(key);
+        }
+
+        apply_deletes(&dst, &deletes);
+
+        for i in 0..40 {
+            assert!(!dst.exists(&format!("snapshots/s{i}/rank_0.pack")).unwrap());
+        }
+        assert!(deletes.keys.lock().unwrap().is_empty());
     }
 
     /// Only `debug` turns the quiet syncs' lines back on; anything else, or

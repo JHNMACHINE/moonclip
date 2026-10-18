@@ -205,6 +205,10 @@ impl S3Storage {
             .timeout_connect(std::time::Duration::from_secs(config.timeout_secs))
             .timeout_read(std::time::Duration::from_secs(config.timeout_secs * 10))
             .timeout_write(std::time::Duration::from_secs(config.timeout_secs * 10))
+            // One connection kept open per transfer the remote sync runs at
+            // once (GPU-235). ureq keeps one per host by default, so the other
+            // transfers would open a connection, TLS included, per request.
+            .max_idle_connections_per_host(crate::remote_sync::TRANSFERS)
             .build();
         let bucket = bucket_of(&config)?;
         let credentials = match &config.session_token {
@@ -693,6 +697,10 @@ impl StorageBackend for S3Storage {
     }
 
     fn list(&self, prefix: &str) -> Result<Vec<String>> {
+        Ok(self.list_sized(prefix)?.into_iter().map(|(key, _)| key).collect())
+    }
+
+    fn list_sized(&self, prefix: &str) -> Result<Vec<(String, Option<u64>)>> {
         let full_prefix = self.config.object_key(prefix);
         let normalized_base = self.config.normalized_prefix();
 
@@ -716,12 +724,12 @@ impl StorageBackend for S3Storage {
                 .map_err(|e| MoonclipError::Storage(format!("S3 list parse error: {e}")))?;
 
             // Parse XML response (minimal, no full XML parser needed)
-            for key in extract_xml_values(&body, "Key") {
+            for (key, size) in listed_objects(&body) {
                 // Strip our prefix to return relative paths
                 if let Some(rel) = key.strip_prefix(&normalized_base) {
-                    all_keys.push(rel.to_string());
+                    all_keys.push((rel.to_string(), size));
                 } else {
-                    all_keys.push(key);
+                    all_keys.push((key, size));
                 }
             }
 
@@ -780,6 +788,26 @@ fn extract_xml_values(xml: &str, tag: &str) -> Vec<String> {
 
 fn extract_xml_value(xml: &str, tag: &str) -> Option<String> {
     extract_xml_values(xml, tag).into_iter().next()
+}
+
+/// Each object of a ListObjectsV2 page, with its size.
+///
+/// Read per `<Contents>` element, so a key and a size are always the same
+/// object's: two flat lists of `Key` and `Size` would pair them by position,
+/// and a page with an object missing one would shift every pair after it. The
+/// size is what the remote sync needs to copy several files at once under a
+/// cap on memory (GPU-235); one it cannot read is `None`, and that file is
+/// copied alone.
+fn listed_objects(xml: &str) -> Vec<(String, Option<u64>)> {
+    let mut objects = Vec::new();
+    for element in xml.split("<Contents>").skip(1) {
+        let element = element.split("</Contents>").next().unwrap_or(element);
+        if let Some(key) = extract_xml_value(element, "Key") {
+            let size = extract_xml_value(element, "Size").and_then(|s| s.trim().parse().ok());
+            objects.push((key, size));
+        }
+    }
+    objects
 }
 
 // ─── SigV4 in the Authorization header (GPU-217) ────────────────────
@@ -1018,6 +1046,26 @@ mod tests {
         let keys = extract_xml_values(xml, "Key");
         assert_eq!(keys[0], "runs/a&b/rank_0.pack");
         assert_eq!(keys[1], "runs/x<y>z/rank_0.pack");
+    }
+
+    /// GPU-235: each key with its own object's size, unescaped as `list`
+    /// returns it, and `None` where a size is missing rather than the next
+    /// object's.
+    #[test]
+    fn listed_objects_pair_each_key_with_its_size() {
+        let xml = "<ListBucketResult>\
+            <Contents><Key>p/a&amp;b.pack</Key><Size>4096</Size></Contents>\
+            <Contents><Key>p/no-size.pack</Key></Contents>\
+            <Contents><Key>p/c.pack</Key><LastModified>x</LastModified><Size>7</Size></Contents>\
+            <IsTruncated>false</IsTruncated></ListBucketResult>";
+        assert_eq!(
+            listed_objects(xml),
+            vec![
+                ("p/a&b.pack".to_string(), Some(4096)),
+                ("p/no-size.pack".to_string(), None),
+                ("p/c.pack".to_string(), Some(7)),
+            ]
+        );
     }
 
     /// `&amp;lt;` is the text `&lt;`, not `<`: expanding the ampersand first
