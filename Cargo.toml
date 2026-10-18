@@ -1,6 +1,6 @@
 [package]
 name = "moonclip"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 # Set by rusty-s3 0.10, the highest MSRV among the dependencies (pyo3 0.29
 # needs 1.83). Declared so a toolchain that is too old fails with that
