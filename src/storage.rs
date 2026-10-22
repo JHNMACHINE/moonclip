@@ -221,6 +221,25 @@ const PERSIST_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_secs
 ///
 /// Elsewhere a rename over an open file succeeds, so there is nothing to wait
 /// for and every error is returned as it comes.
+/// What every temporary file `LocalStorage` writes is called, until it is
+/// renamed to its real name.
+///
+/// So that a listing can leave it out. The remote sync lists this store while
+/// the saver is writing to it, and a pack still being written was in that
+/// listing under its temporary name: it was uploaded as `.tmpXXXXXX`, a file
+/// nothing would ever name, delete or need, and on the next restore it came
+/// back down (GPU-262). One in twenty runs of a bucket test caught it on
+/// Windows; in a bucket it is an object billed for as long as the bucket.
+pub(crate) const PARTIAL_PREFIX: &str = ".moonclip-partial-";
+
+/// Whether `name`, the last part of a path, is a file still being written:
+/// ours, or one `tempfile` named by its default before [`PARTIAL_PREFIX`]
+/// existed, which a crash may have left behind.
+fn is_partial(name: &str) -> bool {
+    name.starts_with(PARTIAL_PREFIX)
+        || (name.len() == 10 && name.starts_with(".tmp") && name[4..].chars().all(|c| c.is_ascii_alphanumeric()))
+}
+
 fn persist_retrying(
     mut tmp: tempfile::NamedTempFile,
     path: &Path,
@@ -271,7 +290,7 @@ impl LocalStorage {
         // Atomic write: temp file → rename. Parts are streamed directly
         // to the file — no concatenated or padded copy of the data.
         let dir = path.parent().unwrap_or(Path::new("."));
-        let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+        let mut tmp = tempfile::Builder::new().prefix(PARTIAL_PREFIX).tempfile_in(dir)?;
         {
             let file = tmp.as_file_mut();
             let mut total = 0usize;
@@ -397,6 +416,7 @@ impl StorageBackend for LocalStorage {
             .into_iter()
             .filter_map(|e| e.ok())
             .filter(|e| e.file_type().is_file())
+            .filter(|e| !is_partial(&e.file_name().to_string_lossy()))
         {
             // The size as the walk saw it. A file rewritten in place since can
             // differ, which only matters to the sync's memory cap, and the one
@@ -427,6 +447,23 @@ impl StorageBackend for LocalStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A file still being written is not in the store yet, and a listing that
+    /// showed it handed the remote sync a temporary name to upload (GPU-262).
+    #[test]
+    fn a_file_being_written_is_not_listed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalStorage::new_unaligned(dir.path()).unwrap();
+        store.put("snapshots/s1/rank_0.pack", b"done").unwrap();
+        let partial = dir.path().join("snapshots/s1").join(format!("{PARTIAL_PREFIX}abc123"));
+        std::fs::write(&partial, b"half").unwrap();
+        std::fs::write(dir.path().join("snapshots/s1/.tmpAG0jOQ"), b"left by a crash").unwrap();
+        std::fs::write(dir.path().join("snapshots/s1/.tmp-notes.txt"), b"a caller's").unwrap();
+
+        let mut listed = store.list("snapshots").unwrap();
+        listed.sort();
+        assert_eq!(listed, vec!["snapshots/s1/.tmp-notes.txt", "snapshots/s1/rank_0.pack"]);
+    }
 
     /// Listed keys must be usable as keys — by `get` here, and by whatever
     /// backend the syncer is pushing to.

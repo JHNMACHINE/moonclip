@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **The local store does not list a file still being written (GPU-262).**
+  The remote sync lists the store while the saver writes to it, and a pack
+  still under its temporary name was uploaded as `.tmpXXXXXX`: a file nothing
+  names, deletes or needs, billed for as long as the bucket, and brought back
+  down by the next restore. Temporary files are now named
+  `.moonclip-partial-*`, and listings leave them out, along with the
+  `.tmpXXXXXX` a crash may have left before.
+
 ## 0.2.4 — 2026-10-18
 
 ### Changed
