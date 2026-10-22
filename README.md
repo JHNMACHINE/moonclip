@@ -192,7 +192,8 @@ src/
 ├── shuffle.rs       # Byte-plane transpose, so a delta compresses
 ├── compression.rs   # Zstd, as concatenated frames across cores
 ├── pack.rs          # The pack file: data plus its own description, one write
-├── manifest.rs      # Manifest v2 — per-rank, per-tensor, lineage
+├── manifest.rs      # The manifest in memory — per-rank, per-tensor, lineage
+├── manifest_io.rs   # And on disk: a small index, and a file per snapshot
 ├── merger.rs        # Background consolidation of delta chains
 ├── inflight.rs      # Which snapshots a read holds, so a merge cannot delete them
 ├── storage.rs       # StorageBackend trait + LocalStorage (4KB aligned)

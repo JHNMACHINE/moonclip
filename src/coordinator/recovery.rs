@@ -231,25 +231,14 @@ pub(super) fn recover_or_reclaim_orphans(storage: &dyn StorageBackend, manifest:
 }
 
 pub(super) fn load_manifest(storage: &dyn StorageBackend, config: &CoordinatorConfig) -> Result<Manifest> {
-    match storage.get("manifest.json") {
-        Ok(data) => {
-            // Trailing zeros: a manifest is rewritten in place, so a shorter
-            // one can leave the tail of a longer one behind it.
-            let end = data
-                .iter()
-                .rposition(|&b| b != 0)
-                .map(|i| i + 1)
-                .unwrap_or(0);
-            serde_json::from_slice(&data[..end])
-                .map_err(|e| MoonclipError::Serialization(e.to_string()))
-        }
-        Err(MoonclipError::NotFound(_)) => Ok(Manifest {
+    match crate::manifest_io::load(storage, None)? {
+        Some(manifest) => Ok(manifest),
+        None => Ok(Manifest {
             world_size: config.world_size,
             retention: config.retention.clone(),
             lineage: config.lineage.clone(),
             ..Default::default()
         }),
-        Err(e) => Err(e),
     }
 }
 

@@ -464,16 +464,17 @@ fn orphan_on_disk(storage: &dyn StorageBackend, id: Uuid) {
         .unwrap();
 }
 
+/// The manifest in `storage`, read the way a coordinator reads it.
+fn read_manifest(storage: &dyn StorageBackend) -> Manifest {
+    crate::manifest_io::load(storage, None).unwrap().expect("a manifest")
+}
+
 /// Rewrite the manifest without `drop`, leaving its data and sidecar on
 /// disk — exactly the state a process killed between the two writes leaves.
 fn forget_snapshot(storage: &dyn StorageBackend, drop: Uuid) {
-    let raw = storage.get("manifest.json").unwrap();
-    let end = raw.iter().rposition(|&b| b != 0).map(|i| i + 1).unwrap_or(0);
-    let mut manifest: Manifest = serde_json::from_slice(&raw[..end]).unwrap();
+    let mut manifest = read_manifest(storage);
     manifest.snapshots.retain(|s| s.id != drop);
-    storage
-        .put("manifest.json", &serde_json::to_vec_pretty(&manifest).unwrap())
-        .unwrap();
+    crate::manifest_io::persist(storage, &mut manifest).unwrap();
 }
 
 fn open(storage: &Arc<dyn StorageBackend>) -> Coordinator {
@@ -533,9 +534,7 @@ fn a_recovered_checkpoint_is_written_back_to_the_manifest() {
     // A second restart must find it already in the manifest rather than
     // rediscovering it — otherwise the recovery only ever lived in memory
     // and the next crash loses it again.
-    let raw = storage.get("manifest.json").unwrap();
-    let end = raw.iter().rposition(|&b| b != 0).map(|i| i + 1).unwrap_or(0);
-    let manifest: Manifest = serde_json::from_slice(&raw[..end]).unwrap();
+    let manifest = read_manifest(storage.as_ref());
     assert_eq!(manifest.snapshots.len(), 1);
     assert_eq!(manifest.snapshots[0].id, lost);
 }
@@ -654,9 +653,7 @@ fn a_merged_snapshot_is_recovered_like_any_other() {
     // Merged directly rather than through `merge_now`: the merger runs on
     // its own thread with no completion to wait on, and this test is about
     // what the merge writes, not when.
-    let raw = storage.get("manifest.json").unwrap();
-    let end = raw.iter().rposition(|&b| b != 0).map(|i| i + 1).unwrap_or(0);
-    let manifest: Manifest = serde_json::from_slice(&raw[..end]).unwrap();
+    let manifest = read_manifest(storage.as_ref());
     let manifest = Arc::new(Mutex::new(manifest));
     crate::merger::do_full_merge(
         &storage,
@@ -834,9 +831,12 @@ fn a_manifest_entry_with_no_files_does_not_panic() {
     drop(coord);
 
     // Delete the data but leave the manifest entry, as a half-finished
-    // cleanup or a truncated volume would.
+    // cleanup or a truncated volume would. The entry's own file stays: with
+    // it gone there is no entry left to list, which is the next test's case.
     for file in snapshot_files(storage.as_ref(), &id.to_string()) {
-        storage.delete(&file).unwrap();
+        if !file.ends_with(crate::manifest_io::RANKS_FILE) {
+            storage.delete(&file).unwrap();
+        }
     }
 
     let restarted = Coordinator::new(Arc::clone(&storage), config()).unwrap();
@@ -1526,18 +1526,11 @@ fn a_checkpoint_that_changed_nothing_can_still_be_recovered() {
     drop(coord);
 
     // The crash: the pack landed, the manifest naming it did not.
-    let manifest_path = dir.path().join("manifest.json");
-    let raw = std::fs::read(&manifest_path).unwrap();
-    // Same trailing-zero trim the loader does in `Coordinator::new`.
-    let end = raw.iter().rposition(|&b| b != 0).map(|i| i + 1).unwrap_or(0);
-    let mut manifest: Manifest = serde_json::from_slice(&raw[..end]).unwrap();
+    let storage = LocalStorage::new(dir.path()).unwrap();
+    let mut manifest = read_manifest(&storage);
     assert_eq!(manifest.snapshots.len(), 2, "both saves were recorded");
     manifest.snapshots.retain(|s| s.id != quiet);
-    std::fs::write(
-        &manifest_path,
-        serde_json::to_vec_pretty(&manifest).unwrap(),
-    )
-    .unwrap();
+    crate::manifest_io::persist(&storage, &mut manifest).unwrap();
 
     let reopened = make_coordinator(dir.path());
     let steps: Vec<u64> = reopened.list_snapshots().iter().map(|s| s.step).collect();
@@ -2669,8 +2662,12 @@ fn restored(
     (disk, local, coord)
 }
 
+/// Whether `id`'s data is on `storage`. Its own file does not count: a
+/// restore brings every snapshot's down, so the index can be read (GPU-261).
 fn is_here(storage: &Arc<dyn StorageBackend>, id: &Uuid) -> bool {
-    !snapshot_files(storage.as_ref(), &id.to_string()).is_empty()
+    snapshot_files(storage.as_ref(), &id.to_string())
+        .iter()
+        .any(|f| !f.ends_with(crate::manifest_io::RANKS_FILE))
 }
 
 /// The restore brings down the newest snapshot and its base and no other,
@@ -2756,7 +2753,7 @@ fn retention_deletes_from_the_bucket_a_snapshot_that_never_came_down() {
 
     for (index, id) in ids.iter().enumerate() {
         let left = !snapshot_files(remote.as_ref(), &id.to_string()).is_empty();
-        assert_eq!(left, index != 1 && index != 2, "step {index} in the bucket: {left}");
+        assert_eq!(left, index != 1 && index != 2, "step {index} in the bucket: {:?}", snapshot_files(remote.as_ref(), &id.to_string()).iter().map(|f| (f.clone(), String::from_utf8_lossy(&remote.get(f).unwrap_or_default()).chars().take(120).collect::<String>())).collect::<Vec<_>>());
     }
 }
 
@@ -2790,4 +2787,252 @@ fn a_store_with_a_merger_restores_everything() {
     let (_disk, local, _coord) = restored(config);
 
     assert!(ids.iter().all(|id| is_here(&local, id)));
+}
+
+// ─── the manifest as an index (GPU-261) ─────────────────────────────
+
+/// Storage that remembers the name of every file written to it.
+struct RecordingStorage {
+    inner: LocalStorage,
+    puts: Mutex<Vec<String>>,
+}
+
+impl StorageBackend for RecordingStorage {
+    fn put(&self, rel_path: &str, data: &[u8]) -> Result<()> {
+        self.puts.lock().unwrap().push(rel_path.to_string());
+        self.inner.put(rel_path, data)
+    }
+    fn get(&self, rel_path: &str) -> Result<Vec<u8>> {
+        self.inner.get(rel_path)
+    }
+    fn exists(&self, rel_path: &str) -> Result<bool> {
+        self.inner.exists(rel_path)
+    }
+    fn delete(&self, rel_path: &str) -> Result<()> {
+        self.inner.delete(rel_path)
+    }
+    fn remove_dir(&self, rel_path: &str) -> Result<()> {
+        self.inner.remove_dir(rel_path)
+    }
+    fn list(&self, prefix: &str) -> Result<Vec<String>> {
+        self.inner.list(prefix)
+    }
+}
+
+/// A coordinator that keeps everything it saves: a full every `full_every`
+/// steps, deltas between.
+fn keeping_everything(storage: Arc<dyn StorageBackend>, full_every: u64) -> Coordinator {
+    Coordinator::new(
+        storage,
+        CoordinatorConfig {
+            compression: CompressionAlgo::Zstd { level: 1 },
+            retention: RetentionPolicy {
+                max_full_snapshots: 10_000,
+                max_deltas_per_full: 10_000,
+                full_snapshot_every_steps: full_every,
+                max_total_snapshots: None,
+            },
+            delta_max_ratio: 0.95,
+            ..Default::default()
+        },
+    )
+    .unwrap()
+}
+
+/// A state with as many entries as a small model: what made each snapshot's
+/// share of the old manifest large was its tensor list, not its bytes.
+fn many_tensors(step: u64) -> Vec<TensorData> {
+    (0..40u8)
+        .map(|i| TensorData {
+            name: format!("model.layers.{i}.self_attn.q_proj.weight"),
+            shape: vec![64],
+            dtype: "uint8".into(),
+            data: vec![(step as u8).wrapping_add(i); 64],
+        })
+        .collect()
+}
+
+fn trimmed_len(bytes: &[u8]) -> u64 {
+    bytes.iter().rposition(|&b| b != 0).map(|i| i + 1).unwrap_or(0) as u64
+}
+
+/// The point of the format: a save writes its own snapshot's file and the
+/// index, and leaves the rest of the window alone. It used to rewrite every
+/// snapshot's tensor entries, and the cost of a step grew with the window.
+#[test]
+fn a_save_writes_its_own_snapshot_and_the_index_and_nothing_else() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = Arc::new(RecordingStorage {
+        inner: LocalStorage::new(dir.path()).unwrap(),
+        puts: Mutex::new(Vec::new()),
+    });
+    let coord = keeping_everything(Arc::clone(&storage) as Arc<dyn StorageBackend>, 1_000_000);
+    for step in 0..30 {
+        coord.save(step, many_tensors(step), HashMap::new()).unwrap();
+    }
+    coord.flush().unwrap();
+    storage.puts.lock().unwrap().clear();
+
+    let id = coord.save(30, many_tensors(30), HashMap::new()).unwrap();
+    coord.flush().unwrap();
+
+    let written: Vec<String> = storage
+        .puts
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|path| !path.ends_with(".pack"))
+        .cloned()
+        .collect();
+    assert_eq!(
+        written,
+        vec![crate::manifest_io::ranks_path(id), "manifest.json".to_string()]
+    );
+}
+
+/// The index grows by a short head per snapshot, whatever the model: a few
+/// hundred bytes, against the tensor entries each snapshot keeps in its own
+/// file.
+#[test]
+fn the_index_does_not_grow_with_the_model() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(dir.path()).unwrap());
+    let coord = keeping_everything(Arc::clone(&storage), 1_000_000);
+    let saves = 100u64;
+    for step in 0..saves {
+        coord.save(step, many_tensors(step), HashMap::new()).unwrap();
+    }
+    coord.flush().unwrap();
+
+    let per_snapshot = trimmed_len(&storage.get("manifest.json").unwrap()) / saves;
+    let newest = coord.list_snapshots().last().unwrap().id;
+    let own = trimmed_len(&storage.get(&crate::manifest_io::ranks_path(newest)).unwrap());
+    assert!(per_snapshot < 400, "{per_snapshot} bytes of index per snapshot");
+    assert!(
+        own > 10 * per_snapshot,
+        "a snapshot's own file ({own} B) should hold what the index does not"
+    );
+}
+
+/// A store written before the index opens, loads, and is moved to the new
+/// layout by its next save.
+#[test]
+fn a_manifest_from_before_the_index_still_opens() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(dir.path()).unwrap());
+    let coord = keeping_everything(Arc::clone(&storage), 3);
+    for step in 0..6 {
+        coord.save(step, evolving_state(step), HashMap::new()).unwrap();
+    }
+    coord.flush().unwrap();
+    let ids: Vec<Uuid> = coord.list_snapshots().iter().map(|s| s.id).collect();
+    drop(coord);
+
+    // What 0.2.4 wrote: one pretty-printed file, every snapshot inline.
+    let mut old = read_manifest(storage.as_ref());
+    old.format_version = 2;
+    storage
+        .put("manifest.json", &serde_json::to_vec_pretty(&old).unwrap())
+        .unwrap();
+    for id in &ids {
+        storage.delete(&crate::manifest_io::ranks_path(*id)).unwrap();
+    }
+
+    let reopened = keeping_everything(Arc::clone(&storage), 3);
+    let listed: Vec<Uuid> = reopened.list_snapshots().iter().map(|s| s.id).collect();
+    assert_eq!(listed, ids);
+    for (step, id) in ids.iter().enumerate() {
+        assert_eq!(reopened.load(*id).unwrap()["w"], evolving_state(step as u64)[0].data);
+    }
+
+    reopened.save(6, evolving_state(6), HashMap::new()).unwrap();
+    reopened.flush().unwrap();
+    for id in &ids {
+        assert!(
+            storage.exists(&crate::manifest_io::ranks_path(*id)).unwrap(),
+            "snapshot {id} was not moved to its own file"
+        );
+    }
+    let index = storage.get("manifest.json").unwrap();
+    let index = String::from_utf8_lossy(&index);
+    assert!(!index.contains("\"tensors\""), "the index still holds tensor entries");
+    drop(reopened);
+
+    let again = keeping_everything(Arc::clone(&storage), 3);
+    assert_eq!(again.list_snapshots().len(), 7);
+    assert_eq!(again.load(ids[4]).unwrap()["w"], evolving_state(4)[0].data);
+}
+
+/// A snapshot whose own file is gone is not lost: its packs describe it, and
+/// startup recovery puts it back, its deltas with it, and writes the file
+/// again. With its packs gone too nothing describes it, and it is left out
+/// with every delta taken against it, while the rest still opens and loads.
+#[test]
+fn a_snapshot_whose_own_file_is_gone_comes_back_from_its_packs() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(dir.path()).unwrap());
+    let coord = keeping_everything(Arc::clone(&storage), 3);
+    for step in 0..6 {
+        coord.save(step, evolving_state(step), HashMap::new()).unwrap();
+    }
+    coord.flush().unwrap();
+    let first_full = coord.list_snapshots().iter().find(|s| s.step == 0).unwrap().id;
+    drop(coord);
+
+    storage.delete(&crate::manifest_io::ranks_path(first_full)).unwrap();
+    let reopened = keeping_everything(Arc::clone(&storage), 3);
+    let steps: Vec<u64> = reopened.list_snapshots().iter().map(|s| s.step).collect();
+    assert_eq!(steps, vec![0, 1, 2, 3, 4, 5]);
+    for info in reopened.list_snapshots() {
+        assert_eq!(reopened.load(info.id).unwrap()["w"], evolving_state(info.step)[0].data);
+    }
+    assert!(storage.exists(&crate::manifest_io::ranks_path(first_full)).unwrap());
+    drop(reopened);
+
+    for file in snapshot_files(storage.as_ref(), &first_full.to_string()) {
+        storage.delete(&file).unwrap();
+    }
+    let without = keeping_everything(Arc::clone(&storage), 3);
+    let steps: Vec<u64> = without.list_snapshots().iter().map(|s| s.step).collect();
+    assert_eq!(steps, vec![3, 4, 5]);
+    for info in without.list_snapshots() {
+        assert_eq!(without.load(info.id).unwrap()["w"], evolving_state(info.step)[0].data);
+    }
+}
+
+/// What retention removes goes whole, its own file included: a directory
+/// left behind per evicted snapshot would be a leak the length of the run.
+#[test]
+fn retention_leaves_no_snapshot_directory_behind() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage: Arc<dyn StorageBackend> = Arc::new(LocalStorage::new(dir.path()).unwrap());
+    let coord = Coordinator::new(
+        Arc::clone(&storage),
+        CoordinatorConfig {
+            compression: CompressionAlgo::Zstd { level: 1 },
+            retention: RetentionPolicy {
+                max_full_snapshots: 10,
+                max_deltas_per_full: 1000,
+                full_snapshot_every_steps: 1000,
+                max_total_snapshots: Some(3),
+            },
+            delta_max_ratio: 0.95,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    for step in 0..12 {
+        coord.save(step, evolving_state(step), HashMap::new()).unwrap();
+    }
+    coord.flush().unwrap();
+
+    let kept: std::collections::HashSet<String> =
+        coord.list_snapshots().iter().map(|s| s.id.to_string()).collect();
+    let on_disk: std::collections::HashSet<String> = storage
+        .list("snapshots")
+        .unwrap()
+        .iter()
+        .filter_map(|f| f.strip_prefix("snapshots/")?.split('/').next().map(String::from))
+        .collect();
+    assert_eq!(on_disk, kept);
 }

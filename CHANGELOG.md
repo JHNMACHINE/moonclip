@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+### Changed
+
+- **A save no longer rewrites the whole manifest (GPU-261).** Each snapshot's
+  tensor entries go to `snapshots/<id>/ranks.json`, written once, when the
+  snapshot is finalised; `manifest.json` is now a compact index of one short
+  entry per snapshot. The manifest was written whole, pretty-printed, at every
+  save, and with a delta per step its size followed the window: on
+  2026-10-22 a model of four parameters with a window that kept everything
+  went from 0.8 s to 20 s per 250 steps as it reached 13 MB, the training
+  loop waiting on the writer at every step. A save now writes its own
+  snapshot's file and the index. **Format version 3**: stores written before
+  open as they are and move to the new layout at their next save; a store
+  written by this version cannot be opened by an older Moonclip.
+  `restore_from_remote` brings down every snapshot's `ranks.json`, which the
+  index needs, besides what it brought before. A snapshot whose
+  `ranks.json` is lost is rebuilt from its packs at startup, as a snapshot
+  missing from the manifest always was.
+
 ### Fixed
 
 - **The local store does not list a file still being written (GPU-262).**

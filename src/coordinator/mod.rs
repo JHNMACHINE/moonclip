@@ -185,10 +185,8 @@ impl Coordinator {
             // Persist immediately: a recovered checkpoint that only exists in
             // this process's memory would be lost again to the next crash, and
             // would be re-recovered on every startup until one happened not to.
-            if let Ok(json) = serde_json::to_vec_pretty(&manifest) {
-                if let Err(e) = storage.put("manifest.json", &json) {
-                    eprintln!("[Moonclip] Could not persist recovered snapshots: {e}");
-                }
+            if let Err(e) = crate::manifest_io::persist(storage.as_ref(), &mut manifest) {
+                eprintln!("[Moonclip] Could not persist recovered snapshots: {e}");
             }
         }
 
@@ -731,7 +729,7 @@ impl Core {
 
         let mut manifest = self.lock_manifest();
         manifest.snapshots.push(snapshot);
-        self.persist_manifest(&manifest)?;
+        self.persist_manifest(&mut manifest)?;
         drop(manifest);
 
         Ok(snap_id)
@@ -1307,7 +1305,7 @@ impl Core {
         if changed {
             // Written now, not at the next save: a pin exists to survive this
             // process, and a fork can be created by something that then exits.
-            self.persist_manifest(&manifest)?;
+            self.persist_manifest(&mut manifest)?;
         }
         // And in the pins file, whatever the manifest said: that is what
         // another process with this store open reads, and its own manifest -
@@ -1444,14 +1442,28 @@ impl Core {
         if !crate::remote_sync::restore_manifest(&self.storage, remote)? {
             return Ok(false);
         }
+        // One listing of the bucket answers every question below - what is
+        // reachable, and what to bring down - and is the list the copies work
+        // from, so none of it is asked twice.
+        let listing = remote.list_sized("")?;
+
+        // Every snapshot's own file before the index is read: the index names
+        // them, and a manifest is not whole without them (GPU-261). They are
+        // the small part of a snapshot, so all of them, where the packs below
+        // are only what a resume loads.
+        let described: Vec<(String, Option<u64>)> = listing
+            .iter()
+            .filter(|(key, _)| {
+                key.starts_with("snapshots/")
+                    && key.ends_with(&format!("/{}", crate::manifest_io::RANKS_FILE))
+            })
+            .cloned()
+            .collect();
+        crate::remote_sync::copy_absent(remote, &self.storage, "", described)?.log("");
+
         // The manifest in memory was read at construction, when the store was
         // empty. Everything downstream asks it, not the disk.
         let mut fresh = load_manifest(self.storage.as_ref(), &self.config)?;
-
-        // One listing of the bucket answers both questions below - what is
-        // reachable, and what to bring down - and is the list the copy works
-        // from, so none of it is asked twice.
-        let listing = remote.list_sized("")?;
         let in_bucket: std::collections::HashSet<&str> =
             listing.iter().map(|(key, _)| key.as_str()).collect();
 
@@ -1486,9 +1498,7 @@ impl Core {
                 "[Moonclip] {dropped} snapshot(s) named by the remote manifest are in \
                  neither the bucket nor here and were left out; resuming from what is."
             );
-            if let Ok(json) = serde_json::to_vec_pretty(&fresh) {
-                let _ = self.storage.put("manifest.json", &json);
-            }
+            let _ = crate::manifest_io::persist(self.storage.as_ref(), &mut fresh);
         }
 
         // What comes down now (GPU-239): every file beside the snapshots - a
@@ -1873,38 +1883,28 @@ impl Core {
 
     /// Re-read manifest from storage (for multi-rank sync).
     fn reload_manifest(&self) -> Result<()> {
-        match self.storage.get("manifest.json") {
-            Ok(data) => {
-                // Strip trailing null bytes from page-aligned storage
-                let end = data
-                    .iter()
-                    .rposition(|&b| b != 0)
-                    .map(|i| i + 1)
-                    .unwrap_or(0);
-                let trimmed = &data[..end];
-                let new_manifest: Manifest = serde_json::from_slice(trimmed)
-                    .map_err(|e| MoonclipError::Serialization(e.to_string()))?;
-                let mut m = self.lock_manifest();
-                *m = new_manifest;
-                // Whatever a panic may have left half-written in memory is
-                // gone: this is the file, read whole. See `heal_manifest`.
-                self.manifest_stale.store(false, Ordering::Relaxed);
-                Ok(())
-            }
-            // Nothing on storage to re-read, so the copy in memory is all
-            // there is and distrusting it further buys nothing.
-            Err(MoonclipError::NotFound(_)) => {
-                self.manifest_stale.store(false, Ordering::Relaxed);
-                Ok(())
-            }
-            Err(e) => Err(e),
+        // The copy in memory lends its snapshots' ranks to the re-read - they
+        // cannot have changed once in their own file, and a multi-rank save
+        // re-reads at every step (GPU-261) - unless it is the copy a panic
+        // may have left half-written, which is read whole instead. See
+        // `heal_manifest`.
+        let trusted = !self.manifest_stale.load(Ordering::Relaxed) && !self.manifest.is_poisoned();
+        let mut m = self.lock_manifest();
+        let read = crate::manifest_io::load(
+            self.storage.as_ref(),
+            if trusted { Some(&mut *m) } else { None },
+        )?;
+        // With nothing on storage to re-read, the copy in memory is all there
+        // is and distrusting it further buys nothing.
+        if let Some(read) = read {
+            *m = read;
         }
+        self.manifest_stale.store(false, Ordering::Relaxed);
+        Ok(())
     }
 
-    fn persist_manifest(&self, manifest: &Manifest) -> Result<()> {
-        let json = serde_json::to_vec_pretty(manifest)
-            .map_err(|e| MoonclipError::Serialization(e.to_string()))?;
-        self.storage.put("manifest.json", &json)
+    fn persist_manifest(&self, manifest: &mut Manifest) -> Result<()> {
+        crate::manifest_io::persist(self.storage.as_ref(), manifest)
     }
 
     /// Apply retention policy: cap full snapshots, then cap total snapshots.

@@ -6,6 +6,7 @@ pub mod error;
 pub mod hash;
 pub(crate) mod inflight;
 pub mod manifest;
+pub mod manifest_io;
 pub mod merger;
 pub mod pack;
 pub mod pool;

@@ -486,14 +486,7 @@ fn do_stride_merge(
         .cloned()
         .collect();
 
-    let json = match serde_json::to_vec_pretty(&*manifest) {
-        Ok(j) => j,
-        Err(e) => {
-            manifest.snapshots = previous;
-            return Err(MoonclipError::Serialization(e.to_string()));
-        }
-    };
-    if let Err(e) = storage.put("manifest.json", &json) {
+    if let Err(e) = crate::manifest_io::persist(storage.as_ref(), &mut manifest) {
         manifest.snapshots = previous;
         return Err(e);
     }
@@ -561,6 +554,14 @@ pub(crate) fn unlink_snapshots(
                     pending_deletes.push(filename.clone());
                 }
             }
+        }
+        // Its own file, which no rank names: written once the snapshot was
+        // finalised, beside the packs (GPU-261). Before then there is none,
+        // and the delete of a file that is not there costs nothing.
+        let ranks = crate::manifest_io::ranks_path(snap.id);
+        if storage.exists(&ranks).unwrap_or(false) {
+            let _ = storage.delete(&ranks);
+            pending_deletes.push(ranks);
         }
         let _ = storage.remove_dir(&format!("snapshots/{}", snap.id));
     }
@@ -897,14 +898,7 @@ pub(crate) fn do_full_merge_within(
     manifest.snapshots.push(merged_snap);
     manifest.snapshots.sort_by_key(|s| s.step);
 
-    let json = match serde_json::to_vec_pretty(&*manifest) {
-        Ok(j) => j,
-        Err(e) => {
-            manifest.snapshots = previous;
-            return Err(MoonclipError::Serialization(e.to_string()));
-        }
-    };
-    if let Err(e) = storage.put("manifest.json", &json) {
+    if let Err(e) = crate::manifest_io::persist(storage.as_ref(), &mut manifest) {
         manifest.snapshots = previous;
         return Err(e);
     }

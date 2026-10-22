@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, MutexGuard};
 use uuid::Uuid;
 
@@ -219,6 +219,12 @@ pub struct Manifest {
     pub retention: RetentionPolicy,
     /// Lineage configuration for rollback.
     pub lineage: LineageConfig,
+    /// Snapshots whose ranks are already in their own file in storage, so the
+    /// next persist names that file instead of writing them again. Not part
+    /// of the format: what is on disk, as this process last wrote or read it.
+    /// See [`crate::manifest_io`] (GPU-261).
+    #[serde(skip)]
+    pub ranks_written: HashSet<Uuid>,
 }
 
 impl Default for Manifest {
@@ -229,6 +235,7 @@ impl Default for Manifest {
             snapshots: Vec::new(),
             retention: RetentionPolicy::default(),
             lineage: LineageConfig::default(),
+            ranks_written: HashSet::new(),
         }
     }
 }
