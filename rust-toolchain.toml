@@ -18,11 +18,11 @@
 # Measured in that container: 31s and four components against 1.4s. Both the
 # image tag and this line carry the patch version so they cannot drift apart.
 #
-# **This is not the MSRV.** `rust-version` in Cargo.toml says 1.83, and that is
+# **This is not the MSRV.** `rust-version` in Cargo.toml says 1.85, and that is
 # a claim about what a *consumer* of the published crate needs — a
 # rust-toolchain.toml only applies inside this directory, so it does not raise
 # the floor for anyone depending on moonclip. It does mean nothing verifies the
-# 1.83 claim any more: CI compiles on 1.98 and would not notice code that needs
+# 1.85 claim any more: CI compiles on 1.98 and would not notice code that needs
 # it. Bumping `rust-version` or adding an MSRV job are both reasonable answers;
 # neither has been done.
 #
