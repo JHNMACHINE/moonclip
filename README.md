@@ -180,6 +180,46 @@ Moonclip can sit under a runtime like [Ravex](https://github.com/JHNMACHINE/rave
 without either one owning the other — and why `import moonclip` does not
 import torch.
 
+### Moonclip and Ravex
+
+The split, since GPU-267: **saving files is Moonclip's,
+the run is Ravex's.** Moonclip decides how a checkpoint becomes files and
+where they go, bucket keys included, which it reads from the environment
+itself. Ravex decides when to save and what, puts the result back into a live
+training process, and coordinates one or more machines. Ravex carries no
+storage code and no S3 client; Moonclip knows nothing about sockets,
+rendezvous or training loops - a rank, to it, is a number on a snapshot.
+
+```
+your training script
+        │  @ravex.train_loop
+        ▼
+Ravex     when to save and what: model, optimizer, scheduler, scaler,
+          dataloader position, RNG; resume into the live objects;
+          HF Trainer, Lightning, DeepSpeed, DCP. And the run on one or
+          more machines: rendezvous, joiners, the replication ring,
+          the store transport, reshard planning
+        │  named tensors, a step, metadata
+        ▼
+Moonclip  how the bytes land: deltas, compression, packs, the manifest,
+          integrity, retention, the sync to a bucket and its keys
+        │
+        ▼
+local disk  ·  S3 / R2 bucket
+```
+
+Two things that look like exceptions are not. Ravex copies a store's files to
+a peer machine (its replication ring, and a node joining a run): it moves them
+as opaque files and never reads or writes what is inside. And Ravex's small
+records - `run.json`, metrics, the audit log - sit beside the checkpoints in
+the store, where Moonclip carries them to the bucket (`sync_prefix`).
+
+Configuration follows the same line. Where the bucket is - `storage` in
+`ravex.yaml`, or `RAVEX_STORAGE_*` - is the run's, documented in
+[Ravex's configuration reference](https://github.com/JHNMACHINE/ravex/blob/main/docs/configuration.md);
+the keys are Moonclip's (`MOONCLIP_S3_*`, see [S3 Backend](#s3-backend)), and
+so is everything under [Tuning](#tuning).
+
 **`src/` — the engine (Rust)**
 
 ```
