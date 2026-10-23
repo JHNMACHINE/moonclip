@@ -8,7 +8,7 @@ use crate::coordinator::{Coordinator, CoordinatorConfig};
 use crate::manifest::{CompressionAlgo, LineageConfig, RetentionPolicy, TensorStorage};
 use crate::merger::MergerConfig;
 use crate::remote_sync::RemoteSyncConfig;
-use crate::s3::{S3Config, S3Storage};
+use crate::s3::{S3Config, S3Credentials, S3Storage};
 use crate::storage::LocalStorage;
 use crate::tensor::TensorData;
 
@@ -432,16 +432,10 @@ impl MoonclipManager {
         };
 
         let storage: Arc<dyn crate::storage::StorageBackend> = if let Some(bucket) = s3_bucket {
-            let ak = s3_access_key.ok_or_else(|| {
-                pyo3::exceptions::PyValueError::new_err(
-                    "s3_access_key required when s3_bucket is set",
-                )
-            })?;
-            let sk = s3_secret_key.ok_or_else(|| {
-                pyo3::exceptions::PyValueError::new_err(
-                    "s3_secret_key required when s3_bucket is set",
-                )
-            })?;
+            // Keys not given are read from the environment here, not by the
+            // caller (GPU-267): see `S3Credentials`.
+            let keys = S3Credentials::resolve(s3_access_key, s3_secret_key, s3_session_token)
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
 
             let remote: Arc<dyn crate::storage::StorageBackend> = Arc::new(S3Storage::new(
                 S3Config {
@@ -449,9 +443,9 @@ impl MoonclipManager {
                     prefix: s3_prefix.into(),
                     region: s3_region.into(),
                     endpoint: s3_endpoint.map(|s| s.into()),
-                    access_key: ak.into(),
-                    secret_key: sk.into(),
-                    session_token: s3_session_token.map(Into::into),
+                    access_key: keys.access_key,
+                    secret_key: keys.secret_key,
+                    session_token: keys.session_token,
                     path_style: s3_path_style,
                     timeout_secs: 30,
                     single_put_limit: crate::s3::SINGLE_PUT_LIMIT,

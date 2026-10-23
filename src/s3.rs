@@ -131,6 +131,82 @@ impl S3Config {
     }
 }
 
+// ─── Credentials ────────────────────────────────────────────────────
+
+/// The keys a bucket is signed with, as given or as found in the environment.
+///
+/// Moonclip reads them itself (GPU-267): the caller that saves files is not
+/// the one that should know where a bucket's keys come from, and before this
+/// every runtime on top of Moonclip carried its own copy of the same lookup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct S3Credentials {
+    pub access_key: String,
+    pub secret_key: String,
+    pub session_token: Option<String>,
+}
+
+/// Where keys are looked for, in order: Moonclip's own names, then the ones
+/// every S3 tool reads. Each row is one source, read whole.
+const CREDENTIAL_SOURCES: [[&str; 3]; 2] = [
+    ["MOONCLIP_S3_ACCESS_KEY", "MOONCLIP_S3_SECRET_KEY", "MOONCLIP_S3_SESSION_TOKEN"],
+    ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"],
+];
+
+impl S3Credentials {
+    /// The keys given, or else the environment's.
+    ///
+    /// Keys given are taken whole: a caller that names an access key and not
+    /// its secret has made a mistake, and filling the secret in from the
+    /// environment would sign with a pair that never belonged together.
+    pub fn resolve(
+        access_key: Option<&str>,
+        secret_key: Option<&str>,
+        session_token: Option<&str>,
+    ) -> Result<Self> {
+        Self::resolve_with(access_key, secret_key, session_token, |name| std::env::var(name).ok())
+    }
+
+    /// [`Self::resolve`] with the environment as a function, so a test can
+    /// give one without touching the process's own.
+    pub fn resolve_with(
+        access_key: Option<&str>,
+        secret_key: Option<&str>,
+        session_token: Option<&str>,
+        var: impl Fn(&str) -> Option<String>,
+    ) -> Result<Self> {
+        let given = |value: Option<&str>| value.filter(|v| !v.is_empty()).map(str::to_string);
+        match (given(access_key), given(secret_key)) {
+            (Some(access_key), Some(secret_key)) => {
+                return Ok(S3Credentials { access_key, secret_key, session_token: given(session_token) });
+            }
+            (None, None) => {}
+            _ => {
+                return Err(MoonclipError::Config(
+                    "an access key and a secret key go together: give both, or neither and let \
+                     Moonclip read them from the environment"
+                        .into(),
+                ))
+            }
+        }
+        let read = |name: &str| var(name).filter(|v| !v.is_empty());
+        // A source is used only when it has both keys. One with half a pair is
+        // skipped rather than completed from the next: two sources mixed sign
+        // with a pair nobody issued, and S3 answers that with a signature
+        // error that names neither variable.
+        for [access, secret, token] in CREDENTIAL_SOURCES {
+            if let (Some(access_key), Some(secret_key)) = (read(access), read(secret)) {
+                let session_token = given(session_token).or_else(|| read(token));
+                return Ok(S3Credentials { access_key, secret_key, session_token });
+            }
+        }
+        Err(MoonclipError::Config(
+            "a bucket needs keys and none were found: set MOONCLIP_S3_ACCESS_KEY and \
+             MOONCLIP_S3_SECRET_KEY (or AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY)"
+                .into(),
+        ))
+    }
+}
+
 // ─── Addressing and signing ─────────────────────────────────────────
 
 /// How long a signed request stays valid. It is signed the moment it is
@@ -898,6 +974,74 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn env(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let vars: Vec<(String, String)> =
+            vars.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        move |name| vars.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone())
+    }
+
+    #[test]
+    fn credentials_given_win_over_the_environment() {
+        let found = S3Credentials::resolve_with(
+            Some("AK"),
+            Some("SK"),
+            None,
+            env(&[("MOONCLIP_S3_ACCESS_KEY", "env"), ("MOONCLIP_S3_SECRET_KEY", "env"),
+                  ("MOONCLIP_S3_SESSION_TOKEN", "env")]),
+        )
+        .unwrap();
+        // The environment's token is not attached to keys it did not give.
+        assert_eq!(found, S3Credentials { access_key: "AK".into(), secret_key: "SK".into(), session_token: None });
+    }
+
+    #[test]
+    fn credentials_half_given_are_refused() {
+        let found = S3Credentials::resolve_with(
+            Some("AK"),
+            None,
+            None,
+            env(&[("MOONCLIP_S3_SECRET_KEY", "env")]),
+        );
+        assert!(matches!(found, Err(MoonclipError::Config(_))));
+    }
+
+    #[test]
+    fn credentials_come_from_moonclip_names_before_aws_ones() {
+        let found = S3Credentials::resolve_with(
+            None,
+            None,
+            None,
+            env(&[("MOONCLIP_S3_ACCESS_KEY", "mk"), ("MOONCLIP_S3_SECRET_KEY", "ms"),
+                  ("AWS_ACCESS_KEY_ID", "ak"), ("AWS_SECRET_ACCESS_KEY", "as"),
+                  ("AWS_SESSION_TOKEN", "at")]),
+        )
+        .unwrap();
+        assert_eq!(found, S3Credentials { access_key: "mk".into(), secret_key: "ms".into(), session_token: None });
+    }
+
+    #[test]
+    fn credentials_never_mix_two_sources() {
+        // Half a pair under Moonclip's names: the AWS pair is used, whole.
+        let found = S3Credentials::resolve_with(
+            None,
+            None,
+            None,
+            env(&[("MOONCLIP_S3_ACCESS_KEY", "mk"), ("AWS_ACCESS_KEY_ID", "ak"),
+                  ("AWS_SECRET_ACCESS_KEY", "as"), ("AWS_SESSION_TOKEN", "at")]),
+        )
+        .unwrap();
+        assert_eq!(found, S3Credentials { access_key: "ak".into(), secret_key: "as".into(), session_token: Some("at".into()) });
+    }
+
+    #[test]
+    fn credentials_missing_say_which_variables() {
+        let found = S3Credentials::resolve_with(None, None, None, env(&[("AWS_ACCESS_KEY_ID", "")]));
+        match found {
+            Err(MoonclipError::Config(message)) => assert!(message.contains("MOONCLIP_S3_ACCESS_KEY")),
+            other => panic!("expected a configuration error, got {other:?}"),
+        }
+    }
 
     #[test]
     fn test_object_key() {

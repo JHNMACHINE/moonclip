@@ -110,13 +110,17 @@ mgr = CheckpointManager(
     "./checkpoints",
     save_dtype="bf16",
     s3_bucket="my-bucket",
-    s3_access_key="...",
-    s3_secret_key="...",
     s3_endpoint="http://localhost:9000",   # MinIO / R2 / B2
     s3_path_style=True,
     sync_every_n_saves=5,
 )
 ```
+
+The keys come from the environment unless they are passed as `s3_access_key`
+and `s3_secret_key`: `MOONCLIP_S3_ACCESS_KEY`, `MOONCLIP_S3_SECRET_KEY` and,
+for temporary credentials, `MOONCLIP_S3_SESSION_TOKEN`; without them, the
+`AWS_*` names every S3 tool reads. Each pair is taken whole, never half from
+one set of names and half from the other.
 
 ## Multi-GPU (FSDP / DDP)
 

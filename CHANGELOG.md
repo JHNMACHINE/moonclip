@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- **Moonclip reads a bucket's keys from the environment itself (GPU-267).**
+  With `s3_bucket` set and no `s3_access_key` / `s3_secret_key`, the keys
+  come from `MOONCLIP_S3_ACCESS_KEY` / `MOONCLIP_S3_SECRET_KEY` (and
+  `MOONCLIP_S3_SESSION_TOKEN`), or else from the `AWS_*` names. Before, both
+  had to be passed, and every runtime on top of Moonclip carried its own copy
+  of that lookup. A pair is taken whole from one source; half a pair passed
+  is refused rather than completed from the environment.
+
 ## 0.3.0 — 2026-10-22
 
 ### Changed

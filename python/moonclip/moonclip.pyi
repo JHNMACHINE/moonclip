@@ -75,7 +75,10 @@ class MoonclipManager:
             s3_region: S3 region.
             s3_prefix: Optional S3 prefix directory.
             s3_endpoint: Optional custom S3 endpoint URL.
-            s3_access_key: S3 access key.
+            s3_access_key: S3 access key. With the secret, or neither: when
+                both are None they are read from MOONCLIP_S3_ACCESS_KEY and
+                MOONCLIP_S3_SECRET_KEY, or else AWS_ACCESS_KEY_ID and
+                AWS_SECRET_ACCESS_KEY.
             s3_secret_key: S3 secret key.
             s3_path_style: Use path-style S3 URLs instead of virtual hosting.
                 Automatically forced to True when s3_endpoint is set.
@@ -137,6 +140,8 @@ class MoonclipManager:
                 memory — turn it off where memory is the binding constraint.
             s3_session_token: The session token of temporary credentials,
                 which come with one beside the access key and the secret.
+                Read from the environment with keys read from there
+                (MOONCLIP_S3_SESSION_TOKEN or AWS_SESSION_TOKEN).
                 Last, so no earlier argument moves.
         """
         ...

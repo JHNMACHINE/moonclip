@@ -605,14 +605,47 @@ class TestConcurrency:
 
 # ─── S3 backend validation ──────────────────────────────────────────
 
+#: Every name Moonclip reads a bucket's keys from (GPU-267), cleared by the
+#: tests below so that keys in the shell running them cannot decide the result.
+S3_KEY_VARIABLES = (
+    "MOONCLIP_S3_ACCESS_KEY", "MOONCLIP_S3_SECRET_KEY", "MOONCLIP_S3_SESSION_TOKEN",
+    "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN",
+)
+
+
 class TestS3Validation:
+    @pytest.fixture(autouse=True)
+    def _no_keys_in_environment(self, monkeypatch):
+        for name in S3_KEY_VARIABLES:
+            monkeypatch.delenv(name, raising=False)
+
     def test_missing_credentials_errors(self, tmp_path):
-        with pytest.raises(ValueError, match="s3_access_key"):
+        with pytest.raises(ValueError, match="MOONCLIP_S3_ACCESS_KEY"):
             MoonclipManager(storage_root=str(tmp_path), s3_bucket="test-bucket")
 
     def test_missing_secret_errors(self, tmp_path):
-        with pytest.raises(ValueError, match="s3_secret_key"):
+        with pytest.raises(ValueError, match="give both"):
             MoonclipManager(storage_root=str(tmp_path), s3_bucket="test", s3_access_key="AK")
+
+    def test_half_a_pair_is_not_completed_from_the_environment(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("MOONCLIP_S3_SECRET_KEY", "SK")
+        with pytest.raises(ValueError, match="give both"):
+            MoonclipManager(storage_root=str(tmp_path), s3_bucket="test", s3_access_key="AK")
+
+    @pytest.mark.parametrize("access, secret", [
+        ("MOONCLIP_S3_ACCESS_KEY", "MOONCLIP_S3_SECRET_KEY"),
+        ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"),
+    ])
+    def test_keys_are_read_from_the_environment(self, tmp_path, monkeypatch, access, secret):
+        monkeypatch.setenv(access, "AK")
+        monkeypatch.setenv(secret, "SK")
+        mgr = MoonclipManager(
+            storage_root=str(tmp_path),
+            s3_bucket="bucket",
+            s3_endpoint="http://localhost:19999",
+            sync_every_n_saves=10,
+        )
+        assert len(mgr.save_tensors(step=1, tensors={"w": ([10], "uint8", bytes(10))})) == 36
 
     def test_s3_config_accepted(self, tmp_path):
         """S3 config with local primary + remote sync should construct without error."""
