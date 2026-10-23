@@ -390,3 +390,49 @@ class MoonclipManager:
         the store was still empty.
         """
         ...
+
+class Bucket:
+    """
+    A bucket's objects by path: whole files in, whole files out.
+
+    Not a checkpoint store - no manifest, no tensors. The keys are read from
+    the environment when neither is given, as for MoonclipManager. Every call
+    releases the GIL, so several threads can move files at once.
+    """
+
+    def __init__(
+        self,
+        bucket: str,
+        prefix: str = "",
+        endpoint: Optional[str] = None,
+        region: Optional[str] = None,
+        path_style: Optional[bool] = None,
+        access_key: Optional[str] = None,
+        secret_key: Optional[str] = None,
+        session_token: Optional[str] = None,
+        timeout: int = 30,
+    ) -> None:
+        """
+        Args:
+            bucket: The bucket's name.
+            prefix: Where in the bucket the paths start.
+            endpoint: A custom endpoint (R2, MinIO...); AWS's when None.
+            region: Defaults to us-east-1, which R2 takes as its ``auto``.
+            path_style: Path-style addressing; None turns it on with an
+                endpoint and off without.
+            access_key, secret_key, session_token: The keys; both or neither.
+            timeout: Connection timeout in seconds.
+        """
+        ...
+
+    def get(self, path: str) -> Optional[bytes]:
+        """The object's bytes, or None when there is none."""
+        ...
+
+    def put(self, path: str, data: bytes) -> None:
+        """Write the whole object."""
+        ...
+
+    def list(self, prefix: str) -> list[str]:
+        """Every path under ``prefix``, as given to :meth:`put`."""
+        ...

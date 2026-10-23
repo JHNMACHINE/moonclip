@@ -1,6 +1,6 @@
 from typing import TYPE_CHECKING
 
-from moonclip.moonclip import MoonclipManager, __version__  # noqa: F401
+from moonclip.moonclip import Bucket, MoonclipManager, __version__  # noqa: F401
 
 if TYPE_CHECKING:
     # Declared for type checkers only. At runtime these are resolved lazily by
@@ -36,6 +36,7 @@ def __getattr__(name):
 
 
 __all__ = [
+    "Bucket",
     "MoonclipManager",
     "CheckpointManager",
     "flatten_state_dict",

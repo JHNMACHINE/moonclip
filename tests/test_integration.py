@@ -17,7 +17,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "python"))
 
-from moonclip import MoonclipManager
+from moonclip import Bucket, MoonclipManager
 
 
 # ─── Helpers ─────────────────────────────────────────────────────────
@@ -646,6 +646,45 @@ class TestS3Validation:
             sync_every_n_saves=10,
         )
         assert len(mgr.save_tensors(step=1, tensors={"w": ([10], "uint8", bytes(10))})) == 36
+
+
+class TestBucket:
+    """``moonclip.Bucket``, the plain object store smith's cache uses (GPU-267)."""
+
+    @pytest.fixture(autouse=True)
+    def _no_keys_in_environment(self, monkeypatch):
+        for name in S3_KEY_VARIABLES:
+            monkeypatch.delenv(name, raising=False)
+
+    def test_without_keys_is_refused(self):
+        with pytest.raises(ValueError, match="MOONCLIP_S3_ACCESS_KEY"):
+            Bucket("bucket")
+
+    def test_an_endpoint_that_is_not_an_address_is_refused(self):
+        with pytest.raises(ValueError, match="not an address"):
+            Bucket("bucket", endpoint="not a url", access_key="AK", secret_key="SK")
+
+    def test_an_unreachable_bucket_is_an_os_error(self):
+        bucket = Bucket("bucket", endpoint="http://127.0.0.1:9", access_key="AK", secret_key="SK", timeout=1)
+        with pytest.raises(OSError):
+            bucket.get("missing")
+
+
+
+@pytest.mark.skipif(not os.environ.get("MOONCLIP_S3_ENDPOINT"), reason="needs MOONCLIP_S3_* (tests/minio_up.sh)")
+def test_bucket_round_trip():
+    # Keys from the environment, as a caller that passes none gets them.
+    bucket = Bucket(
+        os.environ["MOONCLIP_S3_BUCKET"],
+        prefix="bucket-test/%d" % random.getrandbits(32),
+        endpoint=os.environ["MOONCLIP_S3_ENDPOINT"],
+        region=os.environ.get("MOONCLIP_S3_REGION"),
+    )
+    assert bucket.get("a/one") is None
+    bucket.put("a/one", b"1")
+    bucket.put("a/b/two", b"22")
+    assert bucket.get("a/one") == b"1"
+    assert sorted(bucket.list("a/")) == ["a/b/two", "a/one"]
 
     def test_s3_config_accepted(self, tmp_path):
         """S3 config with local primary + remote sync should construct without error."""

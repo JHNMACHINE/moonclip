@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Added
+
+- **`moonclip.Bucket`: a bucket's objects by path (GPU-267).** `get`, `put`
+  and `list` of whole files, keys given or read from the environment, the GIL
+  released on every call. Not a checkpoint store: it is for whoever keeps
+  plain files in a bucket - smith's cache of compiled wheels and kernels,
+  which until now went through a second S3 client that Ravex carried for
+  that one use.
+
 ### Changed
 
 - **Moonclip reads a bucket's keys from the environment itself (GPU-267).**

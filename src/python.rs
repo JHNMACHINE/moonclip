@@ -9,7 +9,7 @@ use crate::manifest::{CompressionAlgo, LineageConfig, RetentionPolicy, TensorSto
 use crate::merger::MergerConfig;
 use crate::remote_sync::RemoteSyncConfig;
 use crate::s3::{S3Config, S3Credentials, S3Storage};
-use crate::storage::LocalStorage;
+use crate::storage::{LocalStorage, StorageBackend};
 use crate::tensor::TensorData;
 
 fn extract_metadata(metadata: Option<Bound<'_, PyDict>>) -> PyResult<HashMap<String, String>> {
@@ -679,9 +679,95 @@ impl MoonclipManager {
     }
 }
 
+/// A bucket's objects by path: whole files in, whole files out (GPU-267).
+///
+/// Not a checkpoint store - no manifest, no tensors - and here anyway,
+/// because saving files is Moonclip's whatever they hold: smith keeps the
+/// wheels and kernels a machine compiled in a bucket through this, where
+/// before it went through a second S3 client that Ravex carried for that
+/// one use. Three calls, and every one of them releases the GIL: they are
+/// network round trips, made from several threads at once.
+#[pyclass(module = "moonclip")]
+pub struct Bucket {
+    inner: S3Storage,
+}
+
+#[pymethods]
+impl Bucket {
+    #[new]
+    #[pyo3(signature = (
+        bucket,
+        prefix = String::new(),
+        endpoint = None,
+        region = None,
+        path_style = None,
+        access_key = None,
+        secret_key = None,
+        session_token = None,
+        timeout = 30,
+    ))]
+    fn new(
+        bucket: String,
+        prefix: String,
+        endpoint: Option<String>,
+        region: Option<String>,
+        path_style: Option<bool>,
+        access_key: Option<&str>,
+        secret_key: Option<&str>,
+        session_token: Option<&str>,
+        timeout: u64,
+    ) -> PyResult<Self> {
+        let keys = S3Credentials::resolve(access_key, secret_key, session_token)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        let config = S3Config {
+            bucket,
+            prefix,
+            // `us-east-1`, as for a checkpoint's bucket: R2 takes it as its
+            // `auto`, and S3-compatible servers that check the region expect
+            // it, where they would refuse `auto`.
+            region: region.unwrap_or_else(|| "us-east-1".into()),
+            endpoint,
+            access_key: keys.access_key,
+            secret_key: keys.secret_key,
+            session_token: keys.session_token,
+            path_style: path_style.unwrap_or(false),
+            timeout_secs: timeout,
+            single_put_limit: crate::s3::SINGLE_PUT_LIMIT,
+        };
+        let config = if path_style.is_none() { config.with_auto_path_style() } else { config };
+        // An endpoint that is not an address is the caller's mistake, said as
+        // one, not a failed request later.
+        let inner = S3Storage::new(config)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        Ok(Bucket { inner })
+    }
+
+    /// The object's bytes, or None when there is none.
+    fn get<'py>(&self, py: Python<'py>, path: &str) -> PyResult<Option<Bound<'py, PyBytes>>> {
+        match py.detach(|| self.inner.get(path)) {
+            Ok(data) => Ok(Some(PyBytes::new(py, &data))),
+            Err(crate::error::MoonclipError::NotFound(_)) => Ok(None),
+            Err(error) => Err(pyo3::exceptions::PyOSError::new_err(error.to_string())),
+        }
+    }
+
+    /// Write the whole object.
+    fn put(&self, py: Python<'_>, path: &str, data: Vec<u8>) -> PyResult<()> {
+        py.detach(|| self.inner.put(path, &data))
+            .map_err(|error| pyo3::exceptions::PyOSError::new_err(error.to_string()))
+    }
+
+    /// Every path under `prefix`, as given to `put`.
+    fn list(&self, py: Python<'_>, prefix: &str) -> PyResult<Vec<String>> {
+        py.detach(|| self.inner.list(prefix))
+            .map_err(|error| pyo3::exceptions::PyOSError::new_err(error.to_string()))
+    }
+}
+
 #[pymodule]
 fn moonclip(m: &Bound<'_, pyo3::types::PyModule>) -> PyResult<()> {
     m.add_class::<MoonclipManager>()?;
+    m.add_class::<Bucket>()?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }
